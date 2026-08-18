@@ -1,12 +1,150 @@
 import SwiftUI
 import UIKit
 
-/// Large expressive XY pad with two modes:
+// MARK: - Pad surface mode (the three buttons)
+
+/// What the pad is doing right now, as ONE choice out of three.
 ///
-///   • CC mode    — X and Y each send an independent CC (uses the first touch).
-///   • Note mode  — position ALONG the chosen diagonal selects a pitch.
-///                  Supports 1, 2, or 3 simultaneous voices. Each finger is
-///                  a voice: touch = Note On, release = Note Off.
+/// The underlying config still stores this as two independent flags —
+/// `XYPadMode` (cc / notes) and `CCPadMode` (standard / morph) — which is
+/// four combinations describing three real states: "notes + morph" is
+/// meaningless, because morph only ever applied to the CC path. The old
+/// header exposed both flags as separate segmented pickers, so reaching
+/// 4-Corner meant setting two controls and knowing that one of them was
+/// ignored in the other mode.
+///
+/// This collapses the pair into the three states that actually exist. The
+/// stored flags are untouched — every preset on disk still decodes, and the
+/// engine still reads `mode` and `ccMode` exactly as before.
+enum XYSurfaceMode: String, CaseIterable, Identifiable {
+    case standard
+    case morph
+    case notes
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .standard: return "XY"
+        case .morph:    return "4C"
+        case .notes:    return "Notes"
+        }
+    }
+
+    var longLabel: String {
+        switch self {
+        case .standard: return "Standard XY"
+        case .morph:    return "4-Corner Morph"
+        case .notes:    return "Notes"
+        }
+    }
+
+    /// Drop a matching image into Assets with this name and the button uses
+    /// it automatically — see `PadModeButton`, which checks at runtime and
+    /// falls back to `symbol` until the asset exists.
+    var imageName: String {
+        switch self {
+        case .standard: return "PadModeXY"
+        case .morph:    return "PadModeMorph"
+        case .notes:    return "PadModeNotes"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .standard: return "circle.grid.cross"
+        case .morph:    return "square.grid.2x2"
+        case .notes:    return "music.note"
+        }
+    }
+}
+
+/// One of the three pad-mode buttons.
+///
+/// The image IS the button — no chip, no border, no background plate. Those
+/// containers were costing width that the preset name needs, and once the
+/// artwork carries the meaning the plate around it is just decoration.
+///
+/// Selection is therefore shown ON the artwork rather than around it:
+/// the active mode sits at full opacity and full size, the inactive ones
+/// are dimmed and fractionally smaller. That reads at a glance without
+/// requiring the images themselves to have selected/unselected variants.
+///
+/// Uses the custom asset when it is present in the bundle and an SF Symbol
+/// when it is not, so the layout is final before the artwork lands and
+/// dropping the three images in later needs no code change.
+struct PadModeButton: View {
+    let mode: XYSurfaceMode
+    let selected: Bool
+    let action: () -> Void
+
+    /// Visual size of the artwork. The tap target is padded out beyond this
+    /// below, since a 34pt image is under the 44pt minimum a finger needs.
+    private let side: CGFloat = 34
+
+    private var customImage: UIImage? { UIImage(named: mode.imageName) }
+
+    var body: some View {
+        Button(action: action) {
+            Group {
+                if let image = customImage {
+                    Image(uiImage: image)
+                        .resizable()
+                        .scaledToFit()
+                } else {
+                    Image(systemName: mode.symbol)
+                        .font(.system(size: 22, weight: .semibold))
+                        .foregroundColor(Theme.accent)
+                }
+            }
+            .frame(width: side, height: side)
+            .opacity(selected ? 1 : 0.38)
+            .scaleEffect(selected ? 1 : 0.88)
+            .shadow(color: selected ? Theme.accent.opacity(0.45) : .clear, radius: 5)
+            .animation(.easeOut(duration: 0.15), value: selected)
+            // Keeps the finger target at 44pt without making the artwork
+            // bigger or spacing the row out.
+            .frame(width: 44, height: 44)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(mode.longLabel)
+        .accessibilityAddTraits(selected ? [.isSelected] : [])
+    }
+}
+
+/// The three buttons as a unit. Used in the pad header AND as the heading of
+/// the config sheet, so the same control means the same thing in both places.
+///
+/// Spacing defaults to zero because each button already pads its artwork out
+/// to a 44pt tap target — the gap is built in, and adding more on top just
+/// spends width the preset name wants.
+struct PadModeSelector: View {
+    @Binding var selection: XYSurfaceMode
+    var spacing: CGFloat = 0
+
+    var body: some View {
+        HStack(spacing: spacing) {
+            ForEach(XYSurfaceMode.allCases) { mode in
+                PadModeButton(mode: mode, selected: selection == mode) {
+                    guard selection != mode else { return }
+                    selection = mode
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                }
+            }
+        }
+    }
+}
+
+// MARK: - XY pad
+
+/// Large expressive XY pad with three surface modes:
+///
+///   • Standard XY — X and Y each send an independent CC (uses the first touch).
+///   • 4-Corner    — four CCs blended by proximity to each corner.
+///   • Notes       — position ALONG the chosen diagonal selects a pitch.
+///                   Supports 1, 2, or 3 simultaneous voices. Each finger is
+///                   a voice: touch = Note On, release = Note Off.
 ///
 /// ── Voice stealing and restore ──────────────────────────────────────────
 /// When a finger lands beyond the voice limit, the OLDEST sounding voice is
@@ -40,6 +178,9 @@ struct XYPadView: View {
     @State private var suspended: [Voice] = []
 
     @State private var showConfig = false
+    /// Preset library, opened from the chip in this view's header — it used
+    /// to live on the app-title row in ContentView.
+    @State private var showPresetPicker = false
 
     private var cfg: XYPadConfig { app.preset.xyPad }
     private var touching: Bool { !voices.isEmpty }
@@ -60,6 +201,10 @@ struct XYPadView: View {
         }
         .sheet(isPresented: $showConfig) {
             XYPadConfigSheet()
+                .environmentObject(app)
+        }
+        .sheet(isPresented: $showPresetPicker) {
+            PresetPickerSheet()
                 .environmentObject(app)
         }
         // Keep the receiving synth's portamento in sync with the toggle,
@@ -84,33 +229,20 @@ struct XYPadView: View {
         }
     }
 
-    // MARK: - Header (mode toggle + config) — outside the touch area
+    // MARK: - Header (three mode buttons + preset + config) — outside the touch area
 
     private var header: some View {
-        HStack(spacing: 10) {
-            Picker("", selection: ccModeBinding) {
-                Text("XY").tag(CCPadMode.standard)
-                Text("4C").tag(CCPadMode.morph)
-            }
-            .pickerStyle(.segmented)
-            .frame(width: 84)
+        HStack(spacing: 6) {
+            PadModeSelector(selection: surfaceModeBinding)
 
-            Picker("", selection: modeBinding) {
-                ForEach(XYPadMode.allCases) { m in
-                    Text(m.label).tag(m)
-                }
-            }
-            .pickerStyle(.segmented)
-            .frame(width: 150)
+            Spacer(minLength: 4)
 
-            if cfg.mode == .notes {
-                let rootName = noteName(cfg.rootNote).replacingOccurrences(of: "\\d+$", with: "", options: .regularExpression)
-                Text("\(rootName) \(cfg.scale.label)")
-                    .font(.caption2.monospaced())
-                    .foregroundColor(Theme.dim)
-            }
-
-            Spacer()
+            // Moved here from the app-title row, which no longer exists. It
+            // sits left of the gear because both are "leave the pad alone and
+            // change something" controls, and keeping them adjacent means the
+            // whole right edge of this row is settings rather than a target
+            // you might hit while reaching for the pad.
+            presetButton
 
             Button {
                 showConfig = true
@@ -118,9 +250,34 @@ struct XYPadView: View {
                 Image(systemName: "slider.horizontal.3")
                     .font(.callout.weight(.semibold))
                     .foregroundColor(Theme.accent)
+                    .frame(width: 30, height: 30)
             }
         }
-        .frame(height: 30)
+        .frame(height: 44)
+    }
+
+    private var presetButton: some View {
+        Button {
+            showPresetPicker = true
+        } label: {
+            HStack(spacing: 4) {
+                Text(app.preset.name.uppercased())
+                    .font(.caption2.monospaced())
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.system(size: 7, weight: .bold))
+            }
+            .foregroundColor(Theme.dim)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(Capsule().fill(Theme.panel2))
+            .overlay(Capsule().strokeBorder(Color.white.opacity(0.08), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        // A long preset name must not push the gear off the row, so the chip
+        // gives way first.
+        .layoutPriority(-1)
     }
 
     // MARK: - Pad surface
@@ -137,14 +294,22 @@ struct XYPadView: View {
                                           lineWidth: touching ? 2 : 1)
                     )
 
-                if cfg.mode == .notes {
-                    noteBands(size: size)
-                    diagonalGuide(size: size)
-                } else if cfg.ccMode == .morph {
-                    morphCornerMeters(size: size)
-                } else {
-                    crosshairGrid(size: size)
+                // Decoration layer. Clipped to the pad's own rounded shape —
+                // note bands and octave lines are built in diagonal space and
+                // their corners genuinely fall outside the rectangle, so
+                // without this they paint over the surrounding layout.
+                Group {
+                    if cfg.mode == .notes {
+                        noteBands(size: size)
+                        octaveLines(size: size)
+                        diagonalGuide(size: size)
+                    } else if cfg.ccMode == .morph {
+                        morphCornerMeters(size: size)
+                    } else {
+                        crosshairGrid(size: size)
+                    }
                 }
+                .clipShape(RoundedRectangle(cornerRadius: 20))
 
                 // Suspended fingers get a dimmed, hollow puck so you can see
                 // where a held-but-silent finger will come back at.
@@ -165,7 +330,97 @@ struct XYPadView: View {
                     onAllTouchesEnded: { handleAllTouchesEnded() }
                 )
             )
+            // The scale chip sits ABOVE the touch layer, because anything
+            // under it is unreachable — the multitouch view takes every
+            // event in its bounds. It costs a small corner of playable
+            // surface, which is the trade for changing key without opening
+            // a sheet mid-performance.
+            .overlay(alignment: .topLeading) {
+                if cfg.mode == .notes {
+                    scaleChip
+                        .padding(10)
+                }
+            }
         }
+    }
+
+    // MARK: - On-surface scale selector
+
+    /// Root + scale, always visible in Notes mode, tap for the full menu.
+    /// The same choice also lives at the bottom of the config sheet.
+    private var scaleChip: some View {
+        Menu {
+            Section("Root") {
+                Button {
+                    setRootNote(cfg.rootNote - 12)
+                } label: {
+                    Label("Octave Down", systemImage: "arrow.down")
+                }
+                Button {
+                    setRootNote(cfg.rootNote + 12)
+                } label: {
+                    Label("Octave Up", systemImage: "arrow.up")
+                }
+            }
+
+            Menu("Root Note: \(noteName(cfg.rootNote))") {
+                ForEach(0..<12, id: \.self) { pitchClass in
+                    Button {
+                        setRootNote(rootOctaveBase + pitchClass)
+                    } label: {
+                        if pitchClass == rootPitchClass {
+                            Label(Self.pitchClassNames[pitchClass], systemImage: "checkmark")
+                        } else {
+                            Text(Self.pitchClassNames[pitchClass])
+                        }
+                    }
+                }
+            }
+
+            ForEach(Scale.families) { family in
+                Section(family.title) {
+                    ForEach(family.scales) { scale in
+                        Button {
+                            app.preset.xyPad.scale = scale
+                        } label: {
+                            if scale == cfg.scale {
+                                Label(scale.label, systemImage: "checkmark")
+                            } else {
+                                Text(scale.label)
+                            }
+                        }
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Text("\(noteName(cfg.rootNote)) \(cfg.scale.label)")
+                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .bold))
+            }
+            .foregroundColor(Theme.accent)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(Capsule().fill(Theme.bg.opacity(0.88)))
+            .overlay(Capsule().strokeBorder(Theme.accent.opacity(0.4), lineWidth: 1))
+        }
+    }
+
+    private static let pitchClassNames = ["C", "C#", "D", "D#", "E", "F",
+                                          "F#", "G", "G#", "A", "A#", "B"]
+
+    private var rootPitchClass: Int { ((cfg.rootNote % 12) + 12) % 12 }
+    private var rootOctaveBase: Int { cfg.rootNote - rootPitchClass }
+
+    /// Changing key silences anything sounding — otherwise a held finger is
+    /// left owning a note the pad can no longer produce, and nothing would
+    /// ever send its Note Off.
+    private func setRootNote(_ note: Int) {
+        let clamped = min(max(note, 0), 120)
+        guard clamped != cfg.rootNote else { return }
+        releaseAllVoices()
+        app.preset.xyPad.rootNote = clamped
     }
 
     // MARK: - Sub-views
@@ -232,6 +487,53 @@ struct XYPadView: View {
                 }
             }
         )
+    }
+
+    /// A faint dotted line at every octave of the root, drawn PERPENDICULAR
+    /// to the pitch diagonal — so it crosses the dashed pitch line rather
+    /// than running alongside it.
+    ///
+    /// Placed at the center of the octave note's own band, which is where
+    /// that pitch visually sits, and drawn from perp 0 to perp 1 so it spans
+    /// the full width of the playing area at that point on the diagonal.
+    /// These are landmarks, not zones: at a glance you can see how far the
+    /// next octave is without counting bands.
+    private func octaveLines(size: CGSize) -> some View {
+        let scaleNotes = scaleNotesInPlay()
+        let count = scaleNotes.count
+        guard count > 1 else { return AnyView(Color.clear) }
+
+        // Swift's % keeps the sign of the dividend, but -12 % 12 is still 0,
+        // so notes below the root are matched correctly without extra work.
+        let alongs: [Double] = scaleNotes.enumerated().compactMap { index, note in
+            guard (note - cfg.rootNote) % 12 == 0 else { return nil }
+            return (Double(index) + 0.5) / Double(count)
+        }
+
+        return AnyView(
+            ZStack {
+                ForEach(Array(alongs.enumerated()), id: \.offset) { _, along in
+                    perpendicularLine(at: along, size: size)
+                        .stroke(Theme.accent.opacity(0.22),
+                                style: StrokeStyle(lineWidth: 1.5,
+                                                   lineCap: .round,
+                                                   dash: [3, 6]))
+                }
+            }
+        )
+    }
+
+    /// The full-width line across the pad at one position along the diagonal.
+    private func perpendicularLine(at along: Double, size: CGSize) -> Path {
+        let start = inverseProject(along: along, perp: 0)
+        let end   = inverseProject(along: along, perp: 1)
+
+        var path = Path()
+        path.move(to: CGPoint(x: start.x * size.width,
+                              y: (1 - start.y) * size.height))
+        path.addLine(to: CGPoint(x: end.x * size.width,
+                                 y: (1 - end.y) * size.height))
+        return path
     }
 
     /// One note zone, drawn perpendicular to the active diagonal.
@@ -508,17 +810,21 @@ struct XYPadView: View {
 
     // MARK: - Portamento (glide) transmission
 
-    /// CC 65 is the standard Portamento On/Off switch. Sending it means the
-    /// receiving synth follows the toggle instead of needing it set by hand.
+    /// The standard Portamento On/Off switch. Sending it means the receiving
+    /// synth follows the toggle instead of needing it set by hand.
     private func sendPortamentoState(on: Bool) {
-        app.midi.controlChange(65, value: on ? 127 : 0, channel: cfg.channel)
+        app.midi.controlChange(MIDIDefaults.portamentoSwitchCC,
+                               value: on ? 127 : 0,
+                               channel: cfg.channel)
         if on { sendGlideTime() }
     }
 
-    /// CC 5 is Portamento Time — how long the slide between notes takes.
+    /// Portamento Time — how long the slide between notes takes.
     private func sendGlideTime() {
         let value = min(max(Int((cfg.glideTime * 127).rounded()), 0), 127)
-        app.midi.controlChange(5, value: value, channel: cfg.channel)
+        app.midi.controlChange(MIDIDefaults.portamentoTimeCC,
+                               value: value,
+                               channel: cfg.channel)
     }
 
     // MARK: - CC emission
@@ -567,7 +873,7 @@ struct XYPadView: View {
             changed = true
             app.midi.controlChange(corner.cc,
                                    value: value,
-                                   channel: corner.channel(padChannel: cfg.channel))
+                                   channel: corner.channel)
         }
 
         // Only touch @State when something moved — otherwise a stationary
@@ -577,25 +883,30 @@ struct XYPadView: View {
 
     // MARK: - Bindings & helpers
 
-    /// Switching modes silences anything currently sounding.
-    private var modeBinding: Binding<XYPadMode> {
+    /// Reads and writes the two stored flags as one three-way choice.
+    ///
+    /// Switching always silences what is sounding first: leaving Notes mode
+    /// with a finger down would otherwise strand a Note On that nothing is
+    /// left to release.
+    private var surfaceModeBinding: Binding<XYSurfaceMode> {
         Binding(
-            get: { app.preset.xyPad.mode },
+            get: {
+                if app.preset.xyPad.mode == .notes { return .notes }
+                return app.preset.xyPad.ccMode == .morph ? .morph : .standard
+            },
             set: { newMode in
                 releaseAllVoices()
-                app.preset.xyPad.mode = newMode
+                switch newMode {
+                case .notes:
+                    app.preset.xyPad.mode = .notes
+                case .standard:
+                    app.preset.xyPad.mode = .cc
+                    app.preset.xyPad.ccMode = .standard
+                case .morph:
+                    app.preset.xyPad.mode = .cc
+                    app.preset.xyPad.ccMode = .morph
+                }
             }
-        )
-    }
-
-    /// XY / 4C toggle. Only meaningful in CC mode, but harmless to switch
-    /// while in Notes mode — it just takes effect the next time CC mode is
-    /// active. Writing `cfg.ccMode` here is what fires the `onChange`
-    /// dedupe reset already wired up in `body`.
-    private var ccModeBinding: Binding<CCPadMode> {
-        Binding(
-            get: { app.preset.xyPad.ccMode },
-            set: { app.preset.xyPad.ccMode = $0 }
         )
     }
 
@@ -704,129 +1015,70 @@ final class TouchTrackingView: UIView {
 
 /// Full editor for the XY pad: mode, voices, CC numbers, diagonal, scale,
 /// note range, glide, velocity source, channel, and return behavior.
+///
+/// Headed by the same three pad-mode buttons that sit in the pad header, so
+/// the sheet opens showing which of the three surfaces it is configuring and
+/// can switch between them without closing.
 struct XYPadConfigSheet: View {
     @EnvironmentObject var app: AppState
     @Environment(\.dismiss) private var dismiss
 
+    private var cfg: XYPadConfig { app.preset.xyPad }
+
     var body: some View {
         NavigationStack {
             Form {
-                Section("Mode") {
-                    Picker("XY Pad Sends", selection: bind(\.mode)) {
-                        ForEach(XYPadMode.allCases) { Text($0.label).tag($0) }
-                    }
-                    .pickerStyle(.segmented)
-                }
-
-                if app.preset.xyPad.mode == .cc {
-                    Section("CC Pad Mode") {
-                        Picker("Mode", selection: bind(\.ccMode)) {
-                            ForEach(CCPadMode.allCases) { Text($0.label).tag($0) }
-                        }
-                        .pickerStyle(.segmented)
-                    }
-
-                    if app.preset.xyPad.ccMode == .standard {
-                        Section("CC Assignments") {
-                            Stepper("X → CC \(app.preset.xyPad.xCC)",
-                                    value: bind(\.xCC), in: 0...127)
-                            Stepper("Y → CC \(app.preset.xyPad.yCC)",
-                                    value: bind(\.yCC), in: 0...127)
-                        }
-                    } else {
-                        morphCornerSection
-                        morphShapeSection
-                    }
-                } else {
-                    Section("Voices") {
-                        Picker("Voices", selection: bind(\.voiceCount)) {
-                            Text("1").tag(1)
-                            Text("2").tag(2)
-                            Text("3").tag(3)
-                        }
-                        .pickerStyle(.segmented)
-
-                        Text("A finger beyond the limit takes over the oldest voice. Lift it and that voice comes back.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-
-                    Section("Diagonal") {
-                        HStack(spacing: 14) {
-                            Spacer(minLength: 0)
-                            ForEach(XYDiagonal.allCases) { d in
-                                Button {
-                                    app.preset.xyPad.diagonal = d
-                                } label: {
-                                    DiagonalArrowIcon(diagonal: d,
-                                                      selected: app.preset.xyPad.diagonal == d)
-                                }
-                                .buttonStyle(.plain)
-                            }
-                            Spacer(minLength: 0)
-                        }
+                Section {
+                    PadModeSelector(selection: surfaceModeBinding, spacing: 8)
+                        .frame(maxWidth: .infinity, alignment: .center)
                         .padding(.vertical, 4)
 
-                        Text(app.preset.xyPad.diagonal.description)
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                            .frame(maxWidth: .infinity, alignment: .center)
+                    Text(surfaceMode.longLabel)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                }
+
+                switch surfaceMode {
+                case .standard:
+                    Section("CC Assignments") {
+                        Stepper("X → CC \(cfg.xCC)", value: bind(\.xCC), in: 0...127)
+                        Stepper("Y → CC \(cfg.yCC)", value: bind(\.yCC), in: 0...127)
                     }
 
-                    Section("Scale") {
-                        Picker("Scale", selection: bind(\.scale)) {
-                            ForEach(Scale.allCases) { Text($0.label).tag($0) }
-                        }
-                    }
+                case .morph:
+                    morphCornerSection
+                    morphShapeSection
 
-                    Section("Note Range") {
-                        Stepper("Root: \(noteName(app.preset.xyPad.rootNote))",
-                                value: bind(\.rootNote), in: 0...120)
-                        Stepper("Range: \(app.preset.xyPad.rangeSemitones) semitones (\(String(format: "%.1f", Double(app.preset.xyPad.rangeSemitones) / 12.0)) oct)",
-                                value: bind(\.rangeSemitones), in: 1...60)
-                        Text("Low \(noteName(app.preset.xyPad.rootNote)) → High \(noteName(app.preset.xyPad.rootNote + app.preset.xyPad.rangeSemitones))")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-
-                    Section("Glide") {
-                        Toggle("Glide (legato portamento)", isOn: bind(\.glide))
-                            .tint(Theme.accent)
-
-                        if app.preset.xyPad.glide {
-                            VStack(alignment: .leading, spacing: 4) {
-                                HStack {
-                                    Text("Glide Time")
-                                    Spacer()
-                                    Text("CC5 · \(Int(app.preset.xyPad.glideTime * 127))")
-                                        .font(.caption.monospaced())
-                                        .foregroundColor(.secondary)
-                                }
-                                Slider(value: bind(\.glideTime), in: 0...1)
-                                    .tint(Theme.accent)
-                            }
-
-                            Text("Sends CC 65 to switch portamento on, and CC 5 for slide time. Left = instant, right = slow.")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                    }
-
-                    Section("Velocity") {
-                        Toggle("Perpendicular → Velocity", isOn: bind(\.perpToVelocity))
-                            .tint(Theme.accent)
-                        if !app.preset.xyPad.perpToVelocity {
-                            Stepper("Fixed velocity: \(app.preset.xyPad.fixedVelocity)",
-                                    value: bind(\.fixedVelocity), in: 1...127)
-                        }
-                    }
+                case .notes:
+                    notesSections
                 }
 
                 Section("Shared") {
-                    Stepper("MIDI Channel: \(app.preset.xyPad.channel + 1)",
+                    Stepper("MIDI Channel: \(cfg.channel + 1)",
                             value: bind(\.channel), in: 0...15)
                     Toggle("Spring return to center", isOn: bind(\.snapBack))
                         .tint(Theme.accent)
+                }
+
+                // Scale lives on the pad surface now — a tap on the chip in
+                // the top-left corner opens the same list. It stays here at
+                // the bottom for setup work, where reaching for a menu on a
+                // pad you are not currently playing is the awkward path.
+                if surfaceMode == .notes {
+                    Section {
+                        Picker("Scale", selection: bind(\.scale)) {
+                            ForEach(Scale.families) { family in
+                                Section(family.title) {
+                                    ForEach(family.scales) { Text($0.label).tag($0) }
+                                }
+                            }
+                        }
+                    } header: {
+                        Text("Scale")
+                    } footer: {
+                        Text("Also available on the pad itself — tap the key name in the top-left corner.")
+                    }
                 }
             }
             .navigationTitle("XY Pad")
@@ -838,45 +1090,154 @@ struct XYPadConfigSheet: View {
         }
     }
 
+    // MARK: - Notes sections
+
+    @ViewBuilder
+    private var notesSections: some View {
+        Section("Voices") {
+            Picker("Voices", selection: bind(\.voiceCount)) {
+                Text("1").tag(1)
+                Text("2").tag(2)
+                Text("3").tag(3)
+            }
+            .pickerStyle(.segmented)
+
+            Text("A finger beyond the limit takes over the oldest voice. Lift it and that voice comes back.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
+
+        Section("Diagonal") {
+            HStack(spacing: 14) {
+                Spacer(minLength: 0)
+                ForEach(XYDiagonal.allCases) { d in
+                    Button {
+                        app.preset.xyPad.diagonal = d
+                    } label: {
+                        DiagonalArrowIcon(diagonal: d,
+                                          selected: cfg.diagonal == d)
+                    }
+                    .buttonStyle(.plain)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.vertical, 4)
+
+            Text(cfg.diagonal.description)
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .frame(maxWidth: .infinity, alignment: .center)
+        }
+
+        Section {
+            Stepper("Root: \(noteName(cfg.rootNote))",
+                    value: bind(\.rootNote), in: 0...120)
+            Stepper("Range: \(cfg.rangeSemitones) semitones (\(String(format: "%.1f", Double(cfg.rangeSemitones) / 12.0)) oct)",
+                    value: bind(\.rangeSemitones), in: 1...60)
+            Text("Low \(noteName(cfg.rootNote)) → High \(noteName(cfg.rootNote + cfg.rangeSemitones))")
+                .font(.caption)
+                .foregroundColor(.secondary)
+        } header: {
+            Text("Note Range")
+        } footer: {
+            Text("A dotted line crosses the pad at every octave of the root, so you can see where the next octave falls without counting bands.")
+        }
+
+        Section("Glide") {
+            Toggle("Glide (legato portamento)", isOn: bind(\.glide))
+                .tint(Theme.accent)
+
+            if cfg.glide {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Glide Time")
+                        Spacer()
+                        Text("CC\(MIDIDefaults.portamentoTimeCC) · \(Int(cfg.glideTime * 127))")
+                            .font(.caption.monospaced())
+                            .foregroundColor(.secondary)
+                    }
+                    Slider(value: bind(\.glideTime), in: 0...1)
+                        .tint(Theme.accent)
+                }
+
+                Text("Sends CC \(MIDIDefaults.portamentoSwitchCC) to switch portamento on, and CC \(MIDIDefaults.portamentoTimeCC) for slide time. Left = instant, right = slow.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+        }
+
+        Section("Velocity") {
+            Toggle("Perpendicular → Velocity", isOn: bind(\.perpToVelocity))
+                .tint(Theme.accent)
+            if !cfg.perpToVelocity {
+                Stepper("Fixed velocity: \(cfg.fixedVelocity)",
+                        value: bind(\.fixedVelocity), in: 1...127)
+            }
+        }
+    }
+
     // MARK: - Morph sections
 
     private static let cornerPositions = ["Top Left", "Top Right",
                                           "Bottom Left", "Bottom Right"]
 
+    /// Laid out as an actual 2×2 grid rather than a four-row list, because
+    /// the corners ARE a 2×2 arrangement — index order is TL, TR, BL, BR, so
+    /// each card sits where its corner sits on the pad. Finding "the one at
+    /// the bottom right" stops being a reading exercise.
     private var morphCornerSection: some View {
         Section {
-            ForEach(0..<4, id: \.self) { index in
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack {
-                        Text(Self.cornerPositions[index])
-                            .font(.caption.weight(.semibold))
-                            .foregroundColor(.secondary)
-                        Spacer()
-                        TextField("Label", text: cornerLabelBinding(index))
-                            .multilineTextAlignment(.trailing)
-                            .autocorrectionDisabled()
-                            .frame(maxWidth: 110)
-                    }
-
-                    Stepper("CC \(app.preset.xyPad.morphCorners[index].cc)",
-                            value: cornerCCBinding(index), in: 0...127)
-
-                    Toggle("Override Channel", isOn: cornerOverrideBinding(index))
-                        .tint(Theme.accent)
-
-                    if let channel = app.preset.xyPad.morphCorners[index].channelOverride {
-                        Stepper("Channel: \(channel + 1)",
-                                value: cornerChannelBinding(index, current: channel),
-                                in: 0...15)
-                    }
+            Grid(horizontalSpacing: 10, verticalSpacing: 10) {
+                GridRow {
+                    cornerCard(0)
+                    cornerCard(1)
                 }
-                .padding(.vertical, 2)
+                GridRow {
+                    cornerCard(2)
+                    cornerCard(3)
+                }
             }
+            .padding(.vertical, 4)
         } header: {
             Text("Corner Outputs")
         } footer: {
-            Text("Each corner sends its own CC. At a corner that output is 127 and the other three are 0; between corners they blend.")
+            Text("Each corner sends its own CC on its own channel. At a corner that output is 127 and the other three are 0; between corners they blend.")
         }
+    }
+
+    private func cornerCard(_ index: Int) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(Self.cornerPositions[index])
+                .font(.system(size: 10, weight: .bold, design: .rounded))
+                .foregroundColor(Theme.accent.opacity(0.8))
+
+            TextField("Label", text: cornerLabelBinding(index))
+                .font(.subheadline.weight(.semibold))
+                .autocorrectionDisabled()
+                .textFieldStyle(.plain)
+
+            Divider().opacity(0.4)
+
+            Stepper(value: cornerCCBinding(index), in: 0...127) {
+                Text("CC \(app.preset.xyPad.morphCorners[index].cc)")
+                    .font(.caption.monospaced())
+            }
+
+            Stepper(value: cornerChannelBinding(index), in: 0...15) {
+                Text("Ch \(app.preset.xyPad.morphCorners[index].channel + 1)")
+                    .font(.caption.monospaced())
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Theme.panel2.opacity(0.6))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(Color.white.opacity(0.1), lineWidth: 1)
+        )
     }
 
     private var morphShapeSection: some View {
@@ -897,7 +1258,7 @@ struct XYPadConfigSheet: View {
                 HStack {
                     Text("Center Strength")
                     Spacer()
-                    Text("\(Int(app.preset.xyPad.morphCenterStrength * 100))%")
+                    Text("\(Int(cfg.morphCenterStrength * 100))%")
                         .font(.caption.monospaced())
                         .foregroundColor(.secondary)
                 }
@@ -915,14 +1276,41 @@ struct XYPadConfigSheet: View {
     }
 
     private var morphCurveDescription: String {
-        let v = Int(app.preset.xyPad.morphCurve.rounded())
+        let v = Int(cfg.morphCurve.rounded())
         if v == 0 { return "0 · linear" }
         return v > 0 ? "+\(v) · focused" : "\(v) · spread"
     }
 
+    // MARK: - Bindings
+
+    private var surfaceMode: XYSurfaceMode {
+        if cfg.mode == .notes { return .notes }
+        return cfg.ccMode == .morph ? .morph : .standard
+    }
+
+    /// The sheet is never the thing being played, so unlike the pad's own
+    /// binding this has no voices to release.
+    private var surfaceModeBinding: Binding<XYSurfaceMode> {
+        Binding(
+            get: { surfaceMode },
+            set: { newMode in
+                switch newMode {
+                case .notes:
+                    app.preset.xyPad.mode = .notes
+                case .standard:
+                    app.preset.xyPad.mode = .cc
+                    app.preset.xyPad.ccMode = .standard
+                case .morph:
+                    app.preset.xyPad.mode = .cc
+                    app.preset.xyPad.ccMode = .morph
+                }
+            }
+        )
+    }
+
     // Corner bindings write through the array by index. The decoder
     // guarantees exactly four entries, and these are only reachable from
-    // ForEach(0..<4), so the index is always valid.
+    // the fixed 2×2 grid above, so the index is always valid.
 
     private func cornerLabelBinding(_ index: Int) -> Binding<String> {
         Binding(
@@ -938,20 +1326,10 @@ struct XYPadConfigSheet: View {
         )
     }
 
-    private func cornerOverrideBinding(_ index: Int) -> Binding<Bool> {
+    private func cornerChannelBinding(_ index: Int) -> Binding<Int> {
         Binding(
-            get: { app.preset.xyPad.morphCorners[index].channelOverride != nil },
-            set: { isOn in
-                app.preset.xyPad.morphCorners[index].channelOverride =
-                    isOn ? app.preset.xyPad.channel : nil
-            }
-        )
-    }
-
-    private func cornerChannelBinding(_ index: Int, current: Int) -> Binding<Int> {
-        Binding(
-            get: { current },
-            set: { app.preset.xyPad.morphCorners[index].channelOverride = min(max($0, 0), 15) }
+            get: { app.preset.xyPad.morphCorners[index].channel },
+            set: { app.preset.xyPad.morphCorners[index].channel = min(max($0, 0), 15) }
         )
     }
 

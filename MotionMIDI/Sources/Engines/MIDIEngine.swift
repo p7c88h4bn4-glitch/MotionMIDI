@@ -175,7 +175,7 @@ final class MIDIEngine: ObservableObject {
         sendQueue.async { [self] in
             var list = MIDIEventList()
             let packet = MIDIEventListInit(&list, ._1_0)
-            var words = [w]
+            let words = [w]
             words.withUnsafeBufferPointer { buf in
                 _ = MIDIEventListAdd(&list,
                                      MemoryLayout<MIDIEventList>.size,

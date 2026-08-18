@@ -114,15 +114,11 @@ final class AppState: ObservableObject {
         return new.id
     }
 
-    /// Copies the active preset wholesale. Nested ids (mappings, buttons)
-    /// are intentionally carried over — they're only ever resolved within
-    /// their own preset, so the copy's glide-toggle button assignment keeps
-    /// pointing at the copy's own button.
     @discardableResult
-    func duplicateActivePreset() -> UUID {
+    func duplicateActivePreset(named newName: String? = nil) -> UUID {
         var copy = preset
         copy.id = UUID()
-        copy.name = uniqueName(from: preset.name + " Copy", ifEmpty: "Copy")
+        copy.name = uniqueName(from: newName ?? (preset.name + " Copy"), ifEmpty: "Copy")
         copy.lastUsed = Date()
         presets.append(copy)
         activatePreset(copy.id)
@@ -168,60 +164,90 @@ final class AppState: ObservableObject {
         PresetLibraryStore.save(presets: presets, activeID: activePresetID)
     }
 
-    // MARK: - Stepped dial
+    // MARK: - Stepped dial(s)
+    //
+    // Every dial-related call now takes a `slot` index into
+    // `preset.dialSlots`. iPhone always passes 0. iPad passes whichever
+    // slot's dial/fader pair the person is touching. The shared library
+    // (`dialLibrary`) is unchanged — any slot in any preset can still link
+    // to a shared entry, independent of every other slot.
 
-    /// The dial currently shown on the deck: the linked library preset if
-    /// the link resolves, otherwise this preset's own local dial.
-    var activeDial: DialPreset {
-        if let id = preset.linkedDialPresetID,
+    /// The dial shown for a given slot: the linked library preset if the
+    /// link resolves, otherwise that slot's own local dial. Out-of-range
+    /// slot indices (e.g. a stale view after a slot was deleted) fall back
+    /// to slot 0 rather than crashing.
+    func dial(at slot: Int) -> DialPreset {
+        guard preset.dialSlots.indices.contains(slot) else {
+            return preset.dialSlots.first?.localDial ?? .factory
+        }
+        let entry = preset.dialSlots[slot]
+        if let id = entry.linkedDialPresetID,
            let shared = dialLibrary.first(where: { $0.id == id }) {
             return shared
         }
-        return preset.dial
+        return entry.localDial
     }
 
-    /// True when the on-screen dial is a shared library preset.
-    var dialIsLinked: Bool {
-        guard let id = preset.linkedDialPresetID else { return false }
+    /// True when the given slot's on-screen dial is a shared library preset.
+    func dialIsLinked(at slot: Int) -> Bool {
+        guard preset.dialSlots.indices.contains(slot),
+              let id = preset.dialSlots[slot].linkedDialPresetID else { return false }
         return dialLibrary.contains { $0.id == id }
     }
 
-    /// Mutate the active dial wherever it actually lives — the shared
-    /// library entry when linked, the preset's local dial otherwise.
-    /// A dangling link (library entry deleted) falls back to local.
-    func updateActiveDial(_ mutate: (inout DialPreset) -> Void) {
-        if let id = preset.linkedDialPresetID {
+    /// Mutate a slot's dial wherever it actually lives — the shared library
+    /// entry when linked, that slot's local dial otherwise. A dangling link
+    /// (library entry deleted elsewhere) heals back to local.
+    func updateDial(at slot: Int, _ mutate: (inout DialPreset) -> Void) {
+        guard preset.dialSlots.indices.contains(slot) else { return }
+        if let id = preset.dialSlots[slot].linkedDialPresetID {
             if let index = dialLibrary.firstIndex(where: { $0.id == id }) {
                 mutate(&dialLibrary[index])
                 return
             }
-            preset.linkedDialPresetID = nil   // dangling link — heal it
+            preset.dialSlots[slot].linkedDialPresetID = nil   // heal
         }
-        mutate(&preset.dial)
+        mutate(&preset.dialSlots[slot].localDial)
     }
 
-    /// Select a dial step: persist the position, then fire every action the
-    /// step carries. Actions are stored in kind order, so a step that both
-    /// sends MIDI and changes a pad parameter always does so in the same
-    /// sequence.
-    func selectDialStep(_ index: Int) {
-        let dial = activeDial
-        guard dial.steps.indices.contains(index) else { return }
-        updateActiveDial { $0.currentStepIndex = index }
-        for action in dial.steps[index].actions {
-            perform(action, dialChannel: dial.channel)
+    /// Select a step on a given slot's dial: persist the position, then fire
+    /// every action the step carries, in the order they're stored.
+    func selectDialStep(at slot: Int, _ stepIndex: Int) {
+        let d = dial(at: slot)
+        guard d.steps.indices.contains(stepIndex) else { return }
+        updateDial(at: slot) { $0.currentStepIndex = stepIndex }
+        for action in d.steps[stepIndex].actions {
+            perform(action, dialChannel: d.channel)
         }
+    }
+
+    /// Appends a new dial+fader slot (iPad only, in practice — see
+    /// `ControlDeckView`). No upper limit; the row that displays these
+    /// scrolls horizontally once they no longer fit.
+    func addDialSlot() {
+        preset.dialSlots.append(DialSlot())
+    }
+
+    /// Removes a slot. Refuses to remove the last one, same guard as preset
+    /// deletion, so there's always at least slot 0 for iPhone to show.
+    func removeDialSlot(at slot: Int) {
+        guard preset.dialSlots.count > 1,
+              preset.dialSlots.indices.contains(slot) else { return }
+        preset.dialSlots.remove(at: slot)
     }
 
     /// Execute one dial action.
+    ///
+    /// `dialChannel` is no longer consulted for the MIDI cases — every
+    /// sending action now carries its own channel outright, resolved at load
+    /// time for presets written before the change. It stays in the signature
+    /// because callers pass it and a future action kind may want it.
     func perform(_ action: DialAction, dialChannel: Int) {
         switch action {
-        case .sendCC(let cc, let value, let channelOverride):
-            midi.controlChange(cc, value: value,
-                               channel: channelOverride ?? dialChannel)
-        case .sendProgramChange(let program, let channelOverride):
-            midi.programChange(program,
-                               channel: channelOverride ?? dialChannel)
+        case .sendCC(let cc, let value, let channel):
+            midi.controlChange(cc, value: value, channel: channel)
+        case .sendProgramChange(let program, let channel):
+            midi.programChange(program, channel: channel)
         case .setRootNote(let n):
             preset.xyPad.rootNote = min(max(n, 0), 120)
         case .setScale(let s):
@@ -264,7 +290,8 @@ final class AppState: ObservableObject {
     /// from a previous session would masquerade as the host's live state.
     @Published var faderValueCache: [CCKey: Int] = [:]
 
-    /// The active step's fader assignment. Two sources, in priority order:
+    /// A slot's active step's fader assignment. Two sources, in priority
+    /// order:
     ///
     ///   1. An explicit **Fader Control** action — the step says outright
     ///      which CC the fader drives, independent of what else it does.
@@ -275,45 +302,48 @@ final class AppState: ObservableObject {
     /// that `perform()` writes: a cached override would go stale the moment
     /// you selected a step that didn't set one, leaving the fader pointed at
     /// the previous step's CC.
-    var faderAssignment: (key: CCKey, storedValue: Int)? {
-        guard let step = activeDial.currentStep else { return nil }
+    ///
+    /// The cache itself (`faderValueCache`) stays keyed by CC identity only,
+    /// shared across every slot and every preset — if two slots happen to
+    /// point at the same channel/CC, they show the same live value, which
+    /// is the correct behavior for "this is the same host parameter".
+    func faderAssignment(at slot: Int) -> (key: CCKey, storedValue: Int)? {
+        let d = dial(at: slot)
+        guard let step = d.currentStep else { return nil }
 
-        if case .setFaderCC(let cc, let defaultValue, let channelOverride)?
+        if case .setFaderCC(let cc, let defaultValue, let channel)?
             = step.action(ofKind: .faderCC) {
-            let key = CCKey(channel: channelOverride ?? activeDial.channel, cc: cc)
-            return (key, defaultValue)
+            return (CCKey(channel: channel, cc: cc), defaultValue)
         }
 
-        if case .sendCC(let cc, let value, let channelOverride)?
+        if case .sendCC(let cc, let value, let channel)?
             = step.action(ofKind: .cc) {
-            let key = CCKey(channel: channelOverride ?? activeDial.channel, cc: cc)
-            return (key, value)
+            return (CCKey(channel: channel, cc: cc), value)
         }
 
         return nil
     }
 
-    /// What the fader shows, fully DERIVED — never separately stored, so
-    /// there is no second copy to fall out of sync:
+    /// What a slot's fader shows, fully DERIVED — never separately stored:
     ///   1. cached feedback/user value for the assignment, else
-    ///   2. the step's own stored Send CC value (the app already has it), else
+    ///   2. the step's own stored Send CC value, else
     ///   3. nil — no Send CC on this step; the fader renders disabled.
     /// Because this recomputes when the selected step changes, "recall on
     /// step change" needs no code at all, and repositioning is inherently
     /// silent.
-    var faderDisplayedValue: Int? {
-        guard let assignment = faderAssignment else { return nil }
+    func faderDisplayedValue(at slot: Int) -> Int? {
+        guard let assignment = faderAssignment(at: slot) else { return nil }
         return faderValueCache[assignment.key] ?? assignment.storedValue
     }
 
-    /// USER fader movement — the ONLY path anywhere that transmits the
+    /// USER fader movement — the ONLY path anywhere that transmits a
     /// fader's CC. Incoming feedback and step changes touch only the cache
     /// and derived state above, so loops are prevented structurally rather
     /// than by timing.
-    func faderMoved(to rawValue: Int) {
-        guard let assignment = faderAssignment else { return }
+    func faderMoved(at slot: Int, to rawValue: Int) {
+        guard let assignment = faderAssignment(at: slot) else { return }
         let value = min(max(rawValue, 0), 127)
-        guard value != faderDisplayedValue else { return }   // no repeats
+        guard value != faderDisplayedValue(at: slot) else { return }   // no repeats
         faderValueCache[assignment.key] = value
         midi.controlChange(assignment.key.cc, value: value,
                            channel: assignment.key.channel)
@@ -329,25 +359,33 @@ final class AppState: ObservableObject {
 
     // MARK: - Dial library management
 
-    /// Copy the active dial into the shared library and link to the copy.
-    func saveActiveDialToLibrary() {
-        var copy = activeDial
+    /// Copy a slot's active dial into the shared library and link that slot
+    /// to the copy.
+    func saveDialToLibrary(at slot: Int) {
+        guard preset.dialSlots.indices.contains(slot) else { return }
+        var copy = dial(at: slot)
         copy.id = UUID()
-        if dialIsLinked { copy.name += " Copy" }
+        if dialIsLinked(at: slot) { copy.name += " Copy" }
         dialLibrary.append(copy)
-        preset.linkedDialPresetID = copy.id
+        preset.dialSlots[slot].linkedDialPresetID = copy.id
     }
 
-    func linkDial(to id: UUID?) {
-        preset.linkedDialPresetID = id
+    func linkDial(at slot: Int, to id: UUID?) {
+        guard preset.dialSlots.indices.contains(slot) else { return }
+        preset.dialSlots[slot].linkedDialPresetID = id
     }
 
+    /// Removing a shared preset can dangle links in ANY slot of the active
+    /// preset (not just one), so every slot is checked and healed back to
+    /// its local dial.
     func deleteDialPresets(at offsets: IndexSet) {
         let removedIDs = offsets.map { dialLibrary[$0].id }
         dialLibrary.remove(atOffsets: offsets)
-        if let linked = preset.linkedDialPresetID,
-           removedIDs.contains(linked) {
-            preset.linkedDialPresetID = nil   // fall back to local dial
+        for index in preset.dialSlots.indices {
+            if let linked = preset.dialSlots[index].linkedDialPresetID,
+               removedIDs.contains(linked) {
+                preset.dialSlots[index].linkedDialPresetID = nil
+            }
         }
     }
 }

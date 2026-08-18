@@ -3,7 +3,7 @@ import SwiftUI
 /// Preset browser, opened by tapping the preset name in the header.
 ///
 /// Ordered most-recently-used first, so whatever you were just playing sits
-/// at the top. Tapping a row switches immediately and closes — during a set
+/// at the top. Tapping a row switches immediately and closes — during a se t
 /// that should be one tap, not a tap plus a confirm.
 struct PresetPickerSheet: View {
     @EnvironmentObject var app: AppState
@@ -33,17 +33,10 @@ struct PresetPickerSheet: View {
 
                 Section {
                     Button {
-                        newPresetName = ""
+                        newPresetName = app.preset.name
                         showNewPrompt = true
                     } label: {
-                        Label("New Preset", systemImage: "plus.circle.fill")
-                    }
-
-                    Button {
-                        app.duplicateActivePreset()
-                        dismiss()
-                    } label: {
-                        Label("Duplicate “\(app.preset.name)”", systemImage: "plus.square.on.square")
+                        Label("Save As New Preset", systemImage: "plus.square.on.square")
                     }
                 }
                 .tint(Theme.accent)
@@ -55,15 +48,15 @@ struct PresetPickerSheet: View {
                     Button("Done") { dismiss() }
                 }
             }
-            .alert("New Preset", isPresented: $showNewPrompt) {
+            .alert("Save As New Preset", isPresented: $showNewPrompt) {
                 TextField("Name", text: $newPresetName)
                 Button("Cancel", role: .cancel) { }
-                Button("Create") {
-                    app.createPreset(named: newPresetName)
+                Button("Save") {
+                    app.duplicateActivePreset(named: newPresetName)
                     dismiss()
                 }
             } message: {
-                Text("Starts from the default layout.")
+                Text("Saves a copy of the current preset with a new name.")
             }
             .alert("Rename Preset", isPresented: renameBinding) {
                 TextField("Name", text: $renameText)

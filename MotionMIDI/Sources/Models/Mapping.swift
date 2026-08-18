@@ -1,5 +1,123 @@
 import Foundation
 
+// MARK: - Central MIDI default allocation
+//
+// ONE place that decides which CC number every feature reaches for when it
+// has no user-chosen value yet. Before this existed the numbers were typed
+// inline at each site, and two of them collided: the stepped dial's default
+// Send CC (20) and Fader CC (21) landed straight on top of morph corners A
+// and B. Adding a dial step to a preset already using 4-Corner Morph meant
+// two controls fighting over the same CC with no warning.
+//
+// ── The map ─────────────────────────────────────────────────────────────
+//
+//   CC 1    Roll → Mod Wheel            (MIDI standard)
+//   CC 2    Shake → Breath              (MIDI standard)
+//   CC 5    Glide time                  (MIDI standard: Portamento Time)
+//   CC 11   Pitch → Expression          (MIDI standard)
+//   CC 12   XY pad X                    (Effect Control 1)
+//   CC 13   XY pad Y                    (Effect Control 2)
+//   CC 20   Morph corner A              (spec-undefined)
+//   CC 21   Morph corner B              (spec-undefined)
+//   CC 22   Morph corner C              (spec-undefined)
+//   CC 23   Morph corner D              (spec-undefined)
+//   CC 65   Glide on/off                (MIDI standard: Portamento Switch)
+//   CC 74   Yaw → Filter Cutoff         (MIDI standard: Brightness)
+//   CC 102-110  Stepped dial Send CC    (spec-undefined block)
+//   CC 111-119  Stepped dial Fader CC   (spec-undefined block)
+//
+// The dial moved into 102-119 rather than sitting next to the morph corners
+// in the low twenties for two reasons. It is the largest block the MIDI
+// spec leaves permanently undefined, so nothing else will ever claim it,
+// and it is big enough that an iPad preset with several dial slots can hand
+// every slot its own pair without running into the morph corners again.
+//
+// CC 32-63 is deliberately avoided everywhere. Those are the LSB partners
+// of CC 0-31 under 14-bit CC, and while most iOS hosts treat all 128 as
+// plain 7-bit, a host that does implement 14-bit would read a write to
+// CC 34 as fine detail on CC 2 rather than as its own control.
+enum MIDIDefaults {
+
+    // ── Channel ─────────────────────────────────────────────────────────
+    /// 0-based, so this is channel 1 as displayed everywhere in the UI.
+    /// Every output in the app starts here.
+    static let channel = 0
+
+    // ── Motion sources ──────────────────────────────────────────────────
+    static let rollCC  = 1
+    static let shakeCC = 2
+    static let pitchCC = 11
+    static let yawCC   = 74
+
+    // ── XY pad, standard mode ───────────────────────────────────────────
+    static let xyXCC = 12
+    static let xyYCC = 13
+
+    // ── XY pad, 4-corner morph ──────────────────────────────────────────
+    /// A/B/C/D in TL/TR/BL/BR order. Exactly four, always — the pad indexes
+    /// this directly.
+    static let morphCornerCCs = [20, 21, 22, 23]
+
+    // ── Glide, fixed by the MIDI spec ───────────────────────────────────
+    /// Not configurable and not part of the free-CC search: a synth looks
+    /// for portamento on these two numbers or not at all.
+    static let portamentoTimeCC   = 5
+    static let portamentoSwitchCC = 65
+
+    // ── Stepped dial ────────────────────────────────────────────────────
+    static let dialSendCCBlock  = 102...110
+    static let dialFaderCCBlock = 111...119
+
+    /// Starting point when a step's Send CC action is first switched on.
+    static var dialSendCC: Int { dialSendCCBlock.lowerBound }
+    /// Starting point when a step's Fader Control action is first switched on.
+    static var dialFaderCC: Int { dialFaderCCBlock.lowerBound }
+
+    // ── Transport buttons ───────────────────────────────────────────────
+    /// The six factory buttons, in order. Sits just above the morph corners
+    /// in the block of controller numbers the MIDI spec leaves undefined,
+    /// so nothing here collides with a standard meaning a synth might act
+    /// on by itself.
+    static let buttonCCs = [24, 25, 26, 27, 28, 29]
+
+    /// Ordered pool a newly added button draws from, longest run first.
+    ///
+    /// Deliberately not a single `ClosedRange` like the dial blocks: there
+    /// is no run of undefined controller numbers long enough left over once
+    /// the dial has taken 102–119, so this stitches together the spec's
+    /// remaining undefined numbers instead. Everything here is undefined in
+    /// the MIDI 1.0 spec — 96–101 are pointedly absent, since those carry
+    /// data entry and RPN/NRPN and a button firing one would confuse a
+    /// receiver mid-edit.
+    static let buttonCCPool: [Int] = Array(24...31) + [85, 86, 87, 88, 89, 90]
+                                                    + [3, 9, 14, 15]
+
+    /// Lowest unclaimed CC in the button pool.
+    static func firstFreeButtonCC(avoiding used: Set<Int>) -> Int {
+        buttonCCPool.first { !used.contains($0) } ?? buttonCCPool[0]
+    }
+
+    /// Every CC this app hands out by itself. Useful as the starting set for
+    /// a free-CC search, so a new assignment avoids the whole factory layout
+    /// rather than only the feature it belongs to.
+    static var reservedCCs: Set<Int> {
+        var used: Set<Int> = [rollCC, shakeCC, pitchCC, yawCC,
+                              xyXCC, xyYCC,
+                              portamentoTimeCC, portamentoSwitchCC,
+                              dialSendCC, dialFaderCC]
+        used.formUnion(morphCornerCCs)
+        used.formUnion(buttonCCs)
+        return used
+    }
+
+    /// Lowest CC in `block` not already in `used`. Falls back to the block's
+    /// first entry when every slot is taken — a duplicate is better than a
+    /// silent failure to assign, and the editor still lets it be changed.
+    static func firstFree(in block: ClosedRange<Int>, avoiding used: Set<Int>) -> Int {
+        block.first { !used.contains($0) } ?? block.lowerBound
+    }
+}
+
 // MARK: - Response curves
 
 enum ResponseCurve: String, Codable, CaseIterable, Identifiable {
@@ -51,7 +169,7 @@ struct MotionMapping: Identifiable, Codable, Equatable {
     var enabled: Bool = true
     var source: MotionSource
     /// 0-based MIDI channel (displayed to the user as 1-16).
-    var channel: Int = 0
+    var channel: Int = MIDIDefaults.channel
     var cc: Int
     var processing = MotionProcessing()
 }
@@ -144,33 +262,85 @@ enum CCPadMode: String, Codable, CaseIterable, Identifiable {
 /// pitch bend, RPN/NRPN and OSC are explicitly out of scope for this
 /// feature, and the morph engine works in normalized weights so a richer
 /// destination type can be introduced later without touching the math.
+///
+/// The channel is a PLAIN VALUE, not an optional override. Earlier builds
+/// stored `channelOverride: Int?` behind an "Override Channel" toggle, so
+/// reading a corner's channel meant knowing whether the toggle was on and
+/// what the pad's channel was underneath. Every corner now simply has a
+/// channel, starting on 1, always visible and always selectable — nothing
+/// to switch on before it can be set.
 struct MorphCorner: Codable, Equatable, Identifiable {
     var id = UUID()
     var label: String
     var cc: Int
-    /// nil = inherit the XY pad's channel.
-    var channelOverride: Int? = nil
+    /// 0-based (displayed as 1-16).
+    var channel: Int = MIDIDefaults.channel
 
-    func channel(padChannel: Int) -> Int { channelOverride ?? padChannel }
+    init(id: UUID = UUID(),
+         label: String,
+         cc: Int,
+         channel: Int = MIDIDefaults.channel) {
+        self.id = id
+        self.label = label
+        self.cc = cc
+        self.channel = channel
+    }
 
     static func defaults() -> [MorphCorner] {
-        [
-            MorphCorner(label: "A", cc: 20),
-            MorphCorner(label: "B", cc: 21),
-            MorphCorner(label: "C", cc: 22),
-            MorphCorner(label: "D", cc: 23)
+        let ccs = MIDIDefaults.morphCornerCCs
+        return [
+            MorphCorner(label: "A", cc: ccs[0]),
+            MorphCorner(label: "B", cc: ccs[1]),
+            MorphCorner(label: "C", cc: ccs[2]),
+            MorphCorner(label: "D", cc: ccs[3])
         ]
+    }
+}
+
+extension MorphCorner {
+    enum CodingKeys: String, CodingKey {
+        case id, label, cc, channel
+    }
+
+    /// Decode-only, and deliberately kept OUT of `CodingKeys`. The moment
+    /// `CodingKeys` carries a case with no matching stored property the
+    /// compiler stops synthesizing `encode(to:)` and the type quietly loses
+    /// Encodable conformance — the same trap `Preset` documents for its own
+    /// legacy dial keys.
+    private enum LegacyCodingKeys: String, CodingKey {
+        case channelOverride
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id    = try c.decodeIfPresent(UUID.self,   forKey: .id)    ?? UUID()
+        label = try c.decodeIfPresent(String.self, forKey: .label) ?? "A"
+        cc    = try c.decodeIfPresent(Int.self,    forKey: .cc)
+            ?? MIDIDefaults.morphCornerCCs[0]
+
+        if let stored = try c.decodeIfPresent(Int.self, forKey: .channel) {
+            channel = stored
+        } else {
+            // Pre-flattening preset. A corner that had the override switched
+            // ON keeps the channel it was overriding to; one that had it off
+            // was inheriting the pad's channel, and the pad's own default is
+            // the same value this falls back to.
+            let legacy = try decoder.container(keyedBy: LegacyCodingKeys.self)
+            channel = try legacy.decodeIfPresent(Int.self, forKey: .channelOverride)
+                ?? MIDIDefaults.channel
+        }
+        channel = min(max(channel, 0), 15)
     }
 }
 
 struct XYPadConfig: Codable, Equatable {
     // ── CC mode ──────────────────────────────────────────────────────────
-    var xCC: Int = 12
-    var yCC: Int = 13
+    var xCC: Int = MIDIDefaults.xyXCC
+    var yCC: Int = MIDIDefaults.xyYCC
 
     // ── Shared ───────────────────────────────────────────────────────────
     /// 0-based channel.
-    var channel: Int = 0
+    var channel: Int = MIDIDefaults.channel
     /// When true the puck springs back to center on release (Spring return).
     /// When false the puck holds its last position (Hold position).
     var snapBack: Bool = true
@@ -232,9 +402,9 @@ extension XYPadConfig {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        xCC            = try c.decodeIfPresent(Int.self,        forKey: .xCC)            ?? 12
-        yCC            = try c.decodeIfPresent(Int.self,        forKey: .yCC)            ?? 13
-        channel        = try c.decodeIfPresent(Int.self,        forKey: .channel)        ?? 0
+        xCC            = try c.decodeIfPresent(Int.self,        forKey: .xCC)            ?? MIDIDefaults.xyXCC
+        yCC            = try c.decodeIfPresent(Int.self,        forKey: .yCC)            ?? MIDIDefaults.xyYCC
+        channel        = try c.decodeIfPresent(Int.self,        forKey: .channel)        ?? MIDIDefaults.channel
         snapBack       = try c.decodeIfPresent(Bool.self,       forKey: .snapBack)       ?? true
         mode           = try c.decodeIfPresent(XYPadMode.self,  forKey: .mode)           ?? .cc
         diagonal       = try c.decodeIfPresent(XYDiagonal.self, forKey: .diagonal)       ?? .bottomLeftToTopRight
@@ -269,20 +439,111 @@ extension XYPadConfig {
 // MARK: - Buttons
 
 enum ButtonBehavior: String, Codable, CaseIterable, Identifiable {
-    /// Note On while held, Note Off on release.
+    /// Held: the "on" message on press, the "off" message on release.
     case momentary
-    /// Short Note On + Off tap per press (Loopy Pro toggles internally).
+    /// Short on + off per press (Loopy Pro toggles internally).
     case tap
 
     var id: String { rawValue }
     var label: String { self == .momentary ? "Momentary" : "Tap" }
 }
 
+/// What a transport button puts on the wire.
+///
+/// CC is the default for new buttons. Notes work fine for triggering clips,
+/// but a CC can be MIDI-learned to anything a host exposes — a mixer send,
+/// a plugin parameter, a transport control — whereas a note is only ever
+/// heard by something listening for notes.
+enum ButtonMessage: String, Codable, CaseIterable, Identifiable {
+    case cc
+    case note
+
+    var id: String { rawValue }
+    var label: String { self == .cc ? "CC" : "Note" }
+}
+
 struct ButtonMapping: Identifiable, Codable, Equatable {
     var id = UUID()
     var name: String
-    var note: Int
+    /// New buttons send CC. Buttons restored from a preset saved before this
+    /// existed stay on notes — see the decoder below.
+    var message: ButtonMessage = .cc
+    /// Used when `message` is `.note`.
+    var note: Int = 60
+    /// Used when `message` is `.cc`.
+    var cc: Int = MIDIDefaults.buttonCCPool[0]
+    /// Sent on press. Also the note velocity when sending notes.
+    var onValue: Int = 127
+    /// Sent on release (momentary) or straight after the on value (tap).
+    var offValue: Int = 0
     /// 0-based channel.
-    var channel: Int = 0
+    var channel: Int = MIDIDefaults.channel
     var behavior: ButtonBehavior = .tap
+
+    init(id: UUID = UUID(),
+         name: String,
+         message: ButtonMessage = .cc,
+         note: Int = 60,
+         cc: Int = MIDIDefaults.buttonCCPool[0],
+         onValue: Int = 127,
+         offValue: Int = 0,
+         channel: Int = MIDIDefaults.channel,
+         behavior: ButtonBehavior = .tap) {
+        self.id = id
+        self.name = name
+        self.message = message
+        self.note = note
+        self.cc = cc
+        self.onValue = onValue
+        self.offValue = offValue
+        self.channel = channel
+        self.behavior = behavior
+    }
+
+    /// One-line description for the editor list.
+    var summary: String {
+        switch message {
+        case .cc:
+            return "CC\(cc) → \(onValue)/\(offValue) · CH \(channel + 1) · \(behavior.label)"
+        case .note:
+            return "Note \(note) · CH \(channel + 1) · \(behavior.label)"
+        }
+    }
+}
+
+extension ButtonMapping {
+    enum CodingKeys: String, CodingKey {
+        case id, name, message, note, cc, onValue, offValue, channel, behavior
+    }
+
+    /// The default in the memberwise init above is `.cc`, but the default
+    /// HERE is `.note`, and the difference is deliberate.
+    ///
+    /// A missing `message` key means the file predates this feature, and
+    /// back then every button sent a note. Defaulting a decode to `.cc`
+    /// would silently repoint every button in every saved preset at a
+    /// controller number — the buttons would still light up and still send
+    /// something, so nothing would look broken until a live set didn't
+    /// trigger. New buttons get the new default; existing ones keep doing
+    /// exactly what they were built to do.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id       = try c.decodeIfPresent(UUID.self,   forKey: .id)   ?? UUID()
+        name     = try c.decodeIfPresent(String.self, forKey: .name) ?? "BTN"
+        note     = try c.decodeIfPresent(Int.self,    forKey: .note) ?? 60
+        message  = try c.decodeIfPresent(ButtonMessage.self, forKey: .message) ?? .note
+        cc       = try c.decodeIfPresent(Int.self, forKey: .cc)
+            ?? MIDIDefaults.buttonCCPool[0]
+        onValue  = try c.decodeIfPresent(Int.self, forKey: .onValue)  ?? 127
+        offValue = try c.decodeIfPresent(Int.self, forKey: .offValue) ?? 0
+        channel  = try c.decodeIfPresent(Int.self, forKey: .channel)
+            ?? MIDIDefaults.channel
+        behavior = try c.decodeIfPresent(ButtonBehavior.self, forKey: .behavior) ?? .tap
+
+        note     = min(max(note, 0), 127)
+        cc       = min(max(cc, 0), 127)
+        onValue  = min(max(onValue, 0), 127)
+        offValue = min(max(offValue, 0), 127)
+        channel  = min(max(channel, 0), 15)
+    }
 }

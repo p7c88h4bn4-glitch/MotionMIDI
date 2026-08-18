@@ -151,3 +151,33 @@ enum Scale: String, Codable, CaseIterable, Identifiable {
         return result.isEmpty ? [min(max(root, 0), 127)] : result
     }
 }
+
+// MARK: - Menu grouping
+
+/// Twenty-four scales in one flat picker is a scroll, not a choice. These
+/// families are the same groupings the case list above is already organized
+/// into, promoted to something the UI can iterate so the on-pad menu and the
+/// config sheet present an identical, sectioned list.
+extension Scale {
+    struct Family: Identifiable {
+        let id = UUID()
+        let title: String
+        let scales: [Scale]
+    }
+
+    static let families: [Family] = [
+        Family(title: "Chromatic", scales: [.chromatic]),
+        Family(title: "Pentatonic", scales: [.majorPentatonic, .minorPentatonic]),
+        Family(title: "Church Modes", scales: [.ionian, .dorian, .phrygian,
+                                               .lydian, .mixolydian, .aeolian]),
+        Family(title: "Minor Variants", scales: [.harmonicMinor, .melodicMinor,
+                                                 .phrygianDominant]),
+        Family(title: "Bebop (Barry Harris)", scales: [.barryMajor6Diminished,
+                                                       .barryMinor6Diminished,
+                                                       .barryDominantBebop]),
+        Family(title: "Symmetric & Jazz", scales: [.wholeTone, .diminishedWholeHalf,
+                                                   .diminishedHalfWhole, .altered,
+                                                   .blues]),
+        Family(title: "Hexatonic", scales: [.augmented, .prometheus, .tritoneScale])
+    ]
+}

@@ -3,50 +3,24 @@ import SwiftUI
 struct ContentView: View {
     @EnvironmentObject var app: AppState
     @State private var showEditor = false
-    @State private var showPresetPicker = false
 
+    // The app-title header row is gone deliberately. It spent a full row of
+    // height telling you which app you had open — something you already know
+    // — on the one screen where vertical space is the scarce resource. The
+    // preset selector it shared that row with moved into the XY pad's own
+    // header, beside the settings button, so nothing was lost but the title.
     var body: some View {
-        VStack(spacing: 14) {
-            // Header — the preset name doubles as the library button.
-            HStack {
-                Text("MOTION MIDI PRO")
-                    .font(.system(.footnote, design: .rounded).weight(.heavy))
-                    .tracking(2)
-                    .foregroundColor(Theme.accent)
-
-                Spacer()
-
-                Button {
-                    showPresetPicker = true
-                } label: {
-                    HStack(spacing: 5) {
-                        Text(app.preset.name.uppercased())
-                            .font(.caption2.monospaced())
-                            .lineLimit(1)
-                        Image(systemName: "chevron.up.chevron.down")
-                            .font(.system(size: 8, weight: .bold))
-                    }
-                    .foregroundColor(Theme.dim)
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 5)
-                    .background(
-                        Capsule().fill(Theme.panel2)
-                    )
-                    .overlay(
-                        Capsule().strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
-                    )
-                }
-                .buttonStyle(.plain)
-            }
-
-            // Top third: XY pad (grows to fill when editor is hidden)
+        VStack(spacing: 0) {
+            // XY pad (grows to fill when the editor is hidden)
             XYPadView()
                 .frame(maxHeight: .infinity)
 
-            // Middle third: performance controls
+            // Performance controls, pushed down slightly to give the pad
+            // more room to breathe at the top.
             ControlDeckView(showEditor: $showEditor)
+                .padding(.top, 8)
 
-            // Bottom third: collapsible editor
+            // Collapsible editor
             if showEditor {
                 EditorView()
                     .frame(height: 340)
@@ -56,9 +30,5 @@ struct ContentView: View {
         .padding(14)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.bg.ignoresSafeArea())
-        .sheet(isPresented: $showPresetPicker) {
-            PresetPickerSheet()
-                .environmentObject(app)
-        }
     }
 }

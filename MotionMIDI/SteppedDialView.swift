@@ -16,13 +16,23 @@ import SwiftUI
 struct SteppedDialView: View {
     @EnvironmentObject var app: AppState
 
+    /// Which dial+fader slot this instance shows. iPhone always passes 0.
+    let slot: Int
+
     @State private var showSettings = false
 
     // ── Single-gesture state machine ────────────────────────────────────
-    /// Which interpretation this drag settled into. Decided ONCE, the first
-    /// time the finger travels past the slop threshold, so a curved swipe
-    /// can't flip modes halfway through and fight itself.
-    private enum DragMode { case undecided, rotary, vertical }
+    /// Locked once per drag, the first time the finger travels past the slop
+    /// threshold, so a curved swipe can't flip modes mid-gesture.
+    ///
+    /// `horizontal` does nothing on purpose. It used to be `rotary` — a
+    /// sideways sweep pointed the dial at whatever step sat under the finger
+    /// — but the dial lives in a horizontally scrolling row of slots, and a
+    /// control that reacts to sideways travel is a control that eats the
+    /// gesture used to reach the slot beside it. Turning is vertical only
+    /// now; sideways travel is recognized purely so it can be ignored, which
+    /// leaves the scroll view free to act on it.
+    private enum DragMode { case undecided, horizontal, vertical }
 
     @State private var dragActive = false
     @State private var dragMode: DragMode = .undecided
@@ -41,7 +51,7 @@ struct SteppedDialView: View {
     /// Movement allowed before a press stops counting as "held still".
     private let slop: CGFloat = 10
 
-    private var dial: DialPreset { app.activeDial }
+    private var dial: DialPreset { app.dial(at: slot) }
 
     private var currentIndex: Int {
         guard !dial.steps.isEmpty else { return 0 }
@@ -66,7 +76,7 @@ struct SteppedDialView: View {
                     .font(.system(size: 8, weight: .semibold).monospaced())
                     .foregroundColor(Theme.dim)
                     .lineLimit(1)
-                if app.dialIsLinked {
+                if app.dialIsLinked(at: slot) {
                     Image(systemName: "link")
                         .font(.system(size: 7, weight: .bold))
                         .foregroundColor(Theme.dim)
@@ -74,7 +84,7 @@ struct SteppedDialView: View {
             }
         }
         .sheet(isPresented: $showSettings) {
-            DialSettingsSheet()
+            DialSettingsSheet(slot: slot)
                 .environmentObject(app)
         }
     }
@@ -131,7 +141,17 @@ struct SteppedDialView: View {
             // ONE gesture. Stacking several .gesture modifiers would let the
             // later one replace the earlier, and a zero-distance drag starves
             // any long press, so both behaviors are driven from here instead.
-            .gesture(
+            //
+            // SIMULTANEOUS, not exclusive. A plain .gesture claims the touch
+            // outright, and a child gesture that engages at zero distance
+            // beats the enclosing ScrollView every time — which meant a
+            // sideways drag anywhere on the dial was swallowed and the row
+            // of slots could not be scrolled from on top of one. Sharing the
+            // gesture lets the scroll view act on horizontal travel while
+            // this still handles vertical. The row scrolls horizontally
+            // only, so there is nothing for it to do with a vertical drag
+            // and the two never contradict each other.
+            .simultaneousGesture(
                 DragGesture(minimumDistance: 0)
                     .onChanged { value in dragChanged(value, center: center) }
                     .onEnded { value in dragEnded(value, center: center) }
@@ -142,34 +162,51 @@ struct SteppedDialView: View {
     // MARK: - Gesture handling
 
     private func dragChanged(_ value: DragGesture.Value, center: CGPoint) {
-        if !dragActive {
-            dragActive = true
+        let dx = value.translation.width
+        let dy = value.translation.height
+        let distance = sqrt(dx * dx + dy * dy)
+
+        // A fresh gesture always reports a fresh (near-zero) translation, so
+        // that is what starts one — not a flag cleared in dragEnded. SwiftUI
+        // cancels gestures when another recognizer takes the touch and then
+        // dragEnded never runs, which left `dragActive` stuck true and the
+        // dial unable to start a new drag at all.
+        if distance < 0.5 {
+            // `dragActive` alone isn't enough: a cancelled gesture leaves it
+            // true, so a genuinely new touch would be mistaken for a
+            // continuation and never re-arm the long press. A mode still set
+            // from a previous gesture is the tell that this is new.
+            let staleFromCancelledGesture = dragMode != .undecided
+            if !dragActive || staleFromCancelledGesture {
+                dragActive = true
+                handledByLongPress = false
+                scheduleLongPress()
+            }
             dragMode = .undecided
             consumedHeight = 0
-            handledByLongPress = false
-            scheduleLongPress()
         }
 
         guard !handledByLongPress else { return }
 
-        let dx = value.translation.width
-        let dy = value.translation.height
-
         // Past the slop threshold this is a drag, not a hold.
-        if sqrt(dx * dx + dy * dy) > slop {
+        if distance > slop {
             cancelLongPress()
             if dragMode == .undecided {
-                // Lock the axis once: clearly-vertical travel scrolls,
-                // anything else sweeps the dial.
-                dragMode = abs(dy) > abs(dx) * 1.4 ? .vertical : .rotary
+                // Lock the axis once. Vertical wins ties and near-ties: the
+                // dial only turns on up/down travel, so the bias should sit
+                // with the axis that does something rather than with the one
+                // whose whole job is to get out of the row's way.
+                dragMode = abs(dy) >= abs(dx) ? .vertical : .horizontal
             }
         }
 
         switch dragMode {
         case .undecided:
             break
-        case .rotary:
-            selectStepUnder(location: value.location, center: center)
+        case .horizontal:
+            // Intentionally empty — see DragMode. The row scrolls on this
+            // instead.
+            break
         case .vertical:
             scrollVertically(translationHeight: dy)
         }
@@ -269,7 +306,7 @@ struct SteppedDialView: View {
         let style: UIImpactFeedbackGenerator.FeedbackStyle =
             (clamped == 0 || clamped == count - 1) ? .medium : .light
         UIImpactFeedbackGenerator(style: style).impactOccurred()
-        app.selectDialStep(clamped)
+        app.selectDialStep(at: slot, clamped)
     }
 
     /// Angle in degrees (from 12 o'clock, clockwise) for step `index` of
@@ -285,6 +322,7 @@ struct SteppedDialView: View {
 struct DialSettingsSheet: View {
     @EnvironmentObject var app: AppState
     @Environment(\.dismiss) private var dismiss
+    let slot: Int
 
     var body: some View {
         NavigationStack {
@@ -307,23 +345,30 @@ struct DialSettingsSheet: View {
     private var sourceSection: some View {
         Section {
             NavigationLink {
-                DialLibraryPicker()
+                DialLibraryPicker(slot: slot)
             } label: {
                 HStack {
                     Text("Dial Preset")
                     Spacer()
-                    Text(app.dialIsLinked ? app.activeDial.name : "Local")
+                    Text(app.dialIsLinked(at: slot) ? app.dial(at: slot).name : "Local")
                         .foregroundColor(.secondary)
                 }
             }
 
-            if !app.dialIsLinked {
+            if !app.dialIsLinked(at: slot) {
                 Button("Save to Shared Library") {
-                    app.saveActiveDialToLibrary()
+                    app.saveDialToLibrary(at: slot)
+                }
+            }
+
+            if app.preset.dialSlots.count > 1 {
+                Button("Delete This Dial + Fader", role: .destructive) {
+                    app.removeDialSlot(at: slot)
+                    dismiss()
                 }
             }
         } footer: {
-            Text(app.dialIsLinked
+            Text(app.dialIsLinked(at: slot)
                  ? "Shared preset — edits here affect every preset linked to it."
                  : "Local dial — saved with this preset only.")
         }
@@ -332,10 +377,14 @@ struct DialSettingsSheet: View {
     // ── Name / channel ───────────────────────────────────────────────────
 
     private var dialSection: some View {
-        Section("Dial") {
+        Section {
             TextField("Name", text: dialBinding(\.name))
-            Stepper("MIDI Channel: \(app.activeDial.channel + 1)",
+            Stepper("MIDI Channel: \(app.dial(at: slot).channel + 1)",
                     value: dialBinding(\.channel), in: 0...15)
+        } header: {
+            Text("Dial")
+        } footer: {
+            Text("New MIDI actions on this dial start on this channel. Each step's own channel is set on the step and can differ — changing this does not move steps already configured.")
         }
     }
 
@@ -343,9 +392,9 @@ struct DialSettingsSheet: View {
 
     private var stepsSection: some View {
         Section {
-            ForEach(app.activeDial.steps) { step in
+            ForEach(app.dial(at: slot).steps) { step in
                 NavigationLink {
-                    DialStepEditor(stepID: step.id)
+                    DialStepEditor(slot: slot, stepID: step.id)
                 } label: {
                     HStack {
                         Text(step.label)
@@ -359,10 +408,10 @@ struct DialSettingsSheet: View {
                 }
             }
             .onMove { from, to in
-                app.updateActiveDial { $0.steps.move(fromOffsets: from, toOffset: to) }
+                app.updateDial(at: slot) { $0.steps.move(fromOffsets: from, toOffset: to) }
             }
             .onDelete { offsets in
-                app.updateActiveDial { dial in
+                app.updateDial(at: slot) { dial in
                     dial.steps.remove(atOffsets: offsets)
                     dial.currentStepIndex = min(dial.currentStepIndex,
                                                 max(dial.steps.count - 1, 0))
@@ -370,7 +419,7 @@ struct DialSettingsSheet: View {
             }
 
             Button {
-                app.updateActiveDial {
+                app.updateDial(at: slot) {
                     $0.steps.append(DialStep(label: "NEW \($0.steps.count + 1)"))
                 }
             } label: {
@@ -378,7 +427,7 @@ struct DialSettingsSheet: View {
                     .foregroundColor(Theme.accent)
             }
         } header: {
-            Text("Steps · \(app.activeDial.steps.count)")
+            Text("Steps · \(app.dial(at: slot).steps.count)")
         } footer: {
             Text("The knob shows the first four characters of each label. Steps run clockwise from the lower left. Swipe to delete, drag to reorder.")
         }
@@ -387,8 +436,8 @@ struct DialSettingsSheet: View {
     /// Binding into whichever DialPreset is active (local or linked).
     private func dialBinding<Value>(_ keyPath: WritableKeyPath<DialPreset, Value>) -> Binding<Value> {
         Binding(
-            get: { app.activeDial[keyPath: keyPath] },
-            set: { newValue in app.updateActiveDial { $0[keyPath: keyPath] = newValue } }
+            get: { app.dial(at: slot)[keyPath: keyPath] },
+            set: { newValue in app.updateDial(at: slot) { $0[keyPath: keyPath] = newValue } }
         )
     }
 }
@@ -398,19 +447,20 @@ struct DialSettingsSheet: View {
 struct DialLibraryPicker: View {
     @EnvironmentObject var app: AppState
     @Environment(\.dismiss) private var dismiss
+    let slot: Int
 
     var body: some View {
         List {
             Section {
                 Button {
-                    app.linkDial(to: nil)
+                    app.linkDial(at: slot, to: nil)
                     dismiss()
                 } label: {
                     HStack {
                         Text("Local (this preset)")
                             .foregroundColor(.primary)
                         Spacer()
-                        if !app.dialIsLinked {
+                        if !app.dialIsLinked(at: slot) {
                             Image(systemName: "checkmark")
                                 .foregroundColor(Theme.accent)
                         }
@@ -429,7 +479,7 @@ struct DialLibraryPicker: View {
 
                 ForEach(app.dialLibrary) { preset in
                     Button {
-                        app.linkDial(to: preset.id)
+                        app.linkDial(at: slot, to: preset.id)
                         dismiss()
                     } label: {
                         HStack {
@@ -441,7 +491,8 @@ struct DialLibraryPicker: View {
                                     .foregroundColor(.secondary)
                             }
                             Spacer()
-                            if app.preset.linkedDialPresetID == preset.id {
+                            if app.preset.dialSlots.indices.contains(slot),
+                               app.preset.dialSlots[slot].linkedDialPresetID == preset.id {
                                 Image(systemName: "checkmark")
                                     .foregroundColor(Theme.accent)
                             }
@@ -468,10 +519,11 @@ struct DialLibraryPicker: View {
 /// stale index across deletes or reorders.
 struct DialStepEditor: View {
     @EnvironmentObject var app: AppState
+    let slot: Int
     let stepID: UUID
 
     private var step: DialStep? {
-        app.activeDial.steps.first { $0.id == stepID }
+        app.dial(at: slot).steps.first { $0.id == stepID }
     }
 
     var body: some View {
@@ -485,16 +537,13 @@ struct DialStepEditor: View {
                         .foregroundColor(.secondary)
                 }
 
-                Section {
-                    ForEach(DialActionKind.allCases) { kind in
-                        actionBlock(kind: kind, step: step)
-                    }
-                } header: {
-                    Text(step.actions.isEmpty
-                         ? "Actions"
-                         : "Actions · \(step.actions.count) on")
-                } footer: {
-                    Text("Turn on any combination. Selecting this step fires them all, in the order listed here.")
+                // Two cards instead of one ten-item checklist. The split is
+                // by what the action DOES, not by convenience: Pad Control
+                // reshapes the instrument under your fingers and sends
+                // nothing, while Dial / Fader puts messages on the wire.
+                // Flat, those read as ten interchangeable options.
+                ForEach(DialActionGroup.allCases) { group in
+                    actionCard(group: group, step: step)
                 }
             } else {
                 Text("This step was deleted.")
@@ -510,6 +559,30 @@ struct DialStepEditor: View {
         return trimmed.isEmpty ? "—" : String(trimmed.prefix(4)).uppercased()
     }
 
+    // MARK: - One card
+
+    private func actionCard(group: DialActionGroup, step: DialStep) -> some View {
+        let count = step.actionCount(in: group)
+
+        return Section {
+            ForEach(group.kinds) { kind in
+                actionBlock(kind: kind, step: step)
+            }
+        } header: {
+            HStack(spacing: 6) {
+                Image(systemName: group.icon)
+                    .font(.caption)
+                Text(group.title)
+                if count > 0 {
+                    Text("· \(count) on")
+                        .foregroundColor(Theme.accent)
+                }
+            }
+        } footer: {
+            Text(group.footer)
+        }
+    }
+
     // MARK: - One checklist entry, plus its controls when enabled
 
     @ViewBuilder
@@ -517,7 +590,16 @@ struct DialStepEditor: View {
         let existing = step.action(ofKind: kind)
 
         Button {
-            mutateStep { $0.toggle(kind: kind) }
+            // Hand the surrounding dial's state down, so switching on a
+            // second Send CC picks the next free number in the dial block
+            // rather than repeating the first one, and starts on the dial's
+            // channel rather than always channel 1.
+            let dial = app.dial(at: slot)
+            mutateStep {
+                $0.toggle(kind: kind,
+                          usedCCs: dial.usedCCs,
+                          channel: dial.channel)
+            }
         } label: {
             HStack(spacing: 10) {
                 Image(systemName: existing == nil ? "circle" : "checkmark.circle.fill")
@@ -550,26 +632,26 @@ struct DialStepEditor: View {
     @ViewBuilder
     private func controls(for action: DialAction) -> some View {
         switch action {
-        case .sendCC(let cc, let value, let channelOverride):
+        case .sendCC(let cc, let value, let channel):
             Stepper("CC Number: \(cc)", value: Binding(
                 get: { cc },
-                set: { setAction(.sendCC(cc: $0, value: value, channelOverride: channelOverride)) }
+                set: { setAction(.sendCC(cc: $0, value: value, channel: channel)) }
             ), in: 0...127)
             Stepper("Value: \(value)", value: Binding(
                 get: { value },
-                set: { setAction(.sendCC(cc: cc, value: $0, channelOverride: channelOverride)) }
+                set: { setAction(.sendCC(cc: cc, value: $0, channel: channel)) }
             ), in: 0...127)
-            channelOverrideControls(current: channelOverride) { newOverride in
-                setAction(.sendCC(cc: cc, value: value, channelOverride: newOverride))
+            channelStepper(channel) { newChannel in
+                setAction(.sendCC(cc: cc, value: value, channel: newChannel))
             }
 
-        case .sendProgramChange(let program, let channelOverride):
+        case .sendProgramChange(let program, let channel):
             Stepper("Program: \(program)", value: Binding(
                 get: { program },
-                set: { setAction(.sendProgramChange(program: $0, channelOverride: channelOverride)) }
+                set: { setAction(.sendProgramChange(program: $0, channel: channel)) }
             ), in: 0...127)
-            channelOverrideControls(current: channelOverride) { newOverride in
-                setAction(.sendProgramChange(program: program, channelOverride: newOverride))
+            channelStepper(channel) { newChannel in
+                setAction(.sendProgramChange(program: program, channel: newChannel))
             }
 
         case .setRootNote(let n):
@@ -583,7 +665,11 @@ struct DialStepEditor: View {
                 get: { s },
                 set: { setAction(.setScale($0)) }
             )) {
-                ForEach(Scale.allCases) { Text($0.label).tag($0) }
+                ForEach(Scale.families) { family in
+                    Section(family.title) {
+                        ForEach(family.scales) { Text($0.label).tag($0) }
+                    }
+                }
             }
 
         case .setFixedVelocity(let v):
@@ -618,20 +704,20 @@ struct DialStepEditor: View {
                 set: { setAction(.setNoteRange($0)) }
             ), in: 1...60)
 
-        case .setFaderCC(let cc, let defaultValue, let channelOverride):
+        case .setFaderCC(let cc, let defaultValue, let channel):
             Stepper("Fader CC: \(cc)", value: Binding(
                 get: { cc },
                 set: { setAction(.setFaderCC(cc: $0, defaultValue: defaultValue,
-                                             channelOverride: channelOverride)) }
+                                             channel: channel)) }
             ), in: 0...127)
             Stepper("Start at: \(defaultValue)", value: Binding(
                 get: { defaultValue },
                 set: { setAction(.setFaderCC(cc: cc, defaultValue: $0,
-                                             channelOverride: channelOverride)) }
+                                             channel: channel)) }
             ), in: 0...127)
-            channelOverrideControls(current: channelOverride) { newOverride in
+            channelStepper(channel) { newChannel in
                 setAction(.setFaderCC(cc: cc, defaultValue: defaultValue,
-                                      channelOverride: newOverride))
+                                      channel: newChannel))
             }
             Text("The fader drives this CC while the step is selected. Selecting the step sends nothing; “Start at” is only what the fader shows until feedback for this CC arrives.")
                 .font(.caption)
@@ -639,21 +725,15 @@ struct DialStepEditor: View {
         }
     }
 
-    @ViewBuilder
-    private func channelOverrideControls(current: Int?,
-                                         apply: @escaping (Int?) -> Void) -> some View {
-        Toggle("Override Channel", isOn: Binding(
-            get: { current != nil },
-            set: { apply($0 ? app.activeDial.channel : nil) }
-        ))
-        .tint(Theme.accent)
-
-        if let channel = current {
-            Stepper("Channel: \(channel + 1)", value: Binding(
-                get: { channel },
-                set: { apply($0) }
-            ), in: 0...15)
-        }
+    /// Every sending action carries its own channel now, always visible.
+    /// There is no override toggle to switch on first — the number shown is
+    /// the number it sends on.
+    private func channelStepper(_ channel: Int,
+                                apply: @escaping (Int) -> Void) -> some View {
+        Stepper("Channel: \(channel + 1)", value: Binding(
+            get: { channel },
+            set: { apply(min(max($0, 0), 15)) }
+        ), in: 0...15)
     }
 
     // ── ID-based mutation helpers ────────────────────────────────────────
@@ -670,7 +750,7 @@ struct DialStepEditor: View {
     }
 
     private func mutateStep(_ mutate: (inout DialStep) -> Void) {
-        app.updateActiveDial { dial in
+        app.updateDial(at: slot) { dial in
             guard let index = dial.steps.firstIndex(where: { $0.id == stepID }) else { return }
             mutate(&dial.steps[index])
         }
@@ -694,14 +774,29 @@ struct DialStepEditor: View {
 struct DialFaderView: View {
     @EnvironmentObject var app: AppState
 
+    /// Which dial+fader slot this fader follows. Must match the
+    /// `SteppedDialView` it sits beside.
+    let slot: Int
+
     /// Visible track height — shorter than the dial's knob for visual balance.
     private let trackHeight: CGFloat = 80
     /// Full touch width; the VISIBLE track is far narrower. A performer
     /// aiming sideways at a 5-point line needs the forgiveness.
     private let touchWidth: CGFloat = 44
 
-    private var value: Int? { app.faderDisplayedValue }
+    private var value: Int? { app.faderDisplayedValue(at: slot) }
     private var enabled: Bool { value != nil }
+
+    // ── Axis lock ───────────────────────────────────────────────────────
+    /// Mirrors the dial's state machine, and for the same reason: this
+    /// fader sits in a horizontally scrolling row, so a sideways drag
+    /// across it has to mean "move the row", not "set this value".
+    private enum FaderDragMode { case undecided, horizontal, vertical }
+    @State private var dragMode: FaderDragMode = .undecided
+
+    /// Travel needed before the drag commits to an axis. Under this, the
+    /// gesture is still a tap.
+    private let slop: CGFloat = 10
 
     var body: some View {
         VStack(spacing: 4) {
@@ -711,14 +806,61 @@ struct DialFaderView: View {
             }
             .frame(width: touchWidth, height: trackHeight)
             .contentShape(Rectangle())          // the whole area drags
-            .gesture(
+            // Simultaneous, so the enclosing scroll view sees this touch
+            // too — an exclusive zero-distance drag would claim it outright
+            // and the slot row could never be scrolled from on top of a
+            // fader.
+            //
+            // The axis lock below is the other half of that. This fader is
+            // an ABSOLUTE control: it reads the finger's Y position rather
+            // than accumulating movement, so without a lock the very first
+            // event of any drag — including a purely sideways one — snapped
+            // the value to wherever the finger happened to land vertically.
+            // Grabbing a fader to slide the row would yank its value on the
+            // way past.
+            .simultaneousGesture(
                 DragGesture(minimumDistance: 0)
                     .onChanged { g in
                         guard enabled else { return }
-                        let fraction = 1 - min(max(g.location.y / trackHeight, 0), 1)
-                        // faderMoved de-duplicates: repeated identical
-                        // rounded values transmit nothing.
-                        app.faderMoved(to: Int((fraction * 127).rounded()))
+
+                        let dx = g.translation.width
+                        let dy = g.translation.height
+                        let distance = sqrt(dx * dx + dy * dy)
+
+                        // Every new gesture starts at ~zero translation, so
+                        // that is the reset — NOT an `if !dragActive` flag
+                        // cleared in onEnded.
+                        //
+                        // onEnded is not guaranteed to run: SwiftUI cancels a
+                        // gesture when another recognizer takes the touch, and
+                        // a flag-based reset then latches. One sideways drag
+                        // left the mode stuck on `.horizontal`, and from that
+                        // point the fader ignored every vertical drag forever.
+                        // Deriving the reset from the gesture's own translation
+                        // cannot get stuck, because a fresh gesture always
+                        // reports a fresh translation.
+                        if distance < 0.5 { dragMode = .undecided }
+
+                        if dragMode == .undecided, distance > slop {
+                            // Vertical wins ties: it's the axis that does
+                            // something here.
+                            dragMode = abs(dy) >= abs(dx) ? .vertical : .horizontal
+                        }
+
+                        // Undecided is still a possible tap; horizontal belongs
+                        // to the row. Only commit once this is definitely a
+                        // vertical drag.
+                        guard dragMode == .vertical else { return }
+                        commit(locationY: g.location.y)
+                    }
+                    .onEnded { g in
+                        defer { dragMode = .undecided }
+
+                        // Never passed slop — a tap. Absolute controls are
+                        // expected to jump to where they were tapped, so that
+                        // behavior is preserved rather than lost to the lock.
+                        guard enabled, dragMode == .undecided else { return }
+                        commit(locationY: g.location.y)
                     }
             )
 
@@ -727,6 +869,13 @@ struct DialFaderView: View {
                 .foregroundColor(Theme.dim)
                 .frame(width: touchWidth)
         }
+    }
+
+    /// faderMoved de-duplicates: repeated identical rounded values
+    /// transmit nothing.
+    private func commit(locationY: CGFloat) {
+        let fraction = 1 - min(max(locationY / trackHeight, 0), 1)
+        app.faderMoved(at: slot, to: Int((fraction * 127).rounded()))
     }
 
     private var track: some View {
