@@ -367,10 +367,6 @@ struct DialSettingsSheet: View {
                     dismiss()
                 }
             }
-        } footer: {
-            Text(app.dialIsLinked(at: slot)
-                 ? "Shared preset — edits here affect every preset linked to it."
-                 : "Local dial — saved with this preset only.")
         }
     }
 
@@ -379,12 +375,11 @@ struct DialSettingsSheet: View {
     private var dialSection: some View {
         Section {
             TextField("Name", text: dialBinding(\.name))
-            Stepper("MIDI Channel: \(app.dial(at: slot).channel + 1)",
-                    value: dialBinding(\.channel), in: 0...15)
+            IntWheelRow(title: "MIDI Channel",
+                        selection: dialBinding(\.channel),
+                        range: 0...15) { String($0 + 1) }
         } header: {
             Text("Dial")
-        } footer: {
-            Text("New MIDI actions on this dial start on this channel. Each step's own channel is set on the step and can differ — changing this does not move steps already configured.")
         }
     }
 
@@ -428,8 +423,6 @@ struct DialSettingsSheet: View {
             }
         } header: {
             Text("Steps · \(app.dial(at: slot).steps.count)")
-        } footer: {
-            Text("The knob shows the first four characters of each label. Steps run clockwise from the lower left. Swipe to delete, drag to reorder.")
         }
     }
 
@@ -466,8 +459,6 @@ struct DialLibraryPicker: View {
                         }
                     }
                 }
-            } footer: {
-                Text("The local dial is saved inside the current preset.")
             }
 
             Section("Shared Library") {
@@ -521,6 +512,7 @@ struct DialStepEditor: View {
     @EnvironmentObject var app: AppState
     let slot: Int
     let stepID: UUID
+    @State private var expandedGroups: Set<DialActionGroup> = Set(DialActionGroup.allCases)
 
     private var step: DialStep? {
         app.dial(at: slot).steps.first { $0.id == stepID }
@@ -537,11 +529,10 @@ struct DialStepEditor: View {
                         .foregroundColor(.secondary)
                 }
 
-                // Two cards instead of one ten-item checklist. The split is
-                // by what the action DOES, not by convenience: Pad Control
-                // reshapes the instrument under your fingers and sends
-                // nothing, while Dial / Fader puts messages on the wire.
-                // Flat, those read as ten interchangeable options.
+                // Three collapsible cards separate the three jobs clearly:
+                // Pad Control reshapes the XY instrument, Dial sends messages
+                // when the step is selected, and Fader assigns the companion
+                // fader. Flat, they read as interchangeable checkboxes.
                 ForEach(DialActionGroup.allCases) { group in
                     actionCard(group: group, step: step)
                 }
@@ -563,23 +554,35 @@ struct DialStepEditor: View {
 
     private func actionCard(group: DialActionGroup, step: DialStep) -> some View {
         let count = step.actionCount(in: group)
-
-        return Section {
-            ForEach(group.kinds) { kind in
-                actionBlock(kind: kind, step: step)
-            }
-        } header: {
-            HStack(spacing: 6) {
-                Image(systemName: group.icon)
-                    .font(.caption)
-                Text(group.title)
-                if count > 0 {
-                    Text("· \(count) on")
-                        .foregroundColor(Theme.accent)
+        let isExpanded = Binding(
+            get: { expandedGroups.contains(group) },
+            set: { expanded in
+                if expanded {
+                    expandedGroups.insert(group)
+                } else {
+                    expandedGroups.remove(group)
                 }
             }
-        } footer: {
-            Text(group.footer)
+        )
+
+        return Section {
+            DisclosureGroup(isExpanded: isExpanded) {
+                ForEach(group.kinds) { kind in
+                    actionBlock(kind: kind, step: step)
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: group.icon)
+                        .font(.caption)
+                    Text(group.title)
+                    if count > 0 {
+                        Text("· \(count) on")
+                            .foregroundColor(Theme.accent)
+                    }
+                }
+                .font(.headline)
+            }
+            .tint(Theme.accent)
         }
     }
 
@@ -623,7 +626,10 @@ struct DialStepEditor: View {
         .buttonStyle(.plain)
 
         if let existing = existing {
-            controls(for: existing)
+            Group {
+                controls(for: existing)
+            }
+            .padding(.leading, 32)
         }
     }
 
@@ -633,15 +639,15 @@ struct DialStepEditor: View {
     private func controls(for action: DialAction) -> some View {
         switch action {
         case .sendCC(let cc, let value, let channel):
-            Stepper("CC Number: \(cc)", value: Binding(
+            IntWheelRow(title: "CC Number", selection: Binding(
                 get: { cc },
                 set: { setAction(.sendCC(cc: $0, value: value, channel: channel)) }
-            ), in: 0...127)
-            Stepper("Value: \(value)", value: Binding(
+            ), range: 0...127)
+            IntWheelRow(title: "Value", selection: Binding(
                 get: { value },
                 set: { setAction(.sendCC(cc: cc, value: $0, channel: channel)) }
-            ), in: 0...127)
-            channelStepper(channel) { newChannel in
+            ), range: 0...127)
+            channelWheel(channel) { newChannel in
                 setAction(.sendCC(cc: cc, value: value, channel: newChannel))
             }
 
@@ -650,15 +656,15 @@ struct DialStepEditor: View {
                 get: { program },
                 set: { setAction(.sendProgramChange(program: $0, channel: channel)) }
             ), in: 0...127)
-            channelStepper(channel) { newChannel in
+            channelWheel(channel) { newChannel in
                 setAction(.sendProgramChange(program: program, channel: newChannel))
             }
 
         case .setRootNote(let n):
-            Stepper("Root: \(DialAction.noteName(n))", value: Binding(
+            IntWheelRow(title: "Root", selection: Binding(
                 get: { n },
                 set: { setAction(.setRootNote($0)) }
-            ), in: 0...120)
+            ), range: 0...120) { MIDIWheelText.note($0) }
 
         case .setScale(let s):
             Picker("Scale", selection: Binding(
@@ -673,20 +679,16 @@ struct DialStepEditor: View {
             }
 
         case .setFixedVelocity(let v):
-            Stepper("Velocity: \(v)", value: Binding(
+            IntWheelRow(title: "Velocity", selection: Binding(
                 get: { v },
                 set: { setAction(.setFixedVelocity($0)) }
-            ), in: 1...127)
+            ), range: 1...127)
 
         case .toggleGlide:
-            Text("Flips the XY pad's glide on or off each time this step is selected.")
-                .font(.caption)
-                .foregroundColor(.secondary)
+            EmptyView()
 
         case .togglePerpVelocity:
-            Text("Flips the perpendicular-to-velocity mapping on or off each time this step is selected.")
-                .font(.caption)
-                .foregroundColor(.secondary)
+            EmptyView()
 
         case .setVoiceCount(let n):
             Picker("Voices", selection: Binding(
@@ -699,41 +701,31 @@ struct DialStepEditor: View {
             }
 
         case .setNoteRange(let r):
-            Stepper("Range: \(r) semitones", value: Binding(
+            IntWheelRow(title: "Range", selection: Binding(
                 get: { r },
                 set: { setAction(.setNoteRange($0)) }
-            ), in: 1...60)
+            ), range: 1...60) { "\($0) semitones" }
 
-        case .setFaderCC(let cc, let defaultValue, let channel):
-            Stepper("Fader CC: \(cc)", value: Binding(
+        case .setFaderCC(let cc, let channel):
+            IntWheelRow(title: "Fader CC", selection: Binding(
                 get: { cc },
-                set: { setAction(.setFaderCC(cc: $0, defaultValue: defaultValue,
-                                             channel: channel)) }
-            ), in: 0...127)
-            Stepper("Start at: \(defaultValue)", value: Binding(
-                get: { defaultValue },
-                set: { setAction(.setFaderCC(cc: cc, defaultValue: $0,
-                                             channel: channel)) }
-            ), in: 0...127)
-            channelStepper(channel) { newChannel in
-                setAction(.setFaderCC(cc: cc, defaultValue: defaultValue,
-                                      channel: newChannel))
+                set: { setAction(.setFaderCC(cc: $0, channel: channel)) }
+            ), range: 0...127)
+            channelWheel(channel) { newChannel in
+                setAction(.setFaderCC(cc: cc, channel: newChannel))
             }
-            Text("The fader drives this CC while the step is selected. Selecting the step sends nothing; “Start at” is only what the fader shows until feedback for this CC arrives.")
-                .font(.caption)
-                .foregroundColor(.secondary)
         }
     }
 
     /// Every sending action carries its own channel now, always visible.
     /// There is no override toggle to switch on first — the number shown is
     /// the number it sends on.
-    private func channelStepper(_ channel: Int,
+    private func channelWheel(_ channel: Int,
                                 apply: @escaping (Int) -> Void) -> some View {
-        Stepper("Channel: \(channel + 1)", value: Binding(
+        IntWheelRow(title: "Channel", selection: Binding(
             get: { channel },
             set: { apply(min(max($0, 0), 15)) }
-        ), in: 0...15)
+        ), range: 0...15) { String($0 + 1) }
     }
 
     // ── ID-based mutation helpers ────────────────────────────────────────

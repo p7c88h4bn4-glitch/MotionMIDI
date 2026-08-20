@@ -25,10 +25,6 @@ struct PresetPickerSheet: View {
                     .onDelete(perform: delete)
                 } header: {
                     Text("Presets · \(app.presets.count)")
-                } footer: {
-                    Text(app.presets.count > 1
-                         ? "Most recent first. Swipe a row to rename or delete — deleting is permanent."
-                         : "Most recent first. Swipe a row to rename. The last remaining preset can't be deleted.")
                 }
 
                 Section {

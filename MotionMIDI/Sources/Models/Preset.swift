@@ -111,6 +111,13 @@ extension Preset {
     var usedButtonCCs: Set<Int> {
         Set(buttons.filter { $0.message == .cc }.map(\.cc))
     }
+
+    /// CCs currently assigned to the visible drawbar bank. Keeping this
+    /// separate lets button creation avoid silently landing on a drawbar.
+    var usedDrawbarCCs: Set<Int> {
+        let count = min(max(xyPad.drawbarCount, 1), xyPad.drawbars.count)
+        return Set(xyPad.drawbars.prefix(count).map(\.cc))
+    }
 }
 
 extension Preset {

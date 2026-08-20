@@ -1,24 +1,22 @@
 import SwiftUI
 import UIKit
 
-// MARK: - Pad surface mode (the three buttons)
+// MARK: - Pad surface mode (the four buttons)
 
-/// What the pad is doing right now, as ONE choice out of three.
+/// What the pad is doing right now, as ONE choice out of four.
 ///
-/// The underlying config still stores this as two independent flags —
-/// `XYPadMode` (cc / notes) and `CCPadMode` (standard / morph) — which is
-/// four combinations describing three real states: "notes + morph" is
-/// meaningless, because morph only ever applied to the CC path. The old
-/// header exposed both flags as separate segmented pickers, so reaching
-/// 4-Corner meant setting two controls and knowing that one of them was
-/// ignored in the other mode.
+/// The underlying config stores this as two flags — `XYPadMode` chooses
+/// CC vs Notes, while `CCPadMode` chooses Standard, Morph, or Drawbars inside
+/// the CC path. Combinations such as "Notes + Morph" are meaningless because
+/// the CC sub-mode is ignored whenever Notes is active.
 ///
-/// This collapses the pair into the three states that actually exist. The
-/// stored flags are untouched — every preset on disk still decodes, and the
-/// engine still reads `mode` and `ccMode` exactly as before.
+/// This exposes only the four real surfaces as one performer-facing choice.
+/// Existing presets remain compatible because the original `mode` and
+/// `ccMode` fields are still what gets persisted.
 enum XYSurfaceMode: String, CaseIterable, Identifiable {
     case standard
     case morph
+    case drawbars
     case notes
 
     var id: String { rawValue }
@@ -27,6 +25,7 @@ enum XYSurfaceMode: String, CaseIterable, Identifiable {
         switch self {
         case .standard: return "XY"
         case .morph:    return "4C"
+        case .drawbars: return "Drawbars"
         case .notes:    return "Notes"
         }
     }
@@ -35,6 +34,7 @@ enum XYSurfaceMode: String, CaseIterable, Identifiable {
         switch self {
         case .standard: return "Standard XY"
         case .morph:    return "4-Corner Morph"
+        case .drawbars: return "Drawbars"
         case .notes:    return "Notes"
         }
     }
@@ -46,6 +46,7 @@ enum XYSurfaceMode: String, CaseIterable, Identifiable {
         switch self {
         case .standard: return "PadModeXY"
         case .morph:    return "PadModeMorph"
+        case .drawbars: return "PadModeDrawbars"
         case .notes:    return "PadModeNotes"
         }
     }
@@ -54,12 +55,13 @@ enum XYSurfaceMode: String, CaseIterable, Identifiable {
         switch self {
         case .standard: return "circle.grid.cross"
         case .morph:    return "square.grid.2x2"
+        case .drawbars: return "slider.vertical.3"
         case .notes:    return "music.note"
         }
     }
 }
 
-/// One of the three pad-mode buttons.
+/// One of the four pad-mode buttons.
 ///
 /// The image IS the button — no chip, no border, no background plate. Those
 /// containers were costing width that the preset name needs, and once the
@@ -113,7 +115,7 @@ struct PadModeButton: View {
     }
 }
 
-/// The three buttons as a unit. Used in the pad header AND as the heading of
+/// The four buttons as a unit. Used in the pad header AND as the heading of
 /// the config sheet, so the same control means the same thing in both places.
 ///
 /// Spacing defaults to zero because each button already pads its artwork out
@@ -138,10 +140,11 @@ struct PadModeSelector: View {
 
 // MARK: - XY pad
 
-/// Large expressive XY pad with three surface modes:
+/// Large expressive XY pad with four surface modes:
 ///
 ///   • Standard XY — X and Y each send an independent CC (uses the first touch).
 ///   • 4-Corner    — four CCs blended by proximity to each corner.
+///   • Drawbars    — a configurable bank of one-dimensional CC controls.
 ///   • Notes       — position ALONG the chosen diagonal selects a pitch.
 ///                   Supports 1, 2, or 3 simultaneous voices. Each finger is
 ///                   a voice: touch = Note On, release = Note Off.
@@ -169,6 +172,20 @@ struct XYPadView: View {
     /// Current corner levels purely for the on-pad meters.
     @State private var morphLevels: [Int] = [0, 0, 0, 0]
 
+    // ── Drawbar-mode state ──────────────────────────────────────────────
+    /// Live values are kept locally while a finger is moving. They are
+    /// committed to the preset when the gesture ends, avoiding a full preset
+    /// save for every high-frequency touch update.
+    @State private var drawbarLevels: [Int] = Array(repeating: 0, count: 9)
+    /// In Individual mode, each finger is locked to the bar it touched first.
+    @State private var drawbarFingerBars: [Int: Int] = [:]
+    /// In Sweep mode, previous finger positions let us interpolate across
+    /// fast swipes so narrow bars cannot be skipped between touch events.
+    @State private var drawbarPreviousPoints: [Int: TouchPoint] = [:]
+    /// One cancellable glide per drawbar. New sweep input retargets that bar
+    /// from its current live value instead of stacking competing ramps.
+    @State private var drawbarRampTasks: [Int: Task<Void, Never>] = [:]
+
     /// Sounding voices, always kept sorted by `id` (ascending = oldest first,
     /// since ids are handed out in contact order). Index 0 is stolen first.
     @State private var voices: [Voice] = []
@@ -183,7 +200,9 @@ struct XYPadView: View {
     @State private var showPresetPicker = false
 
     private var cfg: XYPadConfig { app.preset.xyPad }
-    private var touching: Bool { !voices.isEmpty }
+    private var touching: Bool {
+        !voices.isEmpty || !drawbarFingerBars.isEmpty || !drawbarPreviousPoints.isEmpty
+    }
 
     /// One voice, tied to a specific finger.
     struct Voice: Identifiable, Equatable {
@@ -216,6 +235,7 @@ struct XYPadView: View {
             if cfg.glide { sendGlideTime() }
         }
         .onChange(of: cfg.ccMode) { _, _ in
+            cancelDrawbarRamps(commit: true)
             // Clear dedupe state both ways, so the first move after a mode
             // switch always transmits rather than being suppressed as a
             // "duplicate" of whatever was last sent in the other mode.
@@ -223,13 +243,26 @@ struct XYPadView: View {
             morphLevels = [0, 0, 0, 0]
             lastX = -1
             lastY = -1
+            drawbarFingerBars.removeAll()
+            drawbarPreviousPoints.removeAll()
+            syncDrawbarLevelsFromPreset()
+        }
+        .onChange(of: app.activePresetID) { _, _ in
+            cancelDrawbarRamps(commit: false)
+            drawbarFingerBars.removeAll()
+            drawbarPreviousPoints.removeAll()
+            syncDrawbarLevelsFromPreset()
         }
         .onAppear {
             sendPortamentoState(on: cfg.glide)
+            syncDrawbarLevelsFromPreset()
+        }
+        .onDisappear {
+            cancelDrawbarRamps(commit: true)
         }
     }
 
-    // MARK: - Header (three mode buttons + preset + config) — outside the touch area
+    // MARK: - Header (four mode buttons + preset + config) — outside the touch area
 
     private var header: some View {
         HStack(spacing: 6) {
@@ -247,9 +280,10 @@ struct XYPadView: View {
             Button {
                 showConfig = true
             } label: {
-                Image(systemName: "slider.horizontal.3")
-                    .font(.callout.weight(.semibold))
-                    .foregroundColor(Theme.accent)
+                Image("SettingsIcon")
+                    .resizable()
+                    .interpolation(.high)
+                    .scaledToFit()
                     .frame(width: 30, height: 30)
             }
         }
@@ -305,6 +339,8 @@ struct XYPadView: View {
                         diagonalGuide(size: size)
                     } else if cfg.ccMode == .morph {
                         morphCornerMeters(size: size)
+                    } else if cfg.ccMode == .drawbars {
+                        drawbarBank(size: size)
                     } else {
                         crosshairGrid(size: size)
                     }
@@ -633,6 +669,122 @@ struct XYPadView: View {
         .stroke(Color.white.opacity(0.07), lineWidth: 1)
     }
 
+    // MARK: - Drawbar surface
+
+    private var visibleDrawbarCount: Int {
+        min(max(cfg.drawbarCount, 1), min(drawbarLevels.count, cfg.drawbars.count))
+    }
+
+    /// Draws a bank of fader-like drawbars. The selected direction is the
+    /// direction in which the MIDI value increases toward 127.
+    @ViewBuilder
+    private func drawbarBank(size: CGSize) -> some View {
+        let count = visibleDrawbarCount
+        ZStack {
+            ForEach(0..<count, id: \.self) { index in
+                drawbarLane(index: index, count: count, size: size)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func drawbarLane(index: Int, count: Int, size: CGSize) -> some View {
+        let level = drawbarLevels.indices.contains(index) ? drawbarLevels[index] : 0
+        let fraction = CGFloat(level) / 127.0
+        let inset: CGFloat = 24
+
+        if cfg.drawbarDirection.isVertical {
+            let laneWidth = size.width / CGFloat(max(count, 1))
+            let x = laneWidth * (CGFloat(index) + 0.5)
+            let top = inset
+            let bottom = max(size.height - inset, top + 1)
+            let travel = bottom - top
+            let y = cfg.drawbarDirection == .up
+                ? bottom - travel * fraction
+                : top + travel * fraction
+            let zeroY = cfg.drawbarDirection == .up ? bottom : top
+            let fillHeight = max(abs(zeroY - y), 1)
+            let handleWidth = max(16, min(42, laneWidth * 0.66))
+
+            Rectangle()
+                .fill(Color.white.opacity(0.045))
+                .frame(width: 1, height: size.height)
+                .position(x: laneWidth * CGFloat(index + 1), y: size.height / 2)
+
+            Capsule()
+                .fill(Color.white.opacity(0.13))
+                .frame(width: 4, height: travel)
+                .position(x: x, y: (top + bottom) / 2)
+
+            Capsule()
+                .fill(Theme.accent.opacity(0.42))
+                .frame(width: 4, height: fillHeight)
+                .position(x: x, y: (zeroY + y) / 2)
+
+            RoundedRectangle(cornerRadius: 5)
+                .fill(Theme.accent)
+                .frame(width: handleWidth, height: 18)
+                .shadow(color: Theme.accent.opacity(0.45), radius: 5)
+                .overlay(
+                    Text("\(level)")
+                        .font(.system(size: 7, weight: .bold, design: .monospaced))
+                        .foregroundColor(Theme.bg.opacity(0.9))
+                )
+                .position(x: x, y: y)
+
+            Text("\(index + 1)")
+                .font(.system(size: 8, weight: .semibold, design: .rounded))
+                .foregroundColor(Theme.dim)
+                .position(x: x,
+                          y: cfg.drawbarDirection == .up ? size.height - 9 : 9)
+        } else {
+            let laneHeight = size.height / CGFloat(max(count, 1))
+            let y = laneHeight * (CGFloat(index) + 0.5)
+            let left = inset
+            let right = max(size.width - inset, left + 1)
+            let travel = right - left
+            let x = cfg.drawbarDirection == .right
+                ? left + travel * fraction
+                : right - travel * fraction
+            let zeroX = cfg.drawbarDirection == .right ? left : right
+            let fillWidth = max(abs(zeroX - x), 1)
+            let handleHeight = max(16, min(42, laneHeight * 0.66))
+
+            Rectangle()
+                .fill(Color.white.opacity(0.045))
+                .frame(width: size.width, height: 1)
+                .position(x: size.width / 2, y: laneHeight * CGFloat(index + 1))
+
+            Capsule()
+                .fill(Color.white.opacity(0.13))
+                .frame(width: travel, height: 4)
+                .position(x: (left + right) / 2, y: y)
+
+            Capsule()
+                .fill(Theme.accent.opacity(0.42))
+                .frame(width: fillWidth, height: 4)
+                .position(x: (zeroX + x) / 2, y: y)
+
+            RoundedRectangle(cornerRadius: 5)
+                .fill(Theme.accent)
+                .frame(width: 18, height: handleHeight)
+                .shadow(color: Theme.accent.opacity(0.45), radius: 5)
+                .overlay(
+                    Text("\(level)")
+                        .font(.system(size: 7, weight: .bold, design: .monospaced))
+                        .foregroundColor(Theme.bg.opacity(0.9))
+                        .rotationEffect(.degrees(-90))
+                )
+                .position(x: x, y: y)
+
+            Text("\(index + 1)")
+                .font(.system(size: 8, weight: .semibold, design: .rounded))
+                .foregroundColor(Theme.dim)
+                .position(x: cfg.drawbarDirection == .right ? 9 : size.width - 9,
+                          y: y)
+        }
+    }
+
     private func diagonalGuide(size: CGSize) -> some View {
         Path { p in
             switch cfg.diagonal {
@@ -687,8 +839,12 @@ struct XYPadView: View {
     /// Called on every touch begin / move / end with the CURRENT full set of
     /// fingers on the pad, already normalized to 0...1 with y pointing up.
     private func handleTouches(_ points: [TouchPoint]) {
-        guard cfg.mode == .notes else {
-            handleCCTouches(points)
+        if cfg.mode != .notes {
+            if cfg.ccMode == .drawbars {
+                handleDrawbarTouches(points)
+            } else {
+                handleCCTouches(points)
+            }
             return
         }
 
@@ -771,9 +927,226 @@ struct XYPadView: View {
         emitCC(x: point.x, y: point.y)
     }
 
+    // MARK: - Drawbar touch handling
+
+    private func handleDrawbarTouches(_ points: [TouchPoint]) {
+        // Drawbars do not use the XY puck/voice state.
+        voices.removeAll()
+        suspended.removeAll()
+
+        let liveIDs = Set(points.map(\.id))
+        for id in Array(drawbarFingerBars.keys) where !liveIDs.contains(id) {
+            drawbarFingerBars.removeValue(forKey: id)
+        }
+        for id in Array(drawbarPreviousPoints.keys) where !liveIDs.contains(id) {
+            drawbarPreviousPoints.removeValue(forKey: id)
+        }
+
+        switch cfg.drawbarTouchMode {
+        case .individual:
+            drawbarPreviousPoints.removeAll()
+            for point in points {
+                let index: Int
+                if let captured = drawbarFingerBars[point.id] {
+                    index = captured
+                } else {
+                    index = drawbarIndex(at: point)
+                    drawbarFingerBars[point.id] = index
+                }
+                setDrawbar(index: index, value: drawbarValue(at: point))
+            }
+
+        case .sweep:
+            drawbarFingerBars.removeAll()
+            for point in points {
+                if let previous = drawbarPreviousPoints[point.id] {
+                    applyDrawbarSweep(from: previous, to: point)
+                } else {
+                    setDrawbar(index: drawbarIndex(at: point),
+                               value: drawbarValue(at: point))
+                }
+                drawbarPreviousPoints[point.id] = point
+            }
+        }
+    }
+
+    /// Index of the lane under a point. Vertical drawbars are arranged left
+    /// to right; horizontal drawbars are arranged top to bottom.
+    private func drawbarIndex(at point: TouchPoint) -> Int {
+        let count = visibleDrawbarCount
+        guard count > 1 else { return 0 }
+        let raw: Int
+        if cfg.drawbarDirection.isVertical {
+            raw = Int(point.x * Double(count))
+        } else {
+            raw = Int((1 - point.y) * Double(count))
+        }
+        return min(max(raw, 0), count - 1)
+    }
+
+    /// 0...127 value at a point, with 127 lying in the selected direction.
+    private func drawbarValue(at point: TouchPoint) -> Int {
+        let normalized: Double
+        switch cfg.drawbarDirection {
+        case .up:    normalized = point.y
+        case .down:  normalized = 1 - point.y
+        case .left:  normalized = 1 - point.x
+        case .right: normalized = point.x
+        }
+        return min(max(Int((normalized * 127).rounded()), 0), 127)
+    }
+
+    /// Update every lane crossed between two touch samples. Intermediate
+    /// values are taken from the actual finger path at each lane center, so a
+    /// diagonal sweep naturally paints a rising/falling shape across the bank.
+    private func applyDrawbarSweep(from start: TouchPoint, to end: TouchPoint) {
+        let startIndex = drawbarIndex(at: start)
+        let endIndex = drawbarIndex(at: end)
+
+        guard startIndex != endIndex else {
+            setDrawbar(index: endIndex, value: drawbarValue(at: end))
+            return
+        }
+
+        let count = visibleDrawbarCount
+        let low = min(startIndex, endIndex)
+        let high = max(startIndex, endIndex)
+
+        for index in low...high {
+            let t: Double
+            if cfg.drawbarDirection.isVertical {
+                let targetX = (Double(index) + 0.5) / Double(count)
+                let delta = end.x - start.x
+                t = abs(delta) < 0.000_001 ? 1 : (targetX - start.x) / delta
+            } else {
+                // Lane index 0 is the TOP lane, while TouchPoint.y points up.
+                let targetY = 1 - (Double(index) + 0.5) / Double(count)
+                let delta = end.y - start.y
+                t = abs(delta) < 0.000_001 ? 1 : (targetY - start.y) / delta
+            }
+
+            let clampedT = min(max(t, 0), 1)
+            let interpolated = TouchPoint(
+                id: end.id,
+                x: start.x + (end.x - start.x) * clampedT,
+                y: start.y + (end.y - start.y) * clampedT
+            )
+            setDrawbar(index: index, value: drawbarValue(at: interpolated))
+        }
+
+        // The final lane follows the actual current finger position rather
+        // than only its center-line crossing.
+        setDrawbar(index: endIndex, value: drawbarValue(at: end))
+    }
+
+    private func setDrawbar(index: Int, value: Int) {
+        guard drawbarLevels.indices.contains(index),
+              cfg.drawbars.indices.contains(index) else { return }
+        let target = min(max(value, 0), 127)
+
+        // Ramp is deliberately a Sweep-only behavior. Individual drawbars
+        // remain directly attached to the finger regardless of this setting.
+        if cfg.drawbarTouchMode == .sweep && cfg.drawbarRamp > 0 {
+            rampDrawbar(index: index, to: target)
+        } else {
+            drawbarRampTasks[index]?.cancel()
+            sendDrawbarValue(index: index, value: target)
+        }
+    }
+
+    /// Glide one swept drawbar from its CURRENT live value to the new target.
+    /// The setting is stored as 0...10, with each step representing 100 ms.
+    /// Retargeting cancels the previous glide and starts from wherever the bar
+    /// has actually reached, which keeps repeated sweeps smooth and predictable.
+    private func rampDrawbar(index: Int, to target: Int) {
+        guard drawbarLevels.indices.contains(index),
+              cfg.drawbars.indices.contains(index) else { return }
+
+        let start = drawbarLevels[index]
+        guard start != target else { return }
+
+        drawbarRampTasks[index]?.cancel()
+
+        let duration = Double(min(max(cfg.drawbarRamp, 0), 10)) * 0.1
+        guard duration > 0 else {
+            sendDrawbarValue(index: index, value: target)
+            return
+        }
+
+        // 100 Hz gives a visibly smooth glide without flooding 7-bit MIDI.
+        // Duplicate integer values are suppressed by sendDrawbarValue().
+        let steps = max(1, Int((duration * 100).rounded()))
+        let sleepNs = UInt64((duration / Double(steps)) * 1_000_000_000)
+
+        drawbarRampTasks[index] = Task { @MainActor in
+            for step in 1...steps {
+                do {
+                    try await Task.sleep(nanoseconds: sleepNs)
+                } catch {
+                    return
+                }
+                guard !Task.isCancelled else { return }
+
+                let progress = Double(step) / Double(steps)
+                let value = Int((Double(start) + Double(target - start) * progress).rounded())
+                sendDrawbarValue(index: index, value: value)
+            }
+
+            // A ramp may finish after the finger has lifted, so persist the
+            // completed value here rather than leaving the preset at the
+            // intermediate position captured by handleAllTouchesEnded().
+            commitDrawbarLevel(index)
+        }
+    }
+
+    private func sendDrawbarValue(index: Int, value: Int) {
+        guard drawbarLevels.indices.contains(index),
+              cfg.drawbars.indices.contains(index) else { return }
+        let clamped = min(max(value, 0), 127)
+        guard drawbarLevels[index] != clamped else { return }
+        drawbarLevels[index] = clamped
+        app.midi.controlChange(cfg.drawbars[index].cc,
+                               value: clamped,
+                               channel: cfg.channel)
+    }
+
+    private func cancelDrawbarRamps(commit: Bool) {
+        for task in drawbarRampTasks.values { task.cancel() }
+        drawbarRampTasks.removeAll()
+        if commit { commitDrawbarLevels() }
+    }
+
+    private func commitDrawbarLevel(_ index: Int) {
+        guard app.preset.xyPad.drawbars.indices.contains(index),
+              drawbarLevels.indices.contains(index) else { return }
+        app.preset.xyPad.drawbars[index].value = drawbarLevels[index]
+    }
+
+    private func syncDrawbarLevelsFromPreset() {
+        let stored = cfg.drawbars.map { min(max($0.value, 0), 127) }
+        var levels = Array(stored.prefix(9))
+        while levels.count < 9 { levels.append(0) }
+        drawbarLevels = levels
+    }
+
+    private func commitDrawbarLevels() {
+        var mappings = app.preset.xyPad.drawbars
+        guard !mappings.isEmpty else { return }
+        for index in mappings.indices where drawbarLevels.indices.contains(index) {
+            mappings[index].value = drawbarLevels[index]
+        }
+        app.preset.xyPad.drawbars = mappings
+    }
+
     private func handleAllTouchesEnded() {
         if cfg.mode == .notes {
             releaseAllVoices()
+        } else if cfg.ccMode == .drawbars {
+            commitDrawbarLevels()
+            drawbarFingerBars.removeAll()
+            drawbarPreviousPoints.removeAll()
+            voices.removeAll()
+            suspended.removeAll()
         } else {
             voices.removeAll()
             suspended.removeAll()
@@ -836,6 +1209,9 @@ struct XYPadView: View {
             emitMorphCC(x: x, y: y)
             return
         }
+        if cfg.ccMode == .drawbars {
+            return
+        }
 
         let xv = Int((x * 127).rounded())
         let yv = Int((y * 127).rounded())
@@ -883,7 +1259,7 @@ struct XYPadView: View {
 
     // MARK: - Bindings & helpers
 
-    /// Reads and writes the two stored flags as one three-way choice.
+    /// Reads and writes the two stored flags as one four-way choice.
     ///
     /// Switching always silences what is sounding first: leaving Notes mode
     /// with a finger down would otherwise strand a Note On that nothing is
@@ -892,10 +1268,19 @@ struct XYPadView: View {
         Binding(
             get: {
                 if app.preset.xyPad.mode == .notes { return .notes }
-                return app.preset.xyPad.ccMode == .morph ? .morph : .standard
+                switch app.preset.xyPad.ccMode {
+                case .standard: return .standard
+                case .morph:    return .morph
+                case .drawbars: return .drawbars
+                }
             },
             set: { newMode in
+                if app.preset.xyPad.ccMode == .drawbars {
+                    cancelDrawbarRamps(commit: true)
+                }
                 releaseAllVoices()
+                drawbarFingerBars.removeAll()
+                drawbarPreviousPoints.removeAll()
                 switch newMode {
                 case .notes:
                     app.preset.xyPad.mode = .notes
@@ -905,6 +1290,10 @@ struct XYPadView: View {
                 case .morph:
                     app.preset.xyPad.mode = .cc
                     app.preset.xyPad.ccMode = .morph
+                case .drawbars:
+                    app.preset.xyPad.mode = .cc
+                    app.preset.xyPad.ccMode = .drawbars
+                    syncDrawbarLevelsFromPreset()
                 }
             }
         )
@@ -1016,8 +1405,8 @@ final class TouchTrackingView: UIView {
 /// Full editor for the XY pad: mode, voices, CC numbers, diagonal, scale,
 /// note range, glide, velocity source, channel, and return behavior.
 ///
-/// Headed by the same three pad-mode buttons that sit in the pad header, so
-/// the sheet opens showing which of the three surfaces it is configuring and
+/// Headed by the same four pad-mode buttons that sit in the pad header, so
+/// the sheet opens showing which of the four surfaces it is configuring and
 /// can switch between them without closing.
 struct XYPadConfigSheet: View {
     @EnvironmentObject var app: AppState
@@ -1033,32 +1422,32 @@ struct XYPadConfigSheet: View {
                         .frame(maxWidth: .infinity, alignment: .center)
                         .padding(.vertical, 4)
 
-                    Text(surfaceMode.longLabel)
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .center)
                 }
 
                 switch surfaceMode {
                 case .standard:
                     Section("CC Assignments") {
-                        Stepper("X → CC \(cfg.xCC)", value: bind(\.xCC), in: 0...127)
-                        Stepper("Y → CC \(cfg.yCC)", value: bind(\.yCC), in: 0...127)
+                        IntWheelRow(title: "X → CC", selection: bind(\.xCC), range: 0...127)
+                        IntWheelRow(title: "Y → CC", selection: bind(\.yCC), range: 0...127)
                     }
 
                 case .morph:
                     morphCornerSection
                     morphShapeSection
 
+                case .drawbars:
+                    drawbarSections
+
                 case .notes:
                     notesSections
                 }
 
                 Section("Shared") {
-                    Stepper("MIDI Channel: \(cfg.channel + 1)",
-                            value: bind(\.channel), in: 0...15)
-                    Toggle("Spring return to center", isOn: bind(\.snapBack))
-                        .tint(Theme.accent)
+                    IntWheelRow(title: "MIDI Channel", selection: bind(\.channel), range: 0...15) { String($0 + 1) }
+                    if surfaceMode != .drawbars {
+                        Toggle("Spring return to center", isOn: bind(\.snapBack))
+                            .tint(Theme.accent)
+                    }
                 }
 
                 // Scale lives on the pad surface now — a tap on the chip in
@@ -1076,8 +1465,6 @@ struct XYPadConfigSheet: View {
                         }
                     } header: {
                         Text("Scale")
-                    } footer: {
-                        Text("Also available on the pad itself — tap the key name in the top-left corner.")
                     }
                 }
             }
@@ -1102,9 +1489,6 @@ struct XYPadConfigSheet: View {
             }
             .pickerStyle(.segmented)
 
-            Text("A finger beyond the limit takes over the oldest voice. Lift it and that voice comes back.")
-                .font(.caption)
-                .foregroundColor(.secondary)
         }
 
         Section("Diagonal") {
@@ -1123,24 +1507,18 @@ struct XYPadConfigSheet: View {
             }
             .padding(.vertical, 4)
 
-            Text(cfg.diagonal.description)
-                .font(.caption)
-                .foregroundColor(.secondary)
-                .frame(maxWidth: .infinity, alignment: .center)
         }
 
         Section {
-            Stepper("Root: \(noteName(cfg.rootNote))",
-                    value: bind(\.rootNote), in: 0...120)
-            Stepper("Range: \(cfg.rangeSemitones) semitones (\(String(format: "%.1f", Double(cfg.rangeSemitones) / 12.0)) oct)",
-                    value: bind(\.rangeSemitones), in: 1...60)
+            IntWheelRow(title: "Root", selection: bind(\.rootNote), range: 0...120) { MIDIWheelText.note($0) }
+            IntWheelRow(title: "Range", selection: bind(\.rangeSemitones), range: 1...60) { value in
+                "\(value) st  ·  \(String(format: "%.1f", Double(value) / 12.0)) oct"
+            }
             Text("Low \(noteName(cfg.rootNote)) → High \(noteName(cfg.rootNote + cfg.rangeSemitones))")
                 .font(.caption)
                 .foregroundColor(.secondary)
         } header: {
             Text("Note Range")
-        } footer: {
-            Text("A dotted line crosses the pad at every octave of the root, so you can see where the next octave falls without counting bands.")
         }
 
         Section("Glide") {
@@ -1160,9 +1538,6 @@ struct XYPadConfigSheet: View {
                         .tint(Theme.accent)
                 }
 
-                Text("Sends CC \(MIDIDefaults.portamentoSwitchCC) to switch portamento on, and CC \(MIDIDefaults.portamentoTimeCC) for slide time. Left = instant, right = slow.")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
             }
         }
 
@@ -1170,9 +1545,54 @@ struct XYPadConfigSheet: View {
             Toggle("Perpendicular → Velocity", isOn: bind(\.perpToVelocity))
                 .tint(Theme.accent)
             if !cfg.perpToVelocity {
-                Stepper("Fixed velocity: \(cfg.fixedVelocity)",
-                        value: bind(\.fixedVelocity), in: 1...127)
+                IntWheelRow(title: "Fixed Velocity", selection: bind(\.fixedVelocity), range: 1...127)
             }
+        }
+    }
+
+    // MARK: - Drawbar sections
+
+    @ViewBuilder
+    private var drawbarSections: some View {
+        Section {
+            Stepper("Number of Drawbars: \(cfg.drawbarCount)",
+                    value: drawbarCountBinding, in: 1...9)
+
+            Picker("Direction", selection: bind(\.drawbarDirection)) {
+                ForEach(DrawbarDirection.allCases) { direction in
+                    Text("\(direction.arrow) \(direction.label)").tag(direction)
+                }
+            }
+            .pickerStyle(.segmented)
+        } header: {
+            Text("Layout")
+        }
+
+        Section {
+            Picker("Touch Behavior", selection: bind(\.drawbarTouchMode)) {
+                ForEach(DrawbarTouchMode.allCases) { mode in
+                    Text(mode.label).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            if cfg.drawbarTouchMode == .sweep {
+                IntWheelRow(title: "Ramp",
+                            selection: drawbarRampBinding,
+                            range: 0...10)
+            }
+        } header: {
+            Text("Playing Style")
+        }
+
+        Section {
+            ForEach(0..<cfg.drawbarCount, id: \.self) { index in
+                IntWheelRow(title: "Drawbar \(index + 1) · CC",
+                            selection: drawbarCCBinding(index),
+                            range: 0...127)
+            }
+        } header: {
+            Text("Drawbar Outputs")
         }
     }
 
@@ -1200,8 +1620,6 @@ struct XYPadConfigSheet: View {
             .padding(.vertical, 4)
         } header: {
             Text("Corner Outputs")
-        } footer: {
-            Text("Each corner sends its own CC on its own channel. At a corner that output is 127 and the other three are 0; between corners they blend.")
         }
     }
 
@@ -1218,15 +1636,13 @@ struct XYPadConfigSheet: View {
 
             Divider().opacity(0.4)
 
-            Stepper(value: cornerCCBinding(index), in: 0...127) {
-                Text("CC \(app.preset.xyPad.morphCorners[index].cc)")
-                    .font(.caption.monospaced())
-            }
+            CompactIntWheel(title: "CC",
+                            selection: cornerCCBinding(index),
+                            range: 0...127)
 
-            Stepper(value: cornerChannelBinding(index), in: 0...15) {
-                Text("Ch \(app.preset.xyPad.morphCorners[index].channel + 1)")
-                    .font(.caption.monospaced())
-            }
+            CompactIntWheel(title: "Channel",
+                            selection: cornerChannelBinding(index),
+                            range: 0...15) { String($0 + 1) }
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1270,8 +1686,6 @@ struct XYPadConfigSheet: View {
                 .tint(Theme.accent)
         } header: {
             Text("Morph Shape")
-        } footer: {
-            Text("Curve: left spreads influence across corners, right concentrates it. Center Strength: 0% gives four broad corner regions, 50% is plain blending, 100% widens the four-way mix. Equal Power keeps total level steadier when several clips are partly down.")
         }
     }
 
@@ -1285,7 +1699,11 @@ struct XYPadConfigSheet: View {
 
     private var surfaceMode: XYSurfaceMode {
         if cfg.mode == .notes { return .notes }
-        return cfg.ccMode == .morph ? .morph : .standard
+        switch cfg.ccMode {
+        case .standard: return .standard
+        case .morph:    return .morph
+        case .drawbars: return .drawbars
+        }
     }
 
     /// The sheet is never the thing being played, so unlike the pad's own
@@ -1303,8 +1721,32 @@ struct XYPadConfigSheet: View {
                 case .morph:
                     app.preset.xyPad.mode = .cc
                     app.preset.xyPad.ccMode = .morph
+                case .drawbars:
+                    app.preset.xyPad.mode = .cc
+                    app.preset.xyPad.ccMode = .drawbars
                 }
             }
+        )
+    }
+
+    private var drawbarCountBinding: Binding<Int> {
+        Binding(
+            get: { app.preset.xyPad.drawbarCount },
+            set: { app.preset.xyPad.drawbarCount = min(max($0, 1), 9) }
+        )
+    }
+
+    private var drawbarRampBinding: Binding<Int> {
+        Binding(
+            get: { app.preset.xyPad.drawbarRamp },
+            set: { app.preset.xyPad.drawbarRamp = min(max($0, 0), 10) }
+        )
+    }
+
+    private func drawbarCCBinding(_ index: Int) -> Binding<Int> {
+        Binding(
+            get: { app.preset.xyPad.drawbars[index].cc },
+            set: { app.preset.xyPad.drawbars[index].cc = min(max($0, 0), 127) }
         )
     }
 

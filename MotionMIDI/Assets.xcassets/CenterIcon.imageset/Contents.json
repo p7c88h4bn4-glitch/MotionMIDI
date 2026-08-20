@@ -1,17 +1,17 @@
 {
   "images" : [
     {
-      "filename" : "MotionMIDI_Notes.png",
+      "filename" : "MotionMIDI_Center.png",
       "idiom" : "universal",
       "scale" : "1x"
     },
     {
-      "filename" : "MotionMIDI_Notes 1.png",
+      "filename" : "MotionMIDI_Center 1.png",
       "idiom" : "universal",
       "scale" : "2x"
     },
     {
-      "filename" : "MotionMIDI_Notes 2.png",
+      "filename" : "MotionMIDI_Center 2.png",
       "idiom" : "universal",
       "scale" : "3x"
     }

@@ -215,7 +215,22 @@ final class AppState: ObservableObject {
     func selectDialStep(at slot: Int, _ stepIndex: Int) {
         let d = dial(at: slot)
         guard d.steps.indices.contains(stepIndex) else { return }
+
+        // Capture what the performer is currently looking at BEFORE changing
+        // assignments. If the new CC has no feedback yet, this is the position
+        // the fader will keep.
+        let previousVisibleValue = faderDisplayedValue(at: slot)
+
         updateDial(at: slot) { $0.currentStepIndex = stepIndex }
+
+        if let newKey = faderAssignment(at: slot) {
+            if let known = faderValueCache[newKey] {
+                faderHeldValueBySlot[slot] = known
+            } else if let previousVisibleValue {
+                faderHeldValueBySlot[slot] = previousVisibleValue
+            }
+        }
+
         for action in d.steps[stepIndex].actions {
             perform(action, dialChannel: d.channel)
         }
@@ -290,8 +305,15 @@ final class AppState: ObservableObject {
     /// from a previous session would masquerade as the host's live state.
     @Published var faderValueCache: [CCKey: Int] = [:]
 
-    /// A slot's active step's fader assignment. Two sources, in priority
-    /// order:
+    /// The last visible fader position for each on-screen slot. This is only a
+    /// UI hold value: it is never transmitted and never persisted. When a newly
+    /// selected assignment has no feedback yet, the fader simply remains here
+    /// instead of jumping to a per-step default.
+    @Published private var faderHeldValueBySlot: [Int: Int] = [:]
+
+    /// A slot's active step's fader assignment. This is identity only —
+    /// channel + CC. No initial/default value belongs to the assignment.
+    /// Two sources, in priority order:
     ///
     ///   1. An explicit **Fader Control** action — the step says outright
     ///      which CC the fader drives, independent of what else it does.
@@ -303,37 +325,38 @@ final class AppState: ObservableObject {
     /// you selected a step that didn't set one, leaving the fader pointed at
     /// the previous step's CC.
     ///
-    /// The cache itself (`faderValueCache`) stays keyed by CC identity only,
-    /// shared across every slot and every preset — if two slots happen to
-    /// point at the same channel/CC, they show the same live value, which
-    /// is the correct behavior for "this is the same host parameter".
-    func faderAssignment(at slot: Int) -> (key: CCKey, storedValue: Int)? {
+    /// The live cache (`faderValueCache`) stays keyed by CC identity only,
+    /// shared across every slot and every preset — if two slots point at the
+    /// same channel/CC, they show the same live feedback because they represent
+    /// the same host parameter.
+    func faderAssignment(at slot: Int) -> CCKey? {
         let d = dial(at: slot)
         guard let step = d.currentStep else { return nil }
 
-        if case .setFaderCC(let cc, let defaultValue, let channel)?
+        if case .setFaderCC(let cc, let channel)?
             = step.action(ofKind: .faderCC) {
-            return (CCKey(channel: channel, cc: cc), defaultValue)
+            return CCKey(channel: channel, cc: cc)
         }
 
-        if case .sendCC(let cc, let value, let channel)?
+        if case .sendCC(let cc, _, let channel)?
             = step.action(ofKind: .cc) {
-            return (CCKey(channel: channel, cc: cc), value)
+            return CCKey(channel: channel, cc: cc)
         }
 
         return nil
     }
 
-    /// What a slot's fader shows, fully DERIVED — never separately stored:
-    ///   1. cached feedback/user value for the assignment, else
-    ///   2. the step's own stored Send CC value, else
-    ///   3. nil — no Send CC on this step; the fader renders disabled.
-    /// Because this recomputes when the selected step changes, "recall on
-    /// step change" needs no code at all, and repositioning is inherently
-    /// silent.
+    /// What a slot's fader shows:
+    ///   1. the last live feedback/user value known for this exact channel+CC,
+    ///   2. otherwise the slot's previous visible position,
+    ///   3. 64 only for a brand-new slot that has never had a visible value.
+    ///
+    /// There is deliberately NO per-step "start at" value. Switching steps is
+    /// silent and cannot reset the fader.
     func faderDisplayedValue(at slot: Int) -> Int? {
-        guard let assignment = faderAssignment(at: slot) else { return nil }
-        return faderValueCache[assignment.key] ?? assignment.storedValue
+        guard let key = faderAssignment(at: slot) else { return nil }
+        if let known = faderValueCache[key] { return known }
+        return faderHeldValueBySlot[slot] ?? 64
     }
 
     /// USER fader movement — the ONLY path anywhere that transmits a
@@ -341,12 +364,12 @@ final class AppState: ObservableObject {
     /// and derived state above, so loops are prevented structurally rather
     /// than by timing.
     func faderMoved(at slot: Int, to rawValue: Int) {
-        guard let assignment = faderAssignment(at: slot) else { return }
+        guard let key = faderAssignment(at: slot) else { return }
         let value = min(max(rawValue, 0), 127)
         guard value != faderDisplayedValue(at: slot) else { return }   // no repeats
-        faderValueCache[assignment.key] = value
-        midi.controlChange(assignment.key.cc, value: value,
-                           channel: assignment.key.channel)
+        faderHeldValueBySlot[slot] = value
+        faderValueCache[key] = value
+        midi.controlChange(key.cc, value: value, channel: key.channel)
     }
 
     /// Incoming feedback (e.g. Loopy Pro echoing a parameter move). Cache
@@ -354,7 +377,17 @@ final class AppState: ObservableObject {
     /// `faderDisplayedValue`; if not, the value waits for its step. Nothing
     /// here can transmit.
     func handleIncomingCC(channel: Int, cc: Int, value: Int) {
-        faderValueCache[CCKey(channel: channel, cc: cc)] = min(max(value, 0), 127)
+        let key = CCKey(channel: channel, cc: cc)
+        let clamped = min(max(value, 0), 127)
+        faderValueCache[key] = clamped
+
+        // If this exact parameter is currently visible in one or more slots,
+        // remember that live position as the slot's hold position too. That way
+        // moving later to an assignment with no feedback leaves the fader exactly
+        // where the performer last saw it.
+        for slot in preset.dialSlots.indices where faderAssignment(at: slot) == key {
+            faderHeldValueBySlot[slot] = clamped
+        }
     }
 
     // MARK: - Dial library management

@@ -58,6 +58,12 @@ enum MIDIDefaults {
     /// this directly.
     static let morphCornerCCs = [20, 21, 22, 23]
 
+    // ── XY pad, drawbars ─────────────────────────────────────────────────
+    /// Nine spec-undefined controller numbers for a classic 9-drawbar bank.
+    /// The order looks unusual because it deliberately avoids the factory
+    /// motion, XY, morph, button and stepped-dial assignments above.
+    static let drawbarCCs = [85, 86, 87, 88, 89, 90, 30, 31, 3]
+
     // ── Glide, fixed by the MIDI spec ───────────────────────────────────
     /// Not configurable and not part of the free-CC search: a synth looks
     /// for portamento on these two numbers or not at all.
@@ -106,6 +112,7 @@ enum MIDIDefaults {
                               portamentoTimeCC, portamentoSwitchCC,
                               dialSendCC, dialFaderCC]
         used.formUnion(morphCornerCCs)
+        used.formUnion(drawbarCCs)
         used.formUnion(buttonCCs)
         return used
     }
@@ -247,6 +254,7 @@ enum XYDiagonal: String, Codable, CaseIterable, Identifiable {
 enum CCPadMode: String, Codable, CaseIterable, Identifiable {
     case standard   // X and Y each drive one CC — the original behavior
     case morph      // four-corner blend driving four CCs at once
+    case drawbars   // bank of independent one-dimensional CC controls
 
     var id: String { rawValue }
 
@@ -254,6 +262,7 @@ enum CCPadMode: String, Codable, CaseIterable, Identifiable {
         switch self {
         case .standard: return "Standard XY"
         case .morph:    return "4-Corner Morph"
+        case .drawbars: return "Drawbars"
         }
     }
 }
@@ -333,6 +342,69 @@ extension MorphCorner {
     }
 }
 
+
+// MARK: - Drawbar pad
+
+/// Direction in which a drawbar's MIDI value increases. The same choice also
+/// determines whether the bank is arranged as vertical or horizontal bars.
+enum DrawbarDirection: String, Codable, CaseIterable, Identifiable {
+    case up, down, left, right
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .up:    return "Up"
+        case .down:  return "Down"
+        case .left:  return "Left"
+        case .right: return "Right"
+        }
+    }
+
+    var arrow: String {
+        switch self {
+        case .up:    return "↑"
+        case .down:  return "↓"
+        case .left:  return "←"
+        case .right: return "→"
+        }
+    }
+
+    var isVertical: Bool { self == .up || self == .down }
+}
+
+/// How a finger is associated with drawbars while it moves across the pad.
+enum DrawbarTouchMode: String, Codable, CaseIterable, Identifiable {
+    /// A finger owns the drawbar it first touches until that finger lifts.
+    case individual
+    /// A finger controls whichever drawbar it is currently crossing, so one
+    /// continuous swipe can reshape an entire bank.
+    case sweep
+
+    var id: String { rawValue }
+    var label: String { self == .individual ? "Individual" : "Sweep" }
+}
+
+/// One MIDI destination in the drawbar bank. `value` is persisted so each
+/// preset reopens with the same visual drawbar positions; live touch updates
+/// are staged in the view and committed on release to avoid saving the whole
+/// preset library on every single finger-move event.
+struct DrawbarMapping: Identifiable, Codable, Equatable {
+    var id = UUID()
+    var cc: Int
+    var value: Int = 0
+
+    init(id: UUID = UUID(), cc: Int, value: Int = 0) {
+        self.id = id
+        self.cc = min(max(cc, 0), 127)
+        self.value = min(max(value, 0), 127)
+    }
+
+    static func defaults() -> [DrawbarMapping] {
+        MIDIDefaults.drawbarCCs.map { DrawbarMapping(cc: $0) }
+    }
+}
+
 struct XYPadConfig: Codable, Equatable {
     // ── CC mode ──────────────────────────────────────────────────────────
     var xCC: Int = MIDIDefaults.xyXCC
@@ -388,6 +460,17 @@ struct XYPadConfig: Codable, Equatable {
     var morphCenterStrength: Double = 0.5
     /// Constant-power weighting, for driving several clip volumes at once.
     var morphEqualPower: Bool = false
+
+    // ── Drawbars (CC mode only) ─────────────────────────────────────────
+    /// 1...9 visible bars. The full nine mappings are retained even when the
+    /// visible count is reduced, so shrinking and re-expanding the bank does
+    /// not throw away CC assignments or held positions.
+    var drawbarCount: Int = 4
+    var drawbarDirection: DrawbarDirection = .up
+    var drawbarTouchMode: DrawbarTouchMode = .individual
+    /// Sweep-only glide amount in 100 ms steps: 0 = instant, 10 = 1 second.
+    var drawbarRamp: Int = 0
+    var drawbars: [DrawbarMapping] = DrawbarMapping.defaults()
 }
 
 // Lenient decoding so presets saved before new fields existed still load.
@@ -398,6 +481,7 @@ extension XYPadConfig {
         case glide, glideTime, perpToVelocity, fixedVelocity
         case glideToggleButtonId, voiceCount
         case ccMode, morphCorners, morphCurve, morphCenterStrength, morphEqualPower
+        case drawbarCount, drawbarDirection, drawbarTouchMode, drawbarRamp, drawbars
     }
 
     init(from decoder: Decoder) throws {
@@ -433,6 +517,23 @@ extension XYPadConfig {
         if corners.count > 4 { corners = Array(corners.prefix(4)) }
         while corners.count < 4 { corners.append(fallback[corners.count]) }
         morphCorners = corners
+
+        // Drawbar settings absent from presets saved before this feature.
+        drawbarCount = min(max(try c.decodeIfPresent(Int.self, forKey: .drawbarCount) ?? 4, 1), 9)
+        drawbarDirection = try c.decodeIfPresent(DrawbarDirection.self, forKey: .drawbarDirection) ?? .up
+        drawbarTouchMode = try c.decodeIfPresent(DrawbarTouchMode.self, forKey: .drawbarTouchMode) ?? .individual
+        drawbarRamp = min(max(try c.decodeIfPresent(Int.self, forKey: .drawbarRamp) ?? 0, 0), 10)
+
+        let decodedDrawbars = try c.decodeIfPresent([DrawbarMapping].self, forKey: .drawbars) ?? []
+        var bars = decodedDrawbars
+        let fallbackBars = DrawbarMapping.defaults()
+        if bars.count > 9 { bars = Array(bars.prefix(9)) }
+        while bars.count < 9 { bars.append(fallbackBars[bars.count]) }
+        for index in bars.indices {
+            bars[index].cc = min(max(bars[index].cc, 0), 127)
+            bars[index].value = min(max(bars[index].value, 0), 127)
+        }
+        drawbars = bars
     }
 }
 

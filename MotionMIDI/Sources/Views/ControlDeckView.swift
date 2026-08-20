@@ -176,23 +176,43 @@ struct ControlDeckView: View {
                 app.calibrate()
                 UIImpactFeedbackGenerator(style: .medium).impactOccurred()
             } label: {
-                Image(systemName: "scope")
-                    .font(.callout.weight(.bold))
+                Image("CenterIcon")
+                    .resizable()
+                    .interpolation(.high)
+                    .scaledToFit()
                     .frame(width: 30, height: 30)
             }
-            .buttonStyle(.bordered)
-            .tint(Theme.accent)
+            .buttonStyle(.plain)
 
-            Button {
-                withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
-                    showEditor.toggle()
-                }
-            } label: {
-                Image(systemName: showEditor ? "chevron.down.circle.fill"
-                                             : "slider.horizontal.3")
-                    .font(.title3)
+            editorToggleButton
+        }
+    }
+
+    /// The lower settings button stays visually clean while the editor is
+    /// closed, then gains the same bordered highlight the Center button used
+    /// to have while the editor is open. That makes the close affordance
+    /// obvious without adding permanent chrome to the utility cluster.
+    @ViewBuilder
+    private var editorToggleButton: some View {
+        let button = Button {
+            withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+                showEditor.toggle()
             }
-            .tint(Theme.accent)
+        } label: {
+            Image("SettingsIcon")
+                .resizable()
+                .interpolation(.high)
+                .scaledToFit()
+                .frame(width: 30, height: 30)
+        }
+
+        if showEditor {
+            button
+                .buttonStyle(.bordered)
+                .tint(Theme.accent)
+        } else {
+            button
+                .buttonStyle(.plain)
         }
     }
 }
