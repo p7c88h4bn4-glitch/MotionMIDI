@@ -706,13 +706,22 @@ struct DialStepEditor: View {
                 set: { setAction(.setNoteRange($0)) }
             ), range: 1...60) { "\($0) semitones" }
 
-        case .setFaderCC(let cc, let channel):
+        // `defaultValue` is carried through untouched rather than edited
+        // here. It only decides what the fader READS before any feedback
+        // for this CC has arrived in the session, so it earns no wheel of
+        // its own — but it must still be threaded through every rebuild,
+        // or changing the CC would quietly reset it.
+        case .setFaderCC(let cc, let defaultValue, let channel):
             IntWheelRow(title: "Fader CC", selection: Binding(
                 get: { cc },
-                set: { setAction(.setFaderCC(cc: $0, channel: channel)) }
+                set: { setAction(.setFaderCC(cc: $0,
+                                             defaultValue: defaultValue,
+                                             channel: channel)) }
             ), range: 0...127)
             channelWheel(channel) { newChannel in
-                setAction(.setFaderCC(cc: cc, channel: newChannel))
+                setAction(.setFaderCC(cc: cc,
+                                      defaultValue: defaultValue,
+                                      channel: newChannel))
             }
         }
     }

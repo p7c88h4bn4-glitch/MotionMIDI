@@ -3,14 +3,14 @@ import SwiftUI
 /// Bottom third: collapsible editor. Fully hidden during performance.
 struct EditorView: View {
     @EnvironmentObject var app: AppState
-    @State private var page: Page = .motion
+    @State private var page: Page = .mappings
 
     /// The XY Pad page is deliberately absent. Everything it held now lives
     /// in the pad's own config sheet, reachable from the gear in the pad
     /// header — one place to configure the pad instead of two that showed
     /// overlapping subsets of the same settings.
     enum Page: String, CaseIterable, Identifiable {
-        case motion = "Motion"
+        case mappings = "Mappings"
         case buttons = "Buttons"
         case settings = "Settings"
         var id: String { rawValue }
@@ -27,7 +27,7 @@ struct EditorView: View {
 
             Group {
                 switch page {
-                case .motion:   MappingListView()
+                case .mappings: MappingListView()
                 case .buttons:  ButtonListView()
                 case .settings: SettingsPageView()
                 }
@@ -119,6 +119,12 @@ struct ButtonListView: View {
                     .onDelete { offsets in
                         app.preset.buttons.remove(atOffsets: offsets)
                     }
+                } footer: {
+                    if isPadIdiom {
+                        Text("iPhone shows the first 6 buttons, in this order. Drag to reorder, swipe to delete.")
+                    } else {
+                        Text("Showing the first 6 buttons. Add more, and reorder which 6 appear here, from an iPad.")
+                    }
                 }
 
                 if isPadIdiom {
@@ -130,8 +136,7 @@ struct ButtonListView: View {
                                 ButtonMapping(
                                     name: "NEW",
                                     cc: MIDIDefaults.firstFreeButtonCC(
-                                        avoiding: app.preset.usedButtonCCs
-                                            .union(app.preset.usedDrawbarCCs))
+                                        avoiding: app.preset.usedButtonCCs)
                                 )
                             )
                         } label: {
@@ -173,8 +178,8 @@ struct MappingEditorView: View {
                         Text(s.label).tag(s)
                     }
                 }
-                IntWheelRow(title: "CC Number", selection: $mapping.cc, range: 0...127)
-                IntWheelRow(title: "Channel", selection: $mapping.channel, range: 0...15) { String($0 + 1) }
+                Stepper("CC Number: \(mapping.cc)", value: $mapping.cc, in: 0...127)
+                Stepper("Channel: \(mapping.channel + 1)", value: $mapping.channel, in: 0...15)
             }
 
             Section("Processing") {
@@ -194,8 +199,10 @@ struct MappingEditorView: View {
             }
 
             Section("Output Range") {
-                IntWheelRow(title: "Min", selection: $mapping.processing.outMin, range: 0...127)
-                IntWheelRow(title: "Max", selection: $mapping.processing.outMax, range: 0...127)
+                Stepper("Min: \(mapping.processing.outMin)",
+                        value: $mapping.processing.outMin, in: 0...127)
+                Stepper("Max: \(mapping.processing.outMax)",
+                        value: $mapping.processing.outMax, in: 0...127)
             }
         }
         .scrollContentBackground(.hidden)
@@ -237,15 +244,18 @@ struct ButtonEditorView: View {
 
                     switch button.message {
                     case .cc:
-                        IntWheelRow(title: "CC Number", selection: ccBinding, range: 0...127)
-                        IntWheelRow(title: "On Value", selection: onValueBinding, range: 0...127)
-                        IntWheelRow(title: "Off Value", selection: offValueBinding, range: 0...127)
+                        Stepper("CC Number: \(button.cc)", value: ccBinding, in: 0...127)
+                        Stepper("On Value: \(button.onValue)",
+                                value: onValueBinding, in: 0...127)
+                        Stepper("Off Value: \(button.offValue)",
+                                value: offValueBinding, in: 0...127)
                     case .note:
-                        IntWheelRow(title: "Note", selection: noteBinding, range: 0...127) { MIDIWheelText.note($0) }
-                        IntWheelRow(title: "Velocity", selection: velocityBinding, range: 1...127)
+                        Stepper("Note: \(button.note)", value: noteBinding, in: 0...127)
+                        Stepper("Velocity: \(max(button.onValue, 1))",
+                                value: onValueBinding, in: 1...127)
                     }
 
-                    IntWheelRow(title: "Channel", selection: channelBinding, range: 0...15) { String($0 + 1) }
+                    Stepper("Channel: \(button.channel + 1)", value: channelBinding, in: 0...15)
                     Picker("Behavior", selection: behaviorBinding) {
                         ForEach(ButtonBehavior.allCases) { b in
                             Text(b.label).tag(b)
@@ -253,6 +263,10 @@ struct ButtonEditorView: View {
                     }
                 } header: {
                     Text("MIDI")
+                } footer: {
+                    Text(button.behavior == .tap
+                         ? "Tap sends both halves from one press — \(button.message == .cc ? "the on value, then the off value" : "Note On, then Note Off") — for hosts that toggle internally."
+                         : "Momentary sends \(button.message == .cc ? "the on value while held and the off value on release" : "Note On while held and Note Off on release").")
                 }
 
                 Section("XY Pad Glide Toggle") {
@@ -270,6 +284,11 @@ struct ButtonEditorView: View {
                     ))
                     .tint(Theme.accent)
 
+                    if isAssigned {
+                        Text("This button will toggle glide (legato portamento) on the XY pad when pressed.")
+                            .font(.caption)
+                            .foregroundColor(Theme.dim)
+                    }
                 }
 
                 if isPadIdiom && app.preset.buttons.count > 1 {
@@ -320,12 +339,6 @@ struct ButtonEditorView: View {
     private var ccBinding: Binding<Int> { bind(\.cc, default: MIDIDefaults.buttonCCPool[0]) }
     private var onValueBinding: Binding<Int> { bind(\.onValue, default: 127) }
     private var offValueBinding: Binding<Int> { bind(\.offValue, default: 0) }
-    private var velocityBinding: Binding<Int> {
-        Binding(
-            get: { max(self.button?.onValue ?? 127, 1) },
-            set: { self.onValueBinding.wrappedValue = min(max($0, 1), 127) }
-        )
-    }
     private var channelBinding: Binding<Int> { bind(\.channel, default: 0) }
     private var behaviorBinding: Binding<ButtonBehavior> { bind(\.behavior, default: .tap) }
 
@@ -346,10 +359,9 @@ struct ButtonEditorView: View {
                             .filter { $0.id != self.buttonID && $0.message == .cc }
                             .map(\.cc)
                     )
-                    let unavailable = others.union(self.app.preset.usedDrawbarCCs)
-                    if unavailable.contains(self.app.preset.buttons[i].cc) {
+                    if others.contains(self.app.preset.buttons[i].cc) {
                         self.app.preset.buttons[i].cc =
-                            MIDIDefaults.firstFreeButtonCC(avoiding: unavailable)
+                            MIDIDefaults.firstFreeButtonCC(avoiding: others)
                     }
                 }
                 self.app.preset.buttons[i].message = newValue
@@ -383,21 +395,23 @@ struct LabeledSlider: View {
 struct SettingsPageView: View {
     @EnvironmentObject var app: AppState
     @State private var confirmReset = false
+    @State private var expandedSection: String? = nil
     @State private var showBluetooth = false
-    @State private var showInstructions = false
+
+    /// Same key RootView reads. Toggling it from either surface's settings
+    /// changes the layout for both, which is correct — it's an app-level
+    /// choice, not a property of one surface.
+    @AppStorage("MotionMIDIPro.dualSurface") private var dualSurface = false
 
     var body: some View {
         Form {
-            Section {
-                Button {
-                    showInstructions = true
-                } label: {
-                    Label("Instructions", systemImage: "book.closed.fill")
-                        .foregroundColor(Theme.accent)
-                }
-            }
-
             Section("Preset") {
+                // With two surfaces on screen, both editors look identical.
+                // This says which one is being edited.
+                if dualSurface && isPadIdiom {
+                    LabeledContent("Surface",
+                                   value: app.isPrimary ? "Left" : "Right")
+                }
                 TextField("Preset Name", text: $app.preset.name)
                 LabeledContent("In Library", value: "\(app.presets.count) preset\(app.presets.count == 1 ? "" : "s")")
                 Button("Reset This Preset to Default", role: .destructive) {
@@ -405,7 +419,11 @@ struct SettingsPageView: View {
                 }
             }
 
-            Section("Connection") {
+            // Bluetooth moved off the performance screen and landed here.
+            // Pairing is something done once before a show, not mid-set, and
+            // it was occupying a 44pt target on the row you reach across
+            // while playing.
+            Section {
                 Button {
                     showBluetooth = true
                 } label: {
@@ -414,123 +432,157 @@ struct SettingsPageView: View {
                 }
 
                 MIDIDestinationStatus(midi: app.midi)
+            } header: {
+                Text("Connection")
+            } footer: {
+                Text("Motion MIDI appears to hosts as a single source, no matter how many performer surfaces are on screen.")
+            }
+
+            // iPad only. Two surfaces need width for two pads; on a phone
+            // each would be too narrow to play, so the toggle isn't offered.
+            if isPadIdiom {
+                Section {
+                    Toggle("Second Performer Surface", isOn: $dualSurface)
+                        .tint(Theme.accent)
+                } header: {
+                    Text("Layout")
+                } footer: {
+                    Text("Splits the screen into two independent surfaces, each with its own preset, pad, buttons and dials. Both send down the same MIDI port, so keep them on different channels or CCs. The gyro drives the left surface only — there's one sensor, and it can follow one preset's mappings at a time.")
+                }
             }
 
             Section("Status") {
                 MotionEngineStatus(motion: app.motion)
                 LabeledContent("Virtual Source", value: "Motion MIDI")
             }
+
+            helpSection("Getting Started", icon: "star.fill") {
+                helpItem("Connect to a MIDI Host",
+                         "Open Settings → Connection → Bluetooth MIDI. Connect to any app or device that receives MIDI — on the same iPhone, on an iPad, a Mac, or hardware. Motion MIDI appears as a source named 'Motion MIDI' in any compatible app's MIDI input settings. Popular hosts include Loopy Pro, AUM, GarageBand, Drambo, and any AUv3-compatible app.")
+                helpItem("Same-Device Use",
+                         "Open Motion MIDI first, then switch to your target app. Motion MIDI keeps running in the background. In your host app's MIDI settings, select 'Motion MIDI' as an input source.")
+                helpItem("Calibrate Motion",
+                         "Hold the device in your normal playing position, then tap the crosshair button. This zeros pitch, roll, and yaw so your natural hold position sends center values. Recalibrate any time your playing position changes.")
+                helpItem("Switch Presets",
+                         "Tap the preset name in the top-right of the screen. Presets are listed most-recently-used first. Tap any preset to switch instantly. Use Save As New Preset to copy the current state with a new name.")
+            }
+
+            helpSection("XY Pad", icon: "square.grid.2x2") {
+                helpItem("CC Mode vs Notes Mode",
+                         "Use the CC / Notes toggle in the pad header. CC mode sends two MIDI control change values — X and Y independently — to any parameter in any app that responds to MIDI CC. Notes mode turns the pad into a polyphonic instrument using the scale and diagonal you configure.")
+                helpItem("Standard XY vs 4-Corner Morph",
+                         "Use the XY / 4C toggle in the pad header. Standard XY sends two CCs (X and Y). 4-Corner Morph sends four CCs simultaneously — one per corner — blended smoothly as you move. Useful for controlling four independent parameters at once, such as clip volumes, send levels, or filter cutoffs.")
+                helpItem("4-Corner Morph Controls",
+                         "Morph Curve (-100 to +100): negative values spread influence broadly across corners; positive values concentrate it on the nearest corner. Center Strength: at 0% the pad feels like four distinct regions; at 100% the center creates a wide four-way blend. Equal Power: reduces perceived level drop when multiple destinations are partly attenuated.")
+                helpItem("Notes Mode: Scale and Root",
+                         "The root note sits about one-third of the way along the diagonal, with lower scale notes below it. The root band is highlighted brighter than the others. Change root and scale in the XY pad config sheet (tap the sliders icon in the pad header).")
+                helpItem("Notes Mode: Diagonals",
+                         "The diagonal determines which direction pitch increases as you move across the pad. Four orientations are available. The dashed line shows the pitch direction; the perpendicular bands are individual scale steps.")
+                helpItem("Glide",
+                         "Glide (legato portamento) makes notes slide between pitches instead of retriggering. Enable it in the config sheet or assign it to a pad button. The glide time sends CC 5; the on/off toggle sends CC 65. The receiving synth must respond to these standard portamento CCs — some instruments expose portamento only in their own UI.")
+                helpItem("Voice Count",
+                         "1, 2, or 3 simultaneous touches in Notes mode. When a new finger exceeds the limit, the oldest voice is stolen. Lift a finger and its stolen voice returns at its current position — the same note-priority behavior as a classic mono synth.")
+            }
+
+            helpSection("Stepped Dial", icon: "dial.low.fill") {
+                helpItem("Basic Operation",
+                         "Drag around the knob to sweep through steps. Swipe up to advance one step; swipe down to go back. Long-press for 0.5 seconds to open dial settings.")
+                helpItem("Steps and Actions",
+                         "Each step can fire any combination of actions: Send CC, Program Change, Set Root Note, Set Scale, Toggle Glide, Toggle Perp→Velocity, Set Fixed Velocity, Set Voice Count, Set Note Range, and Fader Control. Tap a step in dial settings to edit it.")
+                helpItem("Program Change",
+                         "Each step can send a Program Change to switch patches, scenes, or presets on any connected device or app. Combine with Send CC or Fader Control on the same step to set up a complete scene in one detent.")
+                helpItem("Fader Control Action",
+                         "Assigns the vertical fader beside the dial to a specific CC while that step is selected. If a step has no Fader Control action, the fader falls back to that step's Send CC assignment. If neither exists, the fader is dimmed.")
+                helpItem("Shared Dial Presets",
+                         "Any dial configuration can be saved to the shared library and linked from multiple presets. Changes to a shared dial affect all presets using it. Tap Dial Preset in dial settings to manage this.")
+                helpItem("Multiple Dials",
+                         "Tap the + button at the end of the dial row to add another dial+fader combo. Each operates independently. On iPhone, scroll the row to reach dials past the first. Long-press any dial to open its settings, where you can delete it.")
+            }
+
+            helpSection("Vertical Fader", icon: "slider.vertical.3") {
+                helpItem("Assignment",
+                         "The fader has no fixed assignment. The selected dial step determines what it controls. Turn the dial and the fader silently re-points to the new step's CC, recalling that CC's last known value — like a motorized fader changing duty between parameters.")
+                helpItem("MIDI Feedback",
+                         "When a connected app sends CC feedback (for example, when you move a parameter directly in the host), the fader follows automatically. Feedback is matched on both MIDI channel and CC number, so messages for one step never update another.")
+                helpItem("No Feedback Loops",
+                         "Incoming feedback never re-transmits. Only direct finger movement on the fader sends MIDI. Changing steps never sends MIDI from the fader — the silent repositioning prevents runaway feedback with any host that echoes parameter changes.")
+                helpItem("Unknown Value",
+                         "If a step has never received feedback during this session, the fader shows the step's own stored Send CC value as a starting point. It does not assume zero and does not automatically query the host for the current value.")
+            }
+
+            helpSection("Motion Control", icon: "gyroscope") {
+                helpItem("Available Sources",
+                         "Roll, Pitch, Yaw, and Shake (acceleration magnitude). Each can be independently mapped to any CC number on any MIDI channel, targeting any parameter in any connected app or device.")
+                helpItem("Calibration",
+                         "Hold the device in playing position and tap the crosshair button. This zeros the current orientation so your natural hold sends center values (approximately CC 64). Recalibrate whenever your playing position changes.")
+                helpItem("Response Curve",
+                         "Each mapping has a dead zone, sensitivity, smoothing, and curve type (linear, S-curve, exponential). S-curve gives expressive control with a stable center; exponential suits dramatic gestures. Adjust in the Mappings tab.")
+                helpItem("Background Operation",
+                         "Motion MIDI keeps running when backgrounded, so any foreground app continues to receive MIDI from device motion. The audio background mode entitlement is already enabled.")
+            }
+
+            helpSection("Pad Buttons", icon: "rectangle.grid.3x2") {
+                helpItem("Behavior",
+                         "Each button sends a MIDI Note On when pressed. Momentary buttons send Note Off on release — useful for sustained triggers or toggle actions. Tap buttons send a short Note On + Note Off automatically — useful for one-shot triggers like scene launches or transport commands.")
+                helpItem("MIDI Assignment",
+                         "Each button has its own note number and MIDI channel. Map them using MIDI Learn or fixed routing in your host app. Common uses: transport control, clip launching, mute toggles, patch changes, or any action triggered by a MIDI note.")
+                helpItem("Glide Toggle",
+                         "One button can be assigned as a glide toggle for the XY pad. Pressing it flips glide on or off in addition to sending its note. Assign it in the button editor under the Buttons tab.")
+                helpItem("iPad: More Buttons",
+                         "On iPad, the Buttons tab allows adding buttons without limit. iPhone always shows the first six — reorder them on iPad to choose which six appear on iPhone.")
+            }
+
+            helpSection("MIDI Routing", icon: "cable.connector") {
+                helpItem("Virtual MIDI Source",
+                         "Motion MIDI creates a CoreMIDI virtual source named 'Motion MIDI'. Any app on the same device can receive from it without a physical connection. Look for 'Motion MIDI' in your host app's MIDI input source list.")
+                helpItem("Bluetooth MIDI",
+                         "Settings → Connection → Bluetooth MIDI opens the browser. Connect to a Bluetooth MIDI peripheral, a Mac, or another iOS device. Motion MIDI broadcasts to all connected destinations simultaneously, so one device can drive multiple apps or hardware at once.")
+                helpItem("Wired Connection",
+                         "Connecting the iPhone to a Mac via USB also exposes Motion MIDI as a MIDI source over the wired connection. No additional setup is required.")
+                helpItem("MIDI Feedback / Incoming CC",
+                         "Motion MIDI creates a virtual MIDI destination named 'Motion MIDI'. Any app that supports MIDI feedback output can send CC values back here, and the vertical fader will update to reflect them. Only CC messages are processed; all other message types are ignored.")
+                helpItem("MIDI Channels",
+                         "Every output in Motion MIDI — XY pad, buttons, motion mappings, dial steps, and fader — has its own MIDI channel setting. Use different channels to route to different instruments or parameters in the same app without conflicts.")
+            }
         }
         .scrollContentBackground(.hidden)
         .sheet(isPresented: $showBluetooth) {
             BluetoothMIDIView()
-        }
-        .fullScreenCover(isPresented: $showInstructions) {
-            InstructionsView()
         }
         .confirmationDialog("Reset this preset to the default layout? Its name and place in the library are kept.",
                             isPresented: $confirmReset, titleVisibility: .visible) {
             Button("Reset", role: .destructive) { app.resetActivePresetToDefault() }
         }
     }
-}
 
-// MARK: - Instructions
+    // MARK: - Help section builder
 
-struct InstructionsView: View {
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        NavigationStack {
-            List {
-                Section("Getting Started") {
-                    bullet("Connect MIDI", "For another device, open Settings → Connection → Bluetooth MIDI. For an app on this iPhone/iPad, select ‘Motion MIDI’ as a MIDI input in that app.")
-                    bullet("Center Motion", "Hold the device in your normal playing position and tap Center. Re-center whenever your playing position changes.")
-                    bullet("Presets", "Tap the preset name above the pad to switch. Presets are most-recent first. Swipe to rename or delete; the last preset cannot be deleted. Save As New Preset copies the current setup.")
-                    bullet("Lower Settings", "Tap the lower Settings button to open the editor. It stays highlighted while the editor is open; tap it again to close.")
-                }
-
-                Section("XY Pad") {
-                    bullet("Open Pad Settings", "Tap the Settings icon beside the preset name.")
-                    bullet("Four Modes", "XY sends X and Y CCs. Morph blends four corner outputs. Drawbars gives independent CC faders. Notes turns the pad into a scale instrument.")
-                    bullet("XY", "Choose X CC, Y CC, channel, and optional spring return.")
-                    bullet("Morph", "Each corner has its own CC and channel. Curve changes how widely corners influence the pad; Center Strength changes the center blend; Equal Power keeps the combined level steadier.")
-                    bullet("Drawbars", "Choose 1–9 bars and a direction. The arrow points toward value 127; the opposite end is 0. All drawbars use the Shared MIDI channel and hold their positions in the preset.")
-                    bullet("Drawbar Touch", "Individual moves only the bar you first touch. Sweep moves every bar you cross. Ramp 0 is instant; Ramp 1–10 glides changes from 100 ms to 1.0 second.")
-                    bullet("Notes: Root & Scale", "Set root and scale in Pad Settings. You can also tap the key/scale chip on the pad for quick scale changes.")
-                    bullet("Notes: Voices", "Choose 1–3 voices. If you exceed the limit, the oldest voice is temporarily stolen and returns when the newer finger lifts.")
-                    bullet("Notes: Diagonal & Range", "The selected diagonal sets the direction of rising pitch. Note Range sets the total span; dotted root-octave lines show where octaves fall.")
-                    bullet("Glide", "Glide slides between notes instead of retriggering. MotionMIDI uses CC65 for portamento on/off and CC5 for glide time; the receiving instrument must support them.")
-                    bullet("Velocity", "Use a fixed velocity or map movement perpendicular to the note bands to velocity.")
-                }
-
-                Section("Stepped Dial") {
-                    bullet("Open Dial Settings", "Long-press a dial for about 0.5 seconds to open its settings menu.")
-                    bullet("Move Through Steps", "Drag around the knob to select steps, or swipe up/down one step at a time. Steps run clockwise from the lower-left; the knob shows the first four characters of each label.")
-                    bullet("Manage Steps", "Add steps, drag to reorder, and swipe to delete. A step can perform several actions at once.")
-                    bullet("Dial Presets", "Local dials live only in the current preset. Shared dials can be linked to multiple presets; editing a shared dial changes every preset linked to it.")
-                    bullet("Dial Channel", "The dial channel is the starting channel for new MIDI actions. Existing step actions keep their own channel unless you change them.")
-                    bullet("Pad Control Card", "Changes pad behavior such as root, scale, glide, velocity mode, voice count, or note range when the step is selected. These actions reshape the pad rather than sending a dial MIDI message.")
-                    bullet("Dial Card", "Send CC and Program Change actions fire when the step is selected. Toggle Glide and Toggle Perp→Velocity flip those pad settings on/off.")
-                    bullet("Fader Card", "Choose the CC and channel controlled by the vertical fader while that step is selected. Selecting the step itself does not send a fader value.")
-                    bullet("Multiple Dials", "Use + to add another dial/fader pair. On iPhone, scroll the dial row to reach additional pairs.")
-                }
-
-                Section("Vertical Fader") {
-                    bullet("Assignment", "A step’s Fader Control action chooses the fader CC. If none is set, the fader can fall back to that step’s Send CC assignment; with neither assignment it is inactive.")
-                    bullet("Feedback", "Incoming CC feedback moves the fader when both channel and CC match the current assignment.")
-                    bullet("No Feedback Loop", "Incoming feedback is not retransmitted. Only direct finger movement sends fader MIDI.")
-                    bullet("Stored Position", "Changing dial steps silently recalls the last known value. If no feedback has been received yet, the step’s stored CC value is the starting point.")
-                }
-
-                Section("Motion") {
-                    bullet("Sources", "Map Roll, Pitch, Yaw, or Shake to any CC and MIDI channel.")
-                    bullet("Processing", "Dead Zone ignores tiny motion. Sensitivity changes gain. Smoothing reduces jitter. Response Curve changes feel. Invert reverses direction. Output Range limits the sent values.")
-                    bullet("Calibration", "Tap Center while holding the device naturally so that position becomes the neutral point.")
-                    bullet("Background", "MotionMIDI can continue sending motion MIDI while another compatible app is in the foreground.")
-                }
-
-                Section("Buttons") {
-                    bullet("CC or Note", "Each button can send either a MIDI CC or a MIDI Note on its own channel.")
-                    bullet("Tap", "Tap sends the on event/value and then the off event/value automatically from one press.")
-                    bullet("Momentary", "Momentary keeps the on event/value active while held and sends the off event/value on release.")
-                    bullet("Glide Toggle", "A button can also be assigned to toggle XY Pad Glide when pressed.")
-                    bullet("Button Order", "iPhone shows the first six buttons. On iPad you can add more, drag to reorder, and choose which six appear first.")
-                }
-
-                Section("MIDI Routing") {
-                    bullet("Virtual Source", "MotionMIDI creates a virtual MIDI source named ‘Motion MIDI’ for same-device routing.")
-                    bullet("Bluetooth", "Use Settings → Connection → Bluetooth MIDI to connect compatible external MIDI devices or computers.")
-                    bullet("Destinations", "Settings shows the MIDI destinations MotionMIDI currently sees.")
-                    bullet("Incoming CC", "MotionMIDI accepts CC feedback so the vertical fader can follow changes made in a host app.")
-                    bullet("Channels", "Pad controls, buttons, motion mappings, dial actions, drawbars, and fader assignments can use their own MIDI channels as provided in their settings.")
-                }
-            }
-            .scrollContentBackground(.hidden)
-            .navigationTitle("Instructions")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { dismiss() }
-                }
+    private func helpSection<Content: View>(_ title: String, icon: String, @ViewBuilder content: @escaping () -> Content) -> some View {
+        Section {
+            DisclosureGroup(
+                isExpanded: Binding(
+                    get: { expandedSection == title },
+                    set: { expandedSection = $0 ? title : nil }
+                )
+            ) {
+                content()
+            } label: {
+                Label(title, systemImage: icon)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundColor(.primary)
             }
         }
     }
 
-    private func bullet(_ title: String, _ detail: String) -> some View {
-        HStack(alignment: .top, spacing: 8) {
-            Text("•")
-                .font(.headline)
+    private func helpItem(_ title: String, _ body: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.caption.weight(.semibold))
                 .foregroundColor(Theme.accent)
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.subheadline.weight(.semibold))
-                Text(detail)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+            Text(body)
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .padding(.vertical, 2)
     }

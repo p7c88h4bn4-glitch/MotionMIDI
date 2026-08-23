@@ -111,13 +111,6 @@ extension Preset {
     var usedButtonCCs: Set<Int> {
         Set(buttons.filter { $0.message == .cc }.map(\.cc))
     }
-
-    /// CCs currently assigned to the visible drawbar bank. Keeping this
-    /// separate lets button creation avoid silently landing on a drawbar.
-    var usedDrawbarCCs: Set<Int> {
-        let count = min(max(xyPad.drawbarCount, 1), xyPad.drawbars.count)
-        return Set(xyPad.drawbars.prefix(count).map(\.cc))
-    }
 }
 
 extension Preset {
@@ -171,26 +164,39 @@ extension Preset {
 /// safety net in case a downgrade is ever needed.
 enum PresetLibraryStore {
     private static let libraryKey = "MotionMIDIPro.presetLibrary"
-    private static let activeKey  = "MotionMIDIPro.activePresetID"
+    private static let activeKeyBase = "MotionMIDIPro.activePresetID"
     private static let legacyKey  = "MotionMIDIPro.currentPreset"
+
+    /// The LIBRARY is shared by every performer surface — build a preset
+    /// once and either surface can load it. The ACTIVE POINTER is per
+    /// surface, so two surfaces can sit on different presets at the same
+    /// time, which is the entire point of having two.
+    ///
+    /// Surface 0 keeps the original, unsuffixed key, so an existing install
+    /// reopens on exactly the preset it was left on rather than resetting
+    /// the moment this shipped.
+    private static func activeKey(surface: Int) -> String {
+        surface == 0 ? activeKeyBase : "\(activeKeyBase).surface\(surface)"
+    }
 
     struct Library {
         var presets: [Preset]
         var activeID: UUID
     }
 
-    static func save(presets: [Preset], activeID: UUID) {
+    static func save(presets: [Preset], activeID: UUID, surface: Int = 0) {
         if let data = try? JSONEncoder().encode(presets) {
             UserDefaults.standard.set(data, forKey: libraryKey)
         }
-        UserDefaults.standard.set(activeID.uuidString, forKey: activeKey)
+        UserDefaults.standard.set(activeID.uuidString, forKey: activeKey(surface: surface))
     }
 
-    static func load() -> Library? {
+    static func load(surface: Int = 0) -> Library? {
         if let data = UserDefaults.standard.data(forKey: libraryKey),
            let presets = try? JSONDecoder().decode([Preset].self, from: data),
            !presets.isEmpty {
-            let stored = UserDefaults.standard.string(forKey: activeKey).flatMap(UUID.init)
+            let stored = UserDefaults.standard
+                .string(forKey: activeKey(surface: surface)).flatMap(UUID.init)
             // A stored id that no longer matches anything falls back to the
             // most recently used preset rather than leaving nothing active.
             let activeID = presets.contains { $0.id == stored }

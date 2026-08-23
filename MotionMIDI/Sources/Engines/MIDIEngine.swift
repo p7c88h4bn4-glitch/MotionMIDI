@@ -31,7 +31,20 @@ final class MIDIEngine: ObservableObject {
 
     /// Called on the MAIN queue for every incoming Control Change:
     /// (channel 0-15, controller 0-127, value 0-127).
-    var onControlChangeReceived: ((Int, Int, Int) -> Void)?
+    ///
+    /// A LIST, not a single closure. One engine is now shared by every
+    /// performer surface on screen, and a lone `var onControlChangeReceived`
+    /// meant whichever surface initialized last silently replaced the
+    /// other's handler — the first surface's faders would simply stop
+    /// tracking host feedback, with nothing to indicate why.
+    private var controlChangeObservers: [(Int, Int, Int) -> Void] = []
+
+    /// Register interest in incoming CCs. Every observer is called for
+    /// every message; each decides for itself whether the channel and
+    /// controller are any of its business.
+    func addControlChangeObserver(_ observer: @escaping (Int, Int, Int) -> Void) {
+        controlChangeObservers.append(observer)
+    }
 
     private var client = MIDIClientRef()
     private var outPort = MIDIPortRef()
@@ -140,7 +153,10 @@ final class MIDIEngine: ObservableObject {
         let value = Int(word & 0x7F)
 
         DispatchQueue.main.async { [weak self] in
-            self?.onControlChangeReceived?(channel, controller, value)
+            guard let self else { return }
+            for observer in self.controlChangeObservers {
+                observer(channel, controller, value)
+            }
         }
     }
 

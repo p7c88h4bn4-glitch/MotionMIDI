@@ -1,6 +1,21 @@
 import Foundation
 import Combine
 
+/// Cross-surface notification constants.
+///
+/// Deliberately OUTSIDE `AppState`, which is `@MainActor`. Static members of
+/// a main-actor-isolated type are themselves actor-isolated, and the closure
+/// handed to `NotificationCenter.addObserver` is `@Sendable` — so reading
+/// them from inside it is a concurrency violation ("main actor-isolated
+/// static property can not be referenced from a Sendable closure"). Both
+/// values are immutable and `Sendable`, so there is nothing for the actor to
+/// protect; the isolation was incidental, inherited from where they happened
+/// to be declared.
+enum SurfaceSync {
+    static let libraryDidChange = Notification.Name("MotionMIDIPro.libraryDidChange")
+    static let surfaceKey = "surface"
+}
+
 @MainActor
 final class AppState: ObservableObject {
 
@@ -20,8 +35,39 @@ final class AppState: ObservableObject {
     let midi: MIDIEngine
     let motion: MotionEngine
 
-    init() {
-        let loaded = PresetLibraryStore.load()
+    /// Which performer surface this instance drives. 0 is the primary.
+    ///
+    /// Two surfaces means two `AppState` objects, each injected into its own
+    /// view subtree. Nothing in the view layer had to change for this: every
+    /// view already reads `@EnvironmentObject var app: AppState`, so giving
+    /// a subtree a different instance is enough to give it a different
+    /// preset, dial, and set of buttons.
+    let surface: Int
+
+    /// Only the primary surface drives the motion engine.
+    ///
+    /// The engine is SHARED, so both surfaces show live meters, but it can
+    /// only be pointed at one preset's mappings at a time. Letting the
+    /// second surface repoint it would mean whichever surface was touched
+    /// last silently stole gyro output from the other.
+    var isPrimary: Bool { surface == 0 }
+
+    /// Designated initializer.
+    ///
+    /// - Parameters:
+    ///   - midi: Shared across surfaces on purpose. One engine means one
+    ///     virtual MIDI port, so a host sees a single instrument rather than
+    ///     one per surface, and both surfaces transmit down it.
+    ///   - motion: Shared for the same reason, plus the hardware reason:
+    ///     there is one gyroscope, and two `CMMotionManager` consumers is
+    ///     wasted battery for identical numbers. Pass nil to have this
+    ///     instance build and start its own.
+    init(surface: Int = 0,
+         midi sharedMIDI: MIDIEngine? = nil,
+         motion sharedMotion: MotionEngine? = nil) {
+        self.surface = surface
+
+        let loaded = PresetLibraryStore.load(surface: surface)
         let initialPresets: [Preset]
         let initialActiveID: UUID
 
@@ -34,23 +80,80 @@ final class AppState: ObservableObject {
             initialActiveID = seed.id
         }
 
-        let midi = MIDIEngine()
+        let midi = sharedMIDI ?? MIDIEngine()
         self.midi = midi
         self.presets = initialPresets
         self.activePresetID = initialActiveID
         self.dialLibrary = DialLibraryStore.load()
 
         let active = initialPresets.first { $0.id == initialActiveID } ?? initialPresets[0]
-        self.motion = MotionEngine(midi: midi, preset: active)
-        self.motion.start()
+
+        if let sharedMotion {
+            self.motion = sharedMotion
+        } else {
+            let engine = MotionEngine(midi: midi, preset: active)
+            self.motion = engine
+            engine.start()
+        }
 
         // Feedback in: the engine parses on its own thread and calls this on
         // the main queue; the Task hop satisfies @MainActor isolation.
-        midi.onControlChangeReceived = { [weak self] channel, cc, value in
+        //
+        // Registered as an OBSERVER rather than assigned to a single
+        // property, so a second surface adds itself alongside the first
+        // instead of replacing it.
+        midi.addControlChangeObserver { [weak self] channel, cc, value in
             Task { @MainActor in
                 self?.handleIncomingCC(channel: channel, cc: cc, value: value)
             }
         }
+
+        // The library is shared storage, so a write from the other surface
+        // has to be picked up here — otherwise this instance keeps its stale
+        // array and its next save silently reverts the other's edit.
+        libraryObserver = NotificationCenter.default.addObserver(
+            forName: SurfaceSync.libraryDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let self else { return }
+            let sender = note.userInfo?[SurfaceSync.surfaceKey] as? Int
+            guard sender != self.surface else { return }
+            Task { @MainActor in self.reloadLibraryFromStore() }
+        }
+    }
+
+    deinit {
+        if let libraryObserver {
+            NotificationCenter.default.removeObserver(libraryObserver)
+        }
+    }
+
+    // MARK: - Cross-surface library sync
+
+    /// `nonisolated(unsafe)` because `deinit` is not actor-isolated and has
+    /// to read this to unregister. Safe in practice: it is written once
+    /// during `init` and read once during `deinit`, with no window in which
+    /// two threads could touch it.
+    nonisolated(unsafe) private var libraryObserver: NSObjectProtocol?
+
+    /// True while applying another surface's write, so re-persisting from
+    /// the resulting `didSet` can't bounce a notification back and forth.
+    private var applyingRemoteLibraryChange = false
+
+    private func reloadLibraryFromStore() {
+        guard let loaded = PresetLibraryStore.load(surface: surface),
+              !loaded.presets.isEmpty else { return }
+
+        applyingRemoteLibraryChange = true
+        presets = loaded.presets
+        // This surface's own active preset is deliberately left alone: the
+        // other surface changing which preset IT is on must not drag this
+        // one along with it.
+        if !presets.contains(where: { $0.id == activePresetID }) {
+            activePresetID = loaded.activeID
+        }
+        applyingRemoteLibraryChange = false
     }
 
     // MARK: - Active preset
@@ -72,7 +175,9 @@ final class AppState: ObservableObject {
             var updated = newValue
             updated.id = activePresetID   // an edit must never change identity
             presets[index] = updated
-            motion.preset = updated
+            // Only the primary surface points the shared motion engine at
+            // its preset — see `isPrimary`.
+            if isPrimary { motion.preset = updated }
         }
     }
 
@@ -101,7 +206,7 @@ final class AppState: ObservableObject {
         guard let index = presets.firstIndex(where: { $0.id == id }) else { return }
         presets[index].lastUsed = Date()
         activePresetID = id
-        motion.preset = presets[index]
+        if isPrimary { motion.preset = presets[index] }
     }
 
     @discardableResult
@@ -161,7 +266,20 @@ final class AppState: ObservableObject {
     }
 
     private func persistPresets() {
-        PresetLibraryStore.save(presets: presets, activeID: activePresetID)
+        PresetLibraryStore.save(presets: presets,
+                                activeID: activePresetID,
+                                surface: surface)
+
+        // Don't echo a change that came FROM the other surface; it already
+        // has it, and bouncing it back would have the two overwriting each
+        // other in a loop.
+        guard !applyingRemoteLibraryChange else { return }
+
+        NotificationCenter.default.post(
+            name: SurfaceSync.libraryDidChange,
+            object: nil,
+            userInfo: [SurfaceSync.surfaceKey: surface]
+        )
     }
 
     // MARK: - Stepped dial(s)
@@ -215,22 +333,7 @@ final class AppState: ObservableObject {
     func selectDialStep(at slot: Int, _ stepIndex: Int) {
         let d = dial(at: slot)
         guard d.steps.indices.contains(stepIndex) else { return }
-
-        // Capture what the performer is currently looking at BEFORE changing
-        // assignments. If the new CC has no feedback yet, this is the position
-        // the fader will keep.
-        let previousVisibleValue = faderDisplayedValue(at: slot)
-
         updateDial(at: slot) { $0.currentStepIndex = stepIndex }
-
-        if let newKey = faderAssignment(at: slot) {
-            if let known = faderValueCache[newKey] {
-                faderHeldValueBySlot[slot] = known
-            } else if let previousVisibleValue {
-                faderHeldValueBySlot[slot] = previousVisibleValue
-            }
-        }
-
         for action in d.steps[stepIndex].actions {
             perform(action, dialChannel: d.channel)
         }
@@ -305,15 +408,8 @@ final class AppState: ObservableObject {
     /// from a previous session would masquerade as the host's live state.
     @Published var faderValueCache: [CCKey: Int] = [:]
 
-    /// The last visible fader position for each on-screen slot. This is only a
-    /// UI hold value: it is never transmitted and never persisted. When a newly
-    /// selected assignment has no feedback yet, the fader simply remains here
-    /// instead of jumping to a per-step default.
-    @Published private var faderHeldValueBySlot: [Int: Int] = [:]
-
-    /// A slot's active step's fader assignment. This is identity only —
-    /// channel + CC. No initial/default value belongs to the assignment.
-    /// Two sources, in priority order:
+    /// A slot's active step's fader assignment. Two sources, in priority
+    /// order:
     ///
     ///   1. An explicit **Fader Control** action — the step says outright
     ///      which CC the fader drives, independent of what else it does.
@@ -325,38 +421,37 @@ final class AppState: ObservableObject {
     /// you selected a step that didn't set one, leaving the fader pointed at
     /// the previous step's CC.
     ///
-    /// The live cache (`faderValueCache`) stays keyed by CC identity only,
-    /// shared across every slot and every preset — if two slots point at the
-    /// same channel/CC, they show the same live feedback because they represent
-    /// the same host parameter.
-    func faderAssignment(at slot: Int) -> CCKey? {
+    /// The cache itself (`faderValueCache`) stays keyed by CC identity only,
+    /// shared across every slot and every preset — if two slots happen to
+    /// point at the same channel/CC, they show the same live value, which
+    /// is the correct behavior for "this is the same host parameter".
+    func faderAssignment(at slot: Int) -> (key: CCKey, storedValue: Int)? {
         let d = dial(at: slot)
         guard let step = d.currentStep else { return nil }
 
-        if case .setFaderCC(let cc, let channel)?
+        if case .setFaderCC(let cc, let defaultValue, let channel)?
             = step.action(ofKind: .faderCC) {
-            return CCKey(channel: channel, cc: cc)
+            return (CCKey(channel: channel, cc: cc), defaultValue)
         }
 
-        if case .sendCC(let cc, _, let channel)?
+        if case .sendCC(let cc, let value, let channel)?
             = step.action(ofKind: .cc) {
-            return CCKey(channel: channel, cc: cc)
+            return (CCKey(channel: channel, cc: cc), value)
         }
 
         return nil
     }
 
-    /// What a slot's fader shows:
-    ///   1. the last live feedback/user value known for this exact channel+CC,
-    ///   2. otherwise the slot's previous visible position,
-    ///   3. 64 only for a brand-new slot that has never had a visible value.
-    ///
-    /// There is deliberately NO per-step "start at" value. Switching steps is
-    /// silent and cannot reset the fader.
+    /// What a slot's fader shows, fully DERIVED — never separately stored:
+    ///   1. cached feedback/user value for the assignment, else
+    ///   2. the step's own stored Send CC value, else
+    ///   3. nil — no Send CC on this step; the fader renders disabled.
+    /// Because this recomputes when the selected step changes, "recall on
+    /// step change" needs no code at all, and repositioning is inherently
+    /// silent.
     func faderDisplayedValue(at slot: Int) -> Int? {
-        guard let key = faderAssignment(at: slot) else { return nil }
-        if let known = faderValueCache[key] { return known }
-        return faderHeldValueBySlot[slot] ?? 64
+        guard let assignment = faderAssignment(at: slot) else { return nil }
+        return faderValueCache[assignment.key] ?? assignment.storedValue
     }
 
     /// USER fader movement — the ONLY path anywhere that transmits a
@@ -364,12 +459,12 @@ final class AppState: ObservableObject {
     /// and derived state above, so loops are prevented structurally rather
     /// than by timing.
     func faderMoved(at slot: Int, to rawValue: Int) {
-        guard let key = faderAssignment(at: slot) else { return }
+        guard let assignment = faderAssignment(at: slot) else { return }
         let value = min(max(rawValue, 0), 127)
         guard value != faderDisplayedValue(at: slot) else { return }   // no repeats
-        faderHeldValueBySlot[slot] = value
-        faderValueCache[key] = value
-        midi.controlChange(key.cc, value: value, channel: key.channel)
+        faderValueCache[assignment.key] = value
+        midi.controlChange(assignment.key.cc, value: value,
+                           channel: assignment.key.channel)
     }
 
     /// Incoming feedback (e.g. Loopy Pro echoing a parameter move). Cache
@@ -377,17 +472,7 @@ final class AppState: ObservableObject {
     /// `faderDisplayedValue`; if not, the value waits for its step. Nothing
     /// here can transmit.
     func handleIncomingCC(channel: Int, cc: Int, value: Int) {
-        let key = CCKey(channel: channel, cc: cc)
-        let clamped = min(max(value, 0), 127)
-        faderValueCache[key] = clamped
-
-        // If this exact parameter is currently visible in one or more slots,
-        // remember that live position as the slot's hold position too. That way
-        // moving later to an assignment with no feedback leaves the fader exactly
-        // where the performer last saw it.
-        for slot in preset.dialSlots.indices where faderAssignment(at: slot) == key {
-            faderHeldValueBySlot[slot] = clamped
-        }
+        faderValueCache[CCKey(channel: channel, cc: cc)] = min(max(value, 0), 127)
     }
 
     // MARK: - Dial library management

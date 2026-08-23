@@ -37,9 +37,9 @@ enum DialAction: Equatable {
     /// Point the compact fader at a CC while this step is selected.
     ///
     /// DECLARATIVE, not executable: selecting the step does not transmit
-    /// anything. The fader follows live feedback when available; otherwise
-    /// it keeps its existing on-screen position.
-    case setFaderCC(cc: Int, channel: Int)
+    /// anything. `defaultValue` is only what the fader shows before any
+    /// feedback for this CC has arrived during this session.
+    case setFaderCC(cc: Int, defaultValue: Int, channel: Int)
 
     /// Sentinel written by the decoder when an old preset said "inherit the
     /// dial's channel". `DialPreset.init(from:)` replaces every one of these
@@ -68,7 +68,7 @@ enum DialAction: Equatable {
             return "Voices → \(n)"
         case .setNoteRange(let r):
             return "Range → \(r)s"
-        case .setFaderCC(let cc, let channel):
+        case .setFaderCC(let cc, _, let channel):
             return "Fader → CC\(cc) ch\(channel + 1)"
         }
     }
@@ -79,7 +79,7 @@ enum DialAction: Equatable {
         switch self {
         case .sendCC(_, _, let channel):          return channel
         case .sendProgramChange(_, let channel):  return channel
-        case .setFaderCC(_, let channel):         return channel
+        case .setFaderCC(_, _, let channel):      return channel
         default:                                  return nil
         }
     }
@@ -93,8 +93,8 @@ enum DialAction: Equatable {
             return .sendCC(cc: cc, value: value, channel: clamped)
         case .sendProgramChange(let program, _):
             return .sendProgramChange(program: program, channel: clamped)
-        case .setFaderCC(let cc, _):
-            return .setFaderCC(cc: cc, channel: clamped)
+        case .setFaderCC(let cc, let defaultValue, _):
+            return .setFaderCC(cc: cc, defaultValue: defaultValue, channel: clamped)
         default:
             return self
         }
@@ -141,8 +141,7 @@ extension DialAction: Codable {
     }
 
     private enum FaderKeys: String, CodingKey {
-        case cc, channel
-        case defaultValue               // legacy, decode-only
+        case cc, defaultValue, channel
         case channelOverride            // legacy, decode-only
     }
 
@@ -185,6 +184,7 @@ extension DialAction: Codable {
             let n = try c.nestedContainer(keyedBy: FaderKeys.self, forKey: .setFaderCC)
             self = .setFaderCC(
                 cc: try n.decodeIfPresent(Int.self, forKey: .cc) ?? MIDIDefaults.dialFaderCC,
+                defaultValue: try n.decodeIfPresent(Int.self, forKey: .defaultValue) ?? 64,
                 channel: try Self.decodeChannel(n, current: .channel, legacy: .channelOverride)
             )
 
@@ -248,9 +248,10 @@ extension DialAction: Codable {
             try n.encode(program, forKey: .program)
             try n.encode(channel, forKey: .channel)
 
-        case .setFaderCC(let cc, let channel):
+        case .setFaderCC(let cc, let defaultValue, let channel):
             var n = c.nestedContainer(keyedBy: FaderKeys.self, forKey: .setFaderCC)
             try n.encode(cc, forKey: .cc)
+            try n.encode(defaultValue, forKey: .defaultValue)
             try n.encode(channel, forKey: .channel)
 
         case .setRootNote(let v):
@@ -306,13 +307,11 @@ enum DialActionKind: String, CaseIterable, Identifiable {
         }
     }
 
-    /// Which collapsible step-editor card this action belongs to.
+    /// Which of the step editor's two cards this action belongs to.
     var group: DialActionGroup {
         switch self {
-        case .cc, .programChange:
-            return .dial
-        case .faderCC:
-            return .fader
+        case .cc, .faderCC, .programChange:
+            return .dialFader
         case .rootNote, .scale, .glide, .perpVelocity,
              .fixedVelocity, .voiceCount, .noteRange:
             return .padControl
@@ -320,13 +319,13 @@ enum DialActionKind: String, CaseIterable, Identifiable {
     }
 }
 
-/// Three deliberately separate jobs in the step editor: reshaping the XY pad,
-/// sending a message from the dial step itself, and assigning the companion
-/// fader. Keeping them in separate collapsible cards makes the hierarchy clear.
+/// The two halves of what a dial step can do, which are genuinely different
+/// jobs: reshaping the XY pad in front of you, versus sending something out
+/// of the app. Ten checkboxes in one list made those look like one menu of
+/// interchangeable options.
 enum DialActionGroup: String, CaseIterable, Identifiable {
     case padControl = "Pad Control"
-    case dial       = "Dial"
-    case fader      = "Fader"
+    case dialFader  = "Dial / Fader"
 
     var id: String { rawValue }
 
@@ -335,8 +334,7 @@ enum DialActionGroup: String, CaseIterable, Identifiable {
     var icon: String {
         switch self {
         case .padControl: return "square.grid.2x2"
-        case .dial:       return "dial.medium.fill"
-        case .fader:      return "slider.vertical.3"
+        case .dialFader:  return "dial.medium.fill"
         }
     }
 
@@ -344,10 +342,8 @@ enum DialActionGroup: String, CaseIterable, Identifiable {
         switch self {
         case .padControl:
             return "Reshapes the XY pad when this step is selected — key, scale, range and voicing. Nothing is transmitted."
-        case .dial:
-            return "MIDI messages sent when this dial step is selected."
-        case .fader:
-            return "Chooses the CC driven by the fader beside the dial while this step is selected."
+        case .dialFader:
+            return "Sends MIDI when this step is selected, and decides what the fader beside the dial drives. Each carries its own channel."
         }
     }
 
@@ -399,7 +395,7 @@ extension DialAction {
         case .faderCC:
             let cc = MIDIDefaults.firstFree(in: MIDIDefaults.dialFaderCCBlock,
                                             avoiding: taken)
-            return .setFaderCC(cc: cc, channel: ch)
+            return .setFaderCC(cc: cc, defaultValue: 64, channel: ch)
         case .programChange: return .sendProgramChange(program: 0, channel: ch)
         case .rootNote:      return .setRootNote(48)
         case .scale:         return .setScale(.chromatic)
@@ -416,7 +412,7 @@ extension DialAction {
     var occupiedCC: Int? {
         switch self {
         case .sendCC(let cc, _, _):      return cc
-        case .setFaderCC(let cc, _):     return cc
+        case .setFaderCC(let cc, _, _):  return cc
         default:                         return nil
         }
     }
