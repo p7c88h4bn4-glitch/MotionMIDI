@@ -76,6 +76,14 @@ struct MappingListView: View {
                     }
                     .listRowBackground(Theme.panel2)
                 }
+
+                Section {
+                    Toggle("Show Meters on Deck", isOn: $app.preset.showMotionMeters)
+                        .tint(Theme.accent)
+                        .listRowBackground(Theme.panel2)
+                } footer: {
+                    Text("Hides the pitch/roll/yaw/magnitude bars from the performance screen. The mappings above keep running and keep sending — this only takes back the space the bars occupy.")
+                }
             }
             .scrollContentBackground(.hidden)
             .navigationBarHidden(true)
@@ -264,9 +272,7 @@ struct ButtonEditorView: View {
                 } header: {
                     Text("MIDI")
                 } footer: {
-                    Text(button.behavior == .tap
-                         ? "Tap sends both halves from one press — \(button.message == .cc ? "the on value, then the off value" : "Note On, then Note Off") — for hosts that toggle internally."
-                         : "Momentary sends \(button.message == .cc ? "the on value while held and the off value on release" : "Note On while held and Note Off on release").")
+                    Text(behaviorFooter)
                 }
 
                 Section("XY Pad Glide Toggle") {
@@ -340,7 +346,50 @@ struct ButtonEditorView: View {
     private var onValueBinding: Binding<Int> { bind(\.onValue, default: 127) }
     private var offValueBinding: Binding<Int> { bind(\.offValue, default: 0) }
     private var channelBinding: Binding<Int> { bind(\.channel, default: 0) }
-    private var behaviorBinding: Binding<ButtonBehavior> { bind(\.behavior, default: .tap) }
+    /// Plain-language description of what the selected behavior puts on the
+    /// wire, phrased for whichever message type the button is sending.
+    private var behaviorFooter: String {
+        guard let button else { return "" }
+        let isCC = button.message == .cc
+
+        switch button.behavior {
+        case .momentary:
+            return isCC
+                ? "Momentary sends the on value while held and the off value on release."
+                : "Momentary sends Note On while held and Note Off on release."
+        case .tap:
+            return isCC
+                ? "Tap sends the on value then the off value from a single press, for hosts that toggle internally."
+                : "Tap sends Note On then Note Off from a single press, for hosts that toggle internally."
+        case .toggle:
+            return isCC
+                ? "Toggle latches: the first press sends the on value and the button stays lit, the next sends the off value. Use it when the host has no toggle of its own, or when you want the button to be the record of what's on."
+                : "Toggle latches: the first press sends Note On and the button stays lit, the next sends Note Off. The note sustains in between. Switching preset releases it, so nothing is left sounding."
+        }
+    }
+
+    /// Wraps the plain binding to clear a latch left behind when a lit
+    /// toggle button is changed to some other behavior.
+    ///
+    /// Without this the button would stay lit with no way to turn it off:
+    /// only `.toggle` presses clear a latch, and it just stopped being one.
+    /// The "off" message goes out too, so the host isn't left holding a
+    /// value nothing on screen still claims to be sending.
+    private var behaviorBinding: Binding<ButtonBehavior> {
+        let raw = bind(\.behavior, default: .tap)
+        return Binding(
+            get: { raw.wrappedValue },
+            set: { newValue in
+                if newValue != .toggle,
+                   let current = self.button,
+                   self.app.isButtonLatched(current.id) {
+                    self.app.emitButton(current, on: false)
+                    self.app.clearButtonLatch(current.id)
+                }
+                raw.wrappedValue = newValue
+            }
+        )
+    }
 
     /// Switching to CC on a button that was last a note button lands it on a
     /// free number when its stored CC is already taken — otherwise flipping
@@ -438,16 +487,23 @@ struct SettingsPageView: View {
                 Text("Motion MIDI appears to hosts as a single source, no matter how many performer surfaces are on screen.")
             }
 
-            // iPad only. Two surfaces need width for two pads; on a phone
-            // each would be too narrow to play, so the toggle isn't offered.
-            if isPadIdiom {
-                Section {
+            Section {
+                Toggle("Show Dial / Fader Panel", isOn: $app.preset.showDialPanel)
+                    .tint(Theme.accent)
+
+                // iPad only. Two surfaces need width for two pads; on a phone
+                // each would be too narrow to play, so it isn't offered.
+                if isPadIdiom {
                     Toggle("Second Performer Surface", isOn: $dualSurface)
                         .tint(Theme.accent)
-                } header: {
-                    Text("Layout")
-                } footer: {
-                    Text("Splits the screen into two independent surfaces, each with its own preset, pad, buttons and dials. Both send down the same MIDI port, so keep them on different channels or CCs. The gyro drives the left surface only — there's one sensor, and it can follow one preset's mappings at a time.")
+                }
+            } header: {
+                Text("Layout")
+            } footer: {
+                if isPadIdiom {
+                    Text("Hiding the dial panel gives its height back to the XY pad, and moves Center and the settings button side by side. Dial steps keep their assignments and keep applying — the row is only hidden.\n\nA second surface splits the screen into two independent performers, each with its own preset, pad, buttons and dials. Both send down the same MIDI port, so keep them on different channels or CCs. The gyro drives the left surface only — there's one sensor, and it can follow one preset's mappings at a time.")
+                } else {
+                    Text("Hiding the dial panel gives its height back to the XY pad, and moves Center and the settings button side by side. Dial steps keep their assignments and keep applying — the row is only hidden.")
                 }
             }
 
@@ -523,9 +579,9 @@ struct SettingsPageView: View {
 
             helpSection("Pad Buttons", icon: "rectangle.grid.3x2") {
                 helpItem("Behavior",
-                         "Each button sends a MIDI Note On when pressed. Momentary buttons send Note Off on release — useful for sustained triggers or toggle actions. Tap buttons send a short Note On + Note Off automatically — useful for one-shot triggers like scene launches or transport commands.")
+                         "Momentary sends the on message while held and the off message on release — for sustained triggers. Tap sends both halves from one press, for hosts that toggle internally, and suits one-shots like scene launches or transport commands. Toggle latches: the first press sends on and the button stays lit, the next press sends off. Use Toggle when the host has no toggle of its own, or when you want the button's lit state to be the record of what is on. Switching preset releases any latched button, so nothing is left hanging.")
                 helpItem("MIDI Assignment",
-                         "Each button has its own note number and MIDI channel. Map them using MIDI Learn or fixed routing in your host app. Common uses: transport control, clip launching, mute toggles, patch changes, or any action triggered by a MIDI note.")
+                         "Each button sends either a CC or a note, on its own number and channel. CC is the default for new buttons: it can be MIDI-learned to anything a host exposes — a mixer send, a plugin parameter, a transport control — while a note is only heard by something listening for notes. Common uses: transport control, clip launching, mute toggles, and patch changes.")
                 helpItem("Glide Toggle",
                          "One button can be assigned as a glide toggle for the XY pad. Pressing it flips glide on or off in addition to sending its note. Assign it in the button editor under the Buttons tab.")
                 helpItem("iPad: More Buttons",

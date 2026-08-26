@@ -695,9 +695,11 @@ struct DialStepEditor: View {
                 get: { n },
                 set: { setAction(.setVoiceCount($0)) }
             )) {
-                Text("1").tag(1)
-                Text("2").tag(2)
-                Text("3").tag(3)
+                // Driven by the shared constant so this cannot fall behind
+                // the pad's own limit again.
+                ForEach(1...XYPadConfig.maxVoices, id: \.self) { count in
+                    Text("\(count)").tag(count)
+                }
             }
 
         case .setNoteRange(let r):

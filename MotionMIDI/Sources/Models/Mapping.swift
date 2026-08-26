@@ -442,7 +442,7 @@ struct XYPadConfig: Codable, Equatable {
     /// Only one button can have this assignment; setting a new one clears
     /// the previous one.
     var glideToggleButtonId: UUID? = nil
-    /// Number of simultaneous voices in note mode (1, 2, or 3).
+    /// Number of simultaneous voices in note mode, up to `maxVoices`.
     /// When a new finger lands beyond this limit, the oldest voice is
     /// stolen and moves to the new finger.
     var voiceCount: Int = 1
@@ -475,6 +475,14 @@ struct XYPadConfig: Codable, Equatable {
 
 // Lenient decoding so presets saved before new fields existed still load.
 extension XYPadConfig {
+    /// Upper limit for `voiceCount`.
+    ///
+    /// Defined once so the pad's picker, the dial step's picker, and the
+    /// clamp in `AppState.perform` cannot drift apart. They already had:
+    /// raising only the pad's picker to 5 looked like it did nothing,
+    /// because a dial step still clamped the value back down to 3.
+    static let maxVoices = 5
+
     enum CodingKeys: String, CodingKey {
         case xCC, yCC, channel, snapBack
         case mode, diagonal, rootNote, rangeSemitones, scale
@@ -537,6 +545,54 @@ extension XYPadConfig {
     }
 }
 
+// MARK: - Transient dial overrides
+
+/// Pad parameters the currently selected dial step is temporarily holding
+/// away from their preset values.
+///
+/// The preset holds the MASTER values — what the pad returns to. A step
+/// carrying `.setScale` or `.setRootNote` overrides that master for exactly
+/// as long as it stays selected; turn the dial to a step that says nothing
+/// about scale and the master comes back on its own.
+///
+/// Before this existed, `perform()` wrote straight into `preset.xyPad`, so a
+/// step did not override the scale, it REPLACED it. One turn of the dial and
+/// the preset's own scale was gone — nothing remembered what it had been, and
+/// the write dirtied the preset and persisted it, so the loss survived a
+/// relaunch. Keeping overrides separate and unsaved is what makes "return to
+/// master" possible at all.
+///
+/// `nil` means "this step has no opinion", which is deliberately different
+/// from any value the field could hold.
+struct XYPadOverrides: Equatable {
+    var scale: Scale?
+    var rootNote: Int?
+    var fixedVelocity: Int?
+    var voiceCount: Int?
+    var rangeSemitones: Int?
+
+    var isActive: Bool {
+        scale != nil || rootNote != nil || fixedVelocity != nil
+            || voiceCount != nil || rangeSemitones != nil
+    }
+
+    /// The config the pad should actually play, given these overrides.
+    ///
+    /// Note mode parameters only. Drawbar and morph settings are never
+    /// overridden here — no dial action targets them, and a bank of drawbars
+    /// silently rearranging itself as the dial turns would be a surprise
+    /// rather than a feature.
+    func applied(to base: XYPadConfig) -> XYPadConfig {
+        var cfg = base
+        if let scale          { cfg.scale = scale }
+        if let rootNote       { cfg.rootNote = min(max(rootNote, 0), 120) }
+        if let fixedVelocity  { cfg.fixedVelocity = min(max(fixedVelocity, 1), 127) }
+        if let voiceCount     { cfg.voiceCount = min(max(voiceCount, 1), XYPadConfig.maxVoices) }
+        if let rangeSemitones { cfg.rangeSemitones = min(max(rangeSemitones, 1), 60) }
+        return cfg
+    }
+}
+
 // MARK: - Buttons
 
 enum ButtonBehavior: String, Codable, CaseIterable, Identifiable {
@@ -544,9 +600,23 @@ enum ButtonBehavior: String, Codable, CaseIterable, Identifiable {
     case momentary
     /// Short on + off per press (Loopy Pro toggles internally).
     case tap
+    /// Latching: "on" on the first press, "off" on the next. The state lives
+    /// HERE rather than in the host, which is the difference from `tap` —
+    /// tap assumes the receiver flips something internally and just nudges
+    /// it, while toggle decides what the value is and says so outright.
+    /// Use it for a host parameter that has no toggle of its own, or where
+    /// you want the button's lit state to be the truth.
+    case toggle
 
     var id: String { rawValue }
-    var label: String { self == .momentary ? "Momentary" : "Tap" }
+
+    var label: String {
+        switch self {
+        case .momentary: return "Momentary"
+        case .tap:       return "Tap"
+        case .toggle:    return "Toggle"
+        }
+    }
 }
 
 /// What a transport button puts on the wire.

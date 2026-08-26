@@ -199,7 +199,23 @@ struct XYPadView: View {
     /// to live on the app-title row in ContentView.
     @State private var showPresetPicker = false
 
-    private var cfg: XYPadConfig { app.preset.xyPad }
+    /// Blank space held to the LEFT of the pad mode buttons.
+    ///
+    /// App-wide rather than per-preset, and deliberately so: what it makes
+    /// room for is the iPad's own window furniture, which depends on how the
+    /// app is being RUN, not on which preset is loaded. Storing it on the
+    /// preset would mean setting it again on every preset in the library and
+    /// having it come and go as you switched between them, while the window
+    /// controls it dodges stayed exactly where they were.
+    @AppStorage("MotionMIDIPro.padModeIndent") private var padModeIndent: Double = 0
+
+    /// Master values with any dial-step overrides applied — the config the
+    /// pad PLAYS, not the one stored on the preset.
+    ///
+    /// The config sheet deliberately reads the stored one instead (see
+    /// `XYPadConfigSheet.cfg`), so editing a value there sets what the pad
+    /// returns to once no step is overriding it.
+    private var cfg: XYPadConfig { app.livePad }
     private var touching: Bool {
         !voices.isEmpty || !drawbarFingerBars.isEmpty || !drawbarPreviousPoints.isEmpty
     }
@@ -267,6 +283,9 @@ struct XYPadView: View {
     private var header: some View {
         HStack(spacing: 6) {
             PadModeSelector(selection: surfaceModeBinding)
+                // Clears the iPad window controls in multi-window mode. See
+                // `padModeIndent`.
+                .padding(.leading, padModeIndent)
 
             Spacer(minLength: 4)
 
@@ -417,7 +436,7 @@ struct XYPadView: View {
                 Section(family.title) {
                     ForEach(family.scales) { scale in
                         Button {
-                            app.preset.xyPad.scale = scale
+                            app.setMasterScale(scale)
                         } label: {
                             if scale == cfg.scale {
                                 Label(scale.label, systemImage: "checkmark")
@@ -456,7 +475,7 @@ struct XYPadView: View {
         let clamped = min(max(note, 0), 120)
         guard clamped != cfg.rootNote else { return }
         releaseAllVoices()
-        app.preset.xyPad.rootNote = clamped
+        app.setMasterRootNote(clamped)
     }
 
     // MARK: - Sub-views
@@ -1412,7 +1431,28 @@ struct XYPadConfigSheet: View {
     @EnvironmentObject var app: AppState
     @Environment(\.dismiss) private var dismiss
 
+    /// Same key `XYPadView` reads — see its declaration for why this is
+    /// app-wide rather than part of the preset.
+    @AppStorage("MotionMIDIPro.padModeIndent") private var padModeIndent: Double = 0
+
+    /// The STORED config, not the playing one.
+    ///
+    /// Everything in this sheet edits master values. When a dial step is
+    /// overriding one of them the control still shows and edits the master —
+    /// `overrideNote` says so underneath — because the useful edit while
+    /// something is overridden is to the value it will return to.
     private var cfg: XYPadConfig { app.preset.xyPad }
+
+    /// Caption shown under a control a dial step is currently holding.
+    @ViewBuilder
+    private func overrideNote<V>(for override: V?,
+                                 _ message: (V) -> String) -> some View {
+        if let override {
+            Label(message(override), systemImage: "dial.medium.fill")
+                .font(.caption)
+                .foregroundColor(Theme.accent)
+        }
+    }
 
     var body: some View {
         NavigationStack {
@@ -1422,6 +1462,45 @@ struct XYPadConfigSheet: View {
                         .frame(maxWidth: .infinity, alignment: .center)
                         .padding(.vertical, 4)
 
+                }
+
+                Section {
+                    // A live preview of the real thing, at the real offset,
+                    // because the useful question here is "do the buttons
+                    // clear the window controls yet" and that is answered by
+                    // looking, not by reading a number.
+                    HStack(spacing: 6) {
+                        PadModeSelector(selection: surfaceModeBinding)
+                            .padding(.leading, padModeIndent)
+                            .allowsHitTesting(false)
+                        Spacer(minLength: 0)
+                    }
+                    .frame(height: 44)
+                    .listRowBackground(Theme.panel2)
+
+                    Slider(value: $padModeIndent, in: 0...140, step: 2) {
+                        Text("Indent")
+                    } minimumValueLabel: {
+                        Text("0").font(.caption2.monospaced())
+                    } maximumValueLabel: {
+                        Text("140").font(.caption2.monospaced())
+                    }
+                    .tint(Theme.accent)
+
+                    LabeledContent("Indent") {
+                        Text("\(Int(padModeIndent)) pt")
+                            .font(.callout.monospaced())
+                            .foregroundColor(Theme.dim)
+                    }
+
+                    if padModeIndent > 0 {
+                        Button("Remove Indent") { padModeIndent = 0 }
+                            .tint(Theme.accent)
+                    }
+                } header: {
+                    Text("Mode Button Indent")
+                } footer: {
+                    Text("Holds blank space to the left of the pad mode buttons, so the iPad's window controls don't sit on top of them in Split View or Stage Manager.\n\nThis one applies to every preset and both performer surfaces, unlike the settings below it — the window controls it dodges don't move when you change preset.")
                 }
 
                 switch surfaceMode {
@@ -1463,8 +1542,14 @@ struct XYPadConfigSheet: View {
                                 }
                             }
                         }
+
+                        overrideNote(for: app.padOverrides.scale) {
+                            "A dial step is holding this at \($0.label)."
+                        }
                     } header: {
-                        Text("Scale")
+                        Text("Master Scale")
+                    } footer: {
+                        Text("The scale the pad returns to. A dial step carrying Set Scale overrides it for as long as that step is selected; turn the dial off it and this comes back.")
                     }
                 }
             }
@@ -1483,12 +1568,17 @@ struct XYPadConfigSheet: View {
     private var notesSections: some View {
         Section("Voices") {
             Picker("Voices", selection: bind(\.voiceCount)) {
-                Text("1").tag(1)
-                Text("2").tag(2)
-                Text("3").tag(3)
+                // Driven by the shared constant so this can't fall behind
+                // the clamp in AppState.perform again.
+                ForEach(1...XYPadConfig.maxVoices, id: \.self) { count in
+                    Text("\(count)").tag(count)
+                }
             }
             .pickerStyle(.segmented)
 
+            overrideNote(for: app.padOverrides.voiceCount) {
+                "A dial step is holding this at \($0)."
+            }
         }
 
         Section("Diagonal") {

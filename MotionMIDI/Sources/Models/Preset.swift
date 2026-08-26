@@ -36,6 +36,20 @@ struct Preset: Identifiable, Codable, Equatable {
     /// every slot in this array, in order, side by side.
     var dialSlots: [DialSlot] = [DialSlot()]
 
+    // ── Deck layout ─────────────────────────────────────────────────────
+    //
+    // Stored per PRESET rather than app-wide, because whether these earn
+    // their space is a property of the setup: a preset that maps no motion
+    // has no use for four motion meters, while the one beside it in the
+    // library might live on them. App-wide flags would force one answer on
+    // both, and would also be shared across performer surfaces.
+
+    /// Show the pitch/roll/yaw/magnitude meters on the control deck.
+    var showMotionMeters: Bool = true
+
+    /// Show the dial + fader row on the control deck.
+    var showDialPanel: Bool = true
+
     // MARK: - Factory default
     //
     // COMPUTED, not a stored constant — every access must mint fresh UUIDs.
@@ -117,6 +131,7 @@ extension Preset {
     enum CodingKeys: String, CodingKey {
         case id, name, motionMappings, xyPad, buttons, calibration
         case lastUsed, dialSlots
+        case showMotionMeters, showDialPanel
     }
 
     /// Pre-iPad-multi-dial presets stored a single dial under these keys.
@@ -139,6 +154,11 @@ extension Preset {
         buttons        = try c.decodeIfPresent([ButtonMapping].self, forKey: .buttons)        ?? fallback.buttons
         calibration    = try c.decodeIfPresent(Calibration.self,     forKey: .calibration)    ?? Calibration()
         lastUsed       = try c.decodeIfPresent(Date.self,            forKey: .lastUsed)       ?? Date()
+
+        // Absent in presets saved before the deck could be trimmed. Both
+        // default to true, so an upgrade never hides something already in use.
+        showMotionMeters = try c.decodeIfPresent(Bool.self, forKey: .showMotionMeters) ?? true
+        showDialPanel    = try c.decodeIfPresent(Bool.self, forKey: .showDialPanel)    ?? true
 
         if let slots = try c.decodeIfPresent([DialSlot].self, forKey: .dialSlots), !slots.isEmpty {
             dialSlots = slots

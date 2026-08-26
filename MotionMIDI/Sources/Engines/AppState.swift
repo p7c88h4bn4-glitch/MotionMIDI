@@ -108,6 +108,12 @@ final class AppState: ObservableObject {
             }
         }
 
+        // Dials persist their position, so on launch they already sit on
+        // steps whose declarations apply. Without this the pad would start on
+        // master values and only snap to the dial's real state after the
+        // first turn.
+        refreshPadOverrides()
+
         // The library is shared storage, so a write from the other surface
         // has to be picked up here — otherwise this instance keeps its stale
         // array and its next save silently reverts the other's edit.
@@ -205,8 +211,17 @@ final class AppState: ObservableObject {
     func activatePreset(_ id: UUID) {
         guard let index = presets.firstIndex(where: { $0.id == id }) else { return }
         presets[index].lastUsed = Date()
+        // Before anything else: the outgoing preset's latched buttons are
+        // still holding messages on the host, and in a moment their buttons
+        // will be gone.
+        releaseAllButtonLatches()
+
         activePresetID = id
         if isPrimary { motion.preset = presets[index] }
+        // The incoming preset has its own dials on their own steps. Without
+        // this the outgoing preset's overrides would linger and silently
+        // reshape the pad just switched to.
+        refreshPadOverrides()
     }
 
     @discardableResult
@@ -337,6 +352,10 @@ final class AppState: ObservableObject {
         for action in d.steps[stepIndex].actions {
             perform(action, dialChannel: d.channel)
         }
+        // What this step declares takes effect now, and what the PREVIOUS
+        // step declared stops applying — including parameters this step says
+        // nothing about, which revert to master.
+        refreshPadOverrides()
     }
 
     /// Appends a new dial+fader slot (iPad only, in practice — see
@@ -366,20 +385,23 @@ final class AppState: ObservableObject {
             midi.controlChange(cc, value: value, channel: channel)
         case .sendProgramChange(let program, let channel):
             midi.programChange(program, channel: channel)
-        case .setRootNote(let n):
-            preset.xyPad.rootNote = min(max(n, 0), 120)
-        case .setScale(let s):
-            preset.xyPad.scale = s
+
         case .toggleGlide:
+            // Toggles genuinely MUTATE the master, and should: "flip glide"
+            // has no meaning as a value to hold and later revert. Selecting
+            // the step flips it and it stays flipped.
             preset.xyPad.glide.toggle()
         case .togglePerpVelocity:
             preset.xyPad.perpToVelocity.toggle()
-        case .setFixedVelocity(let v):
-            preset.xyPad.fixedVelocity = min(max(v, 1), 127)
-        case .setVoiceCount(let n):
-            preset.xyPad.voiceCount = min(max(n, 1), 3)
-        case .setNoteRange(let r):
-            preset.xyPad.rangeSemitones = min(max(r, 1), 60)
+
+        case .setRootNote, .setScale, .setFixedVelocity,
+             .setVoiceCount, .setNoteRange:
+            // DECLARATIVE, exactly like `.setFaderCC` below. These describe
+            // what the pad looks like while their step is selected;
+            // `refreshPadOverrides()` reads them off the step instead of
+            // writing them here. Writing them here is what used to destroy
+            // the preset's own scale on the first turn of the dial.
+            break
 
         case .setFaderCC:
             // Intentionally does nothing. This action is DECLARATIVE — it
@@ -389,6 +411,147 @@ final class AppState: ObservableObject {
             // never sends a fader message.
             break
         }
+    }
+
+    // MARK: - Latching buttons
+
+    /// Buttons currently latched ON by a `.toggle` press.
+    ///
+    /// Held in AppState, not as `@State` inside `PadButton`, for two
+    /// reasons. A latched button is a message already on the wire that
+    /// something still has to take back, so the state has to outlive any
+    /// view that might be torn down and rebuilt — and a stuck note is the
+    /// failure mode if it doesn't. It also has to be reachable when the
+    /// preset changes, so the outgoing preset's latches can be released
+    /// rather than left hanging on the host with no button left to press.
+    ///
+    /// Not persisted. On a fresh launch nothing is holding anything, so a
+    /// restored latch would be a lie about the state of the receiver.
+    @Published private(set) var latchedButtons: Set<UUID> = []
+
+    func isButtonLatched(_ id: UUID) -> Bool {
+        latchedButtons.contains(id)
+    }
+
+    /// Flip a latching button and return the state it landed in, so the
+    /// caller knows which message to send.
+    func toggleButtonLatch(_ id: UUID) -> Bool {
+        if latchedButtons.contains(id) {
+            latchedButtons.remove(id)
+            return false
+        } else {
+            latchedButtons.insert(id)
+            return true
+        }
+    }
+
+    /// Send the "off" half for every latched button and clear them.
+    ///
+    /// Called before the preset changes. Without it, a latched Note On would
+    /// have no Note Off coming — the note would sound until the host was
+    /// restarted, and the button that could have released it no longer
+    /// exists on screen.
+    func releaseAllButtonLatches() {
+        guard !latchedButtons.isEmpty else { return }
+        for button in preset.buttons where latchedButtons.contains(button.id) {
+            emitButton(button, on: false)
+        }
+        latchedButtons.removeAll()
+    }
+
+    /// Clear a single latch without sending anything.
+    ///
+    /// For the editor: changing a button away from `.toggle` while it is lit
+    /// should not leave a latch behind that nothing can now clear.
+    func clearButtonLatch(_ id: UUID) {
+        latchedButtons.remove(id)
+    }
+
+    /// Put one button's message on the wire.
+    ///
+    /// Takes the mapping by VALUE rather than looking it up by id, so a
+    /// delayed or deferred send uses what was on screen when it was queued.
+    /// Re-reading the preset later could pair a Note On with a Note Off for
+    /// a different note, leaving the first stuck on with nothing left to
+    /// release it.
+    func emitButton(_ mapping: ButtonMapping, on: Bool) {
+        switch mapping.message {
+        case .note:
+            if on {
+                midi.noteOn(mapping.note,
+                            velocity: max(mapping.onValue, 1),
+                            channel: mapping.channel)
+            } else {
+                midi.noteOff(mapping.note, channel: mapping.channel)
+            }
+        case .cc:
+            midi.controlChange(mapping.cc,
+                               value: on ? mapping.onValue : mapping.offValue,
+                               channel: mapping.channel)
+        }
+    }
+
+    // MARK: - Master values vs. dial overrides
+
+    /// What the selected dial steps are currently holding away from the
+    /// preset's own values. Transient by design: never encoded, never
+    /// persisted, rebuilt from the dials whenever they move.
+    @Published private(set) var padOverrides = XYPadOverrides()
+
+    /// The pad config to PLAY — master values with any dial overrides on top.
+    ///
+    /// The performance surface reads this. The config sheet keeps editing
+    /// `preset.xyPad` directly, so it always shows and edits the master,
+    /// which is what you want: editing a value you can see being overridden
+    /// should change what it returns TO.
+    var livePad: XYPadConfig {
+        padOverrides.applied(to: preset.xyPad)
+    }
+
+    /// Set the master scale from a live control (the on-pad chip).
+    ///
+    /// Clears any scale override too. Without that, changing key mid-set
+    /// while a dial step happened to be holding a scale would edit the
+    /// master, produce no audible change, and look broken. An explicit touch
+    /// wins — until the dial next moves and re-asserts.
+    func setMasterScale(_ scale: Scale) {
+        preset.xyPad.scale = scale
+        if padOverrides.scale != nil { padOverrides.scale = nil }
+    }
+
+    /// Master root note, same rule as `setMasterScale`.
+    func setMasterRootNote(_ note: Int) {
+        preset.xyPad.rootNote = min(max(note, 0), 120)
+        if padOverrides.rootNote != nil { padOverrides.rootNote = nil }
+    }
+
+    /// Rebuild the override set from every dial's currently selected step.
+    ///
+    /// Reads ALL slots, not just the one that moved, because each dial can
+    /// hold its own overrides at once. Later slots win a conflict: if two
+    /// dials both name a scale, the rightmost is the one you hear. Arbitrary,
+    /// but it has to be one of them, and "the last one you set up" is the
+    /// more predictable rule.
+    func refreshPadOverrides() {
+        var next = XYPadOverrides()
+
+        for slot in preset.dialSlots.indices {
+            guard let step = dial(at: slot).currentStep else { continue }
+            for action in step.actions {
+                switch action {
+                case .setScale(let s):          next.scale = s
+                case .setRootNote(let n):       next.rootNote = n
+                case .setFixedVelocity(let v):  next.fixedVelocity = v
+                case .setVoiceCount(let n):     next.voiceCount = n
+                case .setNoteRange(let r):      next.rangeSemitones = r
+                default:                        break
+                }
+            }
+        }
+
+        // Guarded so an unchanged rebuild doesn't publish a no-op and redraw
+        // the pad on every dial event.
+        if next != padOverrides { padOverrides = next }
     }
 
     // MARK: - Fader (assignment follows the selected dial step)

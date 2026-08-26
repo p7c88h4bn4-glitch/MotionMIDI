@@ -26,8 +26,10 @@ struct ControlDeckView: View {
 
             // Mini motion meters — observing the engine DIRECTLY (see
             // MotionMetersRow) rather than reading through `app`.
-            MotionMetersRow(motion: app.motion)
-                .frame(height: 30)
+            if app.preset.showMotionMeters {
+                MotionMetersRow(motion: app.motion)
+                    .frame(height: 30)
+            }
 
             // Bottom row — dial slot(s) on the left, utility controls right.
             // Every slot in `dialSlots` sits side by side and slides
@@ -37,7 +39,9 @@ struct ControlDeckView: View {
                 // The cluster is the only fixed-width thing in this row.
                 // dialSlotRow is a GeometryReader, which is greedy
                 // horizontally, so it claims everything the cluster doesn't.
-                dialSlotRow
+                if app.preset.showDialPanel {
+                    dialSlotRow
+                }
 
                 utilityCluster
             }
@@ -170,22 +174,44 @@ struct ControlDeckView: View {
     /// two or more dial+fader combos on screen, the cluster was wide enough
     /// to push the rightmost fader out of reach with nothing left to scroll
     /// into. Connection status is still visible in Settings → Connection.
+    /// Center and the editor toggle.
+    ///
+    /// A column while the dial panel is showing, because there the scarce
+    /// resource is WIDTH — every point this gives back goes to the dial row
+    /// beside it. With the panel hidden that trade disappears: there is
+    /// nothing to the left to donate width to, and a tall narrow column just
+    /// makes the deck taller for no gain. So the two lay out along the row
+    /// instead, larger, and the deck gets shorter — which is the point of
+    /// hiding the panel in the first place.
+    @ViewBuilder
     private var utilityCluster: some View {
-        VStack(spacing: 6) {
-            Button {
-                app.calibrate()
-                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-            } label: {
-                Image("CenterIcon")
-                    .resizable()
-                    .interpolation(.high)
-                    .scaledToFit()
-                    .frame(width: 30, height: 30)
+        if app.preset.showDialPanel {
+            VStack(spacing: 6) {
+                centerButton(size: 30)
+                editorToggleButton(size: 30)
             }
-            .buttonStyle(.plain)
-
-            editorToggleButton
+        } else {
+            HStack(spacing: 16) {
+                centerButton(size: 38)
+                editorToggleButton(size: 38)
+            }
+            .frame(maxWidth: .infinity)
         }
+    }
+
+    private func centerButton(size: CGFloat) -> some View {
+        Button {
+            app.calibrate()
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        } label: {
+            Image("CenterIcon")
+                .resizable()
+                .interpolation(.high)
+                .scaledToFit()
+                .frame(width: size, height: size)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Center motion")
     }
 
     /// The lower settings button stays visually clean while the editor is
@@ -193,7 +219,7 @@ struct ControlDeckView: View {
     /// to have while the editor is open. That makes the close affordance
     /// obvious without adding permanent chrome to the utility cluster.
     @ViewBuilder
-    private var editorToggleButton: some View {
+    private func editorToggleButton(size: CGFloat) -> some View {
         let button = Button {
             withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
                 showEditor.toggle()
@@ -203,7 +229,7 @@ struct ControlDeckView: View {
                 .resizable()
                 .interpolation(.high)
                 .scaledToFit()
-                .frame(width: 30, height: 30)
+                .frame(width: size, height: size)
         }
 
         if showEditor {
@@ -265,23 +291,39 @@ struct MotionMetersRow: View {
 struct PadButton: View {
     let mapping: ButtonMapping
     @EnvironmentObject var app: AppState
+
+    /// Finger is down RIGHT NOW. Separate from the latch below: this is
+    /// touch feedback and lasts as long as the touch.
     @State private var pressed = false
+
+    /// Latched ON by a `.toggle` press and still holding.
+    private var latched: Bool { app.isButtonLatched(mapping.id) }
+
+    /// Lit for either reason. A latched button has to stay lit after the
+    /// finger lifts — the whole point of latching is that the state is now
+    /// the button's to report, so if it went dark on release there would be
+    /// nothing on screen saying the message is still out there.
+    private var lit: Bool { pressed || latched }
 
     var body: some View {
         Text(mapping.name)
             .font(.system(.headline, design: .rounded).weight(.bold))
-            .foregroundColor(pressed ? Theme.bg : Theme.accent)
+            .foregroundColor(lit ? Theme.bg : Theme.accent)
             .frame(maxWidth: .infinity, minHeight: 56)
             .background(
                 RoundedRectangle(cornerRadius: 14)
-                    .fill(pressed ? Theme.accent : Theme.panel2)
+                    .fill(lit ? Theme.accent : Theme.panel2)
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 14)
-                    .strokeBorder(Theme.accent.opacity(0.35), lineWidth: 1)
+                    .strokeBorder(Theme.accent.opacity(latched ? 0.9 : 0.35),
+                                  lineWidth: latched ? 2 : 1)
             )
+            // Only the momentary press scales. A latched button holding at
+            // 0.96 would read as permanently half-pressed.
             .scaleEffect(pressed ? 0.96 : 1)
             .animation(.easeOut(duration: 0.08), value: pressed)
+            .animation(.easeOut(duration: 0.12), value: latched)
             .gesture(
                 DragGesture(minimumDistance: 0)
                     .onChanged { _ in
@@ -294,6 +336,7 @@ struct PadButton: View {
                         release()
                     }
             )
+            .accessibilityAddTraits(latched ? [.isButton, .isSelected] : .isButton)
     }
 
     private func press() {
@@ -305,47 +348,31 @@ struct PadButton: View {
             app.preset.xyPad.glide.toggle()
         }
 
-        send(on: true)
+        switch mapping.behavior {
+        case .momentary:
+            // On now, off when the finger lifts.
+            app.emitButton(mapping, on: true)
 
-        // Tap fires both halves from the press, since the host is expected
-        // to toggle internally. Momentary waits for the finger to lift.
-        if mapping.behavior == .tap {
+        case .tap:
+            // Both halves from the press, since the host is expected to
+            // toggle internally — this only nudges it.
+            app.emitButton(mapping, on: true)
             let m = mapping
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                Self.emit(m, on: false, midi: app.midi)
+                app.emitButton(m, on: false)
             }
+
+        case .toggle:
+            // We own the state, so we say what the value IS rather than
+            // nudging the host and hoping. Release does nothing.
+            let nowOn = app.toggleButtonLatch(mapping.id)
+            app.emitButton(mapping, on: nowOn)
         }
     }
 
     private func release() {
         guard mapping.behavior == .momentary else { return }
-        send(on: false)
-    }
-
-    private func send(on: Bool) {
-        Self.emit(mapping, on: on, midi: app.midi)
-    }
-
-    /// Static, and takes an explicit mapping, so the delayed "off" half of a
-    /// tap sends what was on screen at PRESS time. Capturing `self` instead
-    /// would re-read `mapping` 50ms later, and an edit landing inside that
-    /// window could pair a Note On with a Note Off for a different note —
-    /// leaving the first one stuck on with nothing left to release it.
-    private static func emit(_ mapping: ButtonMapping, on: Bool, midi: MIDIEngine) {
-        switch mapping.message {
-        case .note:
-            if on {
-                midi.noteOn(mapping.note,
-                            velocity: max(mapping.onValue, 1),
-                            channel: mapping.channel)
-            } else {
-                midi.noteOff(mapping.note, channel: mapping.channel)
-            }
-        case .cc:
-            midi.controlChange(mapping.cc,
-                               value: on ? mapping.onValue : mapping.offValue,
-                               channel: mapping.channel)
-        }
+        app.emitButton(mapping, on: false)
     }
 }
 
