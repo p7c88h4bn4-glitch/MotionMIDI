@@ -143,8 +143,14 @@ struct ButtonListView: View {
                             app.preset.buttons.append(
                                 ButtonMapping(
                                     name: "NEW",
-                                    cc: MIDIDefaults.firstFreeButtonCC(
-                                        avoiding: app.preset.usedButtonCCs)
+                                    // Avoids every CC the preset assigns —
+                                    // drawbars, morph corners, dial steps and
+                                    // motion included — not just other
+                                    // buttons. Only avoiding buttons is what
+                                    // let a new one land on a drawbar.
+                                    cc: app.firstFreeCC()
+                                        ?? MIDIDefaults.firstFreeButtonCC(
+                                            avoiding: app.preset.usedButtonCCs)
                                 )
                             )
                         } label: {
@@ -403,14 +409,18 @@ struct ButtonEditorView: View {
                     .firstIndex(where: { $0.id == self.buttonID }) else { return }
 
                 if newValue == .cc {
+                    // Everything the preset already sends, this button
+                    // excepted — its own stored CC is fine to keep if
+                    // nothing else took it while it was a note button.
                     let others = Set(
-                        self.app.preset.buttons
-                            .filter { $0.id != self.buttonID && $0.message == .cc }
+                        self.app.ccAssignments
+                            .filter { $0.slot != .button(self.buttonID) }
                             .map(\.cc)
                     )
                     if others.contains(self.app.preset.buttons[i].cc) {
                         self.app.preset.buttons[i].cc =
-                            MIDIDefaults.firstFreeButtonCC(avoiding: others)
+                            self.app.firstFreeCC()
+                            ?? MIDIDefaults.firstFreeButtonCC(avoiding: others)
                     }
                 }
                 self.app.preset.buttons[i].message = newValue
@@ -446,6 +456,11 @@ struct SettingsPageView: View {
     @State private var confirmReset = false
     @State private var expandedSection: String? = nil
     @State private var showBluetooth = false
+    @State private var showCCMap = false
+
+    private var ccConflictCount: Int {
+        Preset.conflictingSlots(in: app.ccAssignments).count
+    }
 
     /// Same key RootView reads. Toggling it from either surface's settings
     /// changes the layout for both, which is correct — it's an app-level
@@ -485,6 +500,35 @@ struct SettingsPageView: View {
                 Text("Connection")
             } footer: {
                 Text("Motion MIDI appears to hosts as a single source, no matter how many performer surfaces are on screen.")
+            }
+
+            Section {
+                Button {
+                    showCCMap = true
+                } label: {
+                    HStack {
+                        Label("CC Map", systemImage: "tablecells")
+                        Spacer()
+                        // The conflict count is the reason to open it, so it
+                        // belongs on the way in rather than inside.
+                        if ccConflictCount > 0 {
+                            Text("\(ccConflictCount)")
+                                .font(.caption.bold())
+                                .foregroundColor(Theme.bg)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 2)
+                                .background(Capsule().fill(Theme.danger))
+                        }
+                        Image(systemName: "chevron.right")
+                            .font(.caption.weight(.semibold))
+                            .foregroundColor(Theme.dim)
+                    }
+                }
+                .tint(Theme.accent)
+            } header: {
+                Text("MIDI")
+            } footer: {
+                Text("Every CC this preset sends, in one place — motion, pad, morph corners, drawbars, buttons and every dial step. Numbers and names are editable there.")
             }
 
             Section {
@@ -604,6 +648,13 @@ struct SettingsPageView: View {
         .scrollContentBackground(.hidden)
         .sheet(isPresented: $showBluetooth) {
             BluetoothMIDIView()
+        }
+        // Full screen rather than a sheet: the editor is a bottom-third
+        // panel, so a pushed page would inherit that height and the map is a
+        // table you need to see a lot of at once.
+        .fullScreenCover(isPresented: $showCCMap) {
+            CCMapView()
+                .environmentObject(app)
         }
         .confirmationDialog("Reset this preset to the default layout? Its name and place in the library are kept.",
                             isPresented: $confirmReset, titleVisibility: .visible) {

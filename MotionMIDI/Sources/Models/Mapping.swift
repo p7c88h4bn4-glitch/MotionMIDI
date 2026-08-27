@@ -95,8 +95,13 @@ enum MIDIDefaults {
     /// the MIDI 1.0 spec — 96–101 are pointedly absent, since those carry
     /// data entry and RPN/NRPN and a button firing one would confuse a
     /// receiver mid-edit.
-    static let buttonCCPool: [Int] = Array(24...31) + [85, 86, 87, 88, 89, 90]
-                                                    + [3, 9, 14, 15]
+    /// Drawbar numbers are pointedly absent. An earlier version of this pool
+    /// was written before drawbars existed and contained all nine of them —
+    /// half the pool — so a seventh button was handed Drawbar 1. The pool
+    /// lists only numbers no other feature claims by default.
+    static let buttonCCPool: [Int] = [9, 14, 15] + Array(24...31).filter {
+        !drawbarCCs.contains($0)
+    }
 
     /// Lowest unclaimed CC in the button pool.
     static func firstFreeButtonCC(avoiding used: Set<Int>) -> Int {
@@ -394,11 +399,30 @@ struct DrawbarMapping: Identifiable, Codable, Equatable {
     var cc: Int
     var value: Int = 0
 
-    init(id: UUID = UUID(), cc: Int, value: Int = 0) {
+    /// Optional override for the "Drawbar N" default.
+    ///
+    /// Optional rather than defaulted-empty so the synthesised decoder
+    /// treats an absent key as nil, which is what every preset saved before
+    /// this field existed will have. nil and "" both mean "use the default",
+    /// so clearing the field in the UI reverts rather than blanking the row.
+    var name: String?
+
+    /// 0-based, displayed as 1-16. Optional for the same decoding reason as
+    /// `name`: presets saved before drawbars had their own channel have no
+    /// key here, and nil resolves to the app default at read time.
+    var channel: Int?
+
+    init(id: UUID = UUID(), cc: Int, value: Int = 0,
+         name: String? = nil, channel: Int? = nil) {
         self.id = id
         self.cc = min(max(cc, 0), 127)
         self.value = min(max(value, 0), 127)
+        self.name = name
+        self.channel = channel.map { min(max($0, 0), 15) }
     }
+
+    /// The channel this bar actually sends on.
+    var resolvedChannel: Int { channel ?? MIDIDefaults.channel }
 
     static func defaults() -> [DrawbarMapping] {
         MIDIDefaults.drawbarCCs.map { DrawbarMapping(cc: $0) }
@@ -409,6 +433,17 @@ struct XYPadConfig: Codable, Equatable {
     // ── CC mode ──────────────────────────────────────────────────────────
     var xCC: Int = MIDIDefaults.xyXCC
     var yCC: Int = MIDIDefaults.xyYCC
+
+    /// Optional overrides for the "X Axis" / "Y Axis" defaults, so a pad
+    /// wired to filter and resonance can say so in the CC map.
+    var xAxisName: String = ""
+    var yAxisName: String = ""
+
+    /// 0-based, displayed as 1-16. The two axes carry their own channels so
+    /// a pad can drive two different instruments at once — previously both
+    /// were pinned to the app default with no way to separate them.
+    var xChannel: Int = MIDIDefaults.channel
+    var yChannel: Int = MIDIDefaults.channel
 
     // ── Shared ───────────────────────────────────────────────────────────
     /// 0-based channel.
@@ -489,6 +524,8 @@ extension XYPadConfig {
         case glide, glideTime, perpToVelocity, fixedVelocity
         case glideToggleButtonId, voiceCount
         case ccMode, morphCorners, morphCurve, morphCenterStrength, morphEqualPower
+        case xAxisName, yAxisName
+        case xChannel, yChannel
         case drawbarCount, drawbarDirection, drawbarTouchMode, drawbarRamp, drawbars
     }
 
@@ -496,6 +533,10 @@ extension XYPadConfig {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         xCC            = try c.decodeIfPresent(Int.self,        forKey: .xCC)            ?? MIDIDefaults.xyXCC
         yCC            = try c.decodeIfPresent(Int.self,        forKey: .yCC)            ?? MIDIDefaults.xyYCC
+        xAxisName      = try c.decodeIfPresent(String.self,     forKey: .xAxisName)      ?? ""
+        yAxisName      = try c.decodeIfPresent(String.self,     forKey: .yAxisName)      ?? ""
+        xChannel       = try c.decodeIfPresent(Int.self,        forKey: .xChannel)       ?? MIDIDefaults.channel
+        yChannel       = try c.decodeIfPresent(Int.self,        forKey: .yChannel)       ?? MIDIDefaults.channel
         channel        = try c.decodeIfPresent(Int.self,        forKey: .channel)        ?? MIDIDefaults.channel
         snapBack       = try c.decodeIfPresent(Bool.self,       forKey: .snapBack)       ?? true
         mode           = try c.decodeIfPresent(XYPadMode.self,  forKey: .mode)           ?? .cc

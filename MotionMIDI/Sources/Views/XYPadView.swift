@@ -198,6 +198,7 @@ struct XYPadView: View {
     /// Preset library, opened from the chip in this view's header — it used
     /// to live on the app-title row in ContentView.
     @State private var showPresetPicker = false
+    @State private var showScalePanel = false
 
     /// Blank space held to the LEFT of the pad mode buttons.
     ///
@@ -403,50 +404,14 @@ struct XYPadView: View {
 
     /// Root + scale, always visible in Notes mode, tap for the full menu.
     /// The same choice also lives at the bottom of the config sheet.
+    /// The key/scale chip and the panel it opens.
+    ///
+    /// A popover rather than a `Menu`, because a Menu can only hold buttons,
+    /// toggles and submenus — no wheel, no slider. What this needs is a small
+    /// control surface, so it gets a real one.
     private var scaleChip: some View {
-        Menu {
-            Section("Root") {
-                Button {
-                    setRootNote(cfg.rootNote - 12)
-                } label: {
-                    Label("Octave Down", systemImage: "arrow.down")
-                }
-                Button {
-                    setRootNote(cfg.rootNote + 12)
-                } label: {
-                    Label("Octave Up", systemImage: "arrow.up")
-                }
-            }
-
-            Menu("Root Note: \(noteName(cfg.rootNote))") {
-                ForEach(0..<12, id: \.self) { pitchClass in
-                    Button {
-                        setRootNote(rootOctaveBase + pitchClass)
-                    } label: {
-                        if pitchClass == rootPitchClass {
-                            Label(Self.pitchClassNames[pitchClass], systemImage: "checkmark")
-                        } else {
-                            Text(Self.pitchClassNames[pitchClass])
-                        }
-                    }
-                }
-            }
-
-            ForEach(Scale.families) { family in
-                Section(family.title) {
-                    ForEach(family.scales) { scale in
-                        Button {
-                            app.setMasterScale(scale)
-                        } label: {
-                            if scale == cfg.scale {
-                                Label(scale.label, systemImage: "checkmark")
-                            } else {
-                                Text(scale.label)
-                            }
-                        }
-                    }
-                }
-            }
+        Button {
+            showScalePanel = true
         } label: {
             HStack(spacing: 5) {
                 Text("\(noteName(cfg.rootNote)) \(cfg.scale.label)")
@@ -460,6 +425,173 @@ struct XYPadView: View {
             .background(Capsule().fill(Theme.bg.opacity(0.88)))
             .overlay(Capsule().strokeBorder(Theme.accent.opacity(0.4), lineWidth: 1))
         }
+        .buttonStyle(.plain)
+        // Faded almost out while a finger is on the pad. It is a setup
+        // control, and during play it is only something to see past.
+        .opacity(touching ? 0.1 : 1)
+        .animation(.easeInOut(duration: 0.15), value: touching)
+        // Not tappable while faded — at 10% it reads as inactive, and a
+        // stray thumb landing on an invisible control mid-phrase would
+        // change key with no obvious cause.
+        .allowsHitTesting(!touching)
+        .popover(isPresented: $showScalePanel) {
+            scalePanel
+                .presentationCompactAdaptation(.popover)
+        }
+    }
+
+    // MARK: - Scale panel
+
+    private var scalePanel: some View {
+        VStack(spacing: 0) {
+            scalePanelTopRow
+            Divider().overlay(Theme.accent.opacity(0.25))
+            scalePanelRangeRow
+            Divider().overlay(Theme.accent.opacity(0.25))
+            scalePanelScaleList
+        }
+        .frame(width: 300)
+        .background(Theme.panel)
+    }
+
+    /// `↓  [root wheel]  [octave]  ↑`
+    ///
+    /// The arrows flank the pair and move the OCTAVE. The wheel picks the
+    /// pitch class without moving the octave, so the two axes of "which key"
+    /// stay independent — sliding from B to C on the wheel does not jump an
+    /// octave behind your back.
+    private var scalePanelTopRow: some View {
+        HStack(spacing: 10) {
+            octaveButton(delta: -12, symbol: "chevron.down")
+
+            Picker("Root", selection: Binding(
+                get: { rootPitchClass },
+                set: { setRootNote(rootOctaveBase + $0) }
+            )) {
+                ForEach(0..<12, id: \.self) { pc in
+                    Text(Self.pitchClassNames[pc])
+                        .font(.system(size: 15, weight: .semibold, design: .rounded))
+                        .tag(pc)
+                }
+            }
+            .pickerStyle(.wheel)
+            .frame(width: 74, height: 96)
+            .clipped()
+
+            Text("\(rootOctaveNumber)")
+                .font(.system(size: 30, weight: .bold, design: .rounded))
+                .foregroundColor(Theme.accent)
+                .monospacedDigit()
+                .frame(minWidth: 34)
+
+            octaveButton(delta: 12, symbol: "chevron.up")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+    }
+
+    /// Disabled at the ends rather than silently clamping, so a tap that
+    /// cannot do anything looks like it cannot do anything.
+    private func octaveButton(delta: Int, symbol: String) -> some View {
+        let target = cfg.rootNote + delta
+        let possible = target >= 0 && target <= 120
+
+        return Button {
+            setRootNote(target)
+        } label: {
+            Image(systemName: symbol)
+                .font(.system(size: 15, weight: .bold))
+                .frame(width: 38, height: 38)
+                .background(
+                    RoundedRectangle(cornerRadius: 9)
+                        .fill(Theme.panel2)
+                )
+        }
+        .buttonStyle(.plain)
+        .foregroundColor(possible ? Theme.accent : Theme.dim.opacity(0.4))
+        .disabled(!possible)
+        .accessibilityLabel(delta > 0 ? "Octave up" : "Octave down")
+    }
+
+    private var scalePanelRangeRow: some View {
+        VStack(spacing: 2) {
+            HStack {
+                Text("Range")
+                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    .foregroundColor(Theme.dim)
+                Spacer()
+                Text(rangeDescription)
+                    .font(.system(size: 12, weight: .bold, design: .rounded))
+                    .foregroundColor(Theme.accent)
+                    .monospacedDigit()
+            }
+
+            Slider(
+                value: Binding(
+                    get: { Double(cfg.rangeSemitones) },
+                    set: { newValue in
+                        let semis = Int(newValue.rounded())
+                        guard semis != cfg.rangeSemitones else { return }
+                        // Same reason as changing key: the notes under a held
+                        // finger are about to move, and a voice left owning
+                        // one the pad can no longer produce never gets its
+                        // Note Off.
+                        releaseAllVoices()
+                        app.preset.xyPad.rangeSemitones = semis
+                        app.clearRangeOverride()
+                    }
+                ),
+                in: 1...60,
+                step: 1
+            )
+            .tint(Theme.accent)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+
+    private var scalePanelScaleList: some View {
+        ScrollView {
+            VStack(spacing: 0) {
+                ForEach(Scale.byUsefulness) { scale in
+                    Button {
+                        releaseAllVoices()
+                        app.setMasterScale(scale)
+                    } label: {
+                        HStack(spacing: 8) {
+                            Text(scale.label)
+                                .font(.system(size: 14, weight: scale == cfg.scale ? .bold : .regular,
+                                              design: .rounded))
+                                .foregroundColor(scale == cfg.scale ? Theme.accent : .white.opacity(0.82))
+                            Spacer(minLength: 0)
+                            if scale == cfg.scale {
+                                Image(systemName: "checkmark")
+                                    .font(.system(size: 12, weight: .bold))
+                                    .foregroundColor(Theme.accent)
+                            }
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 9)
+                        .contentShape(Rectangle())
+                        .background(scale == cfg.scale ? Theme.accent.opacity(0.12) : .clear)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .frame(height: 236)
+    }
+
+    /// Octave in the usual naming where middle C (MIDI 60) is C4.
+    private var rootOctaveNumber: Int { cfg.rootNote / 12 - 1 }
+
+    private var rangeDescription: String {
+        let semis = cfg.rangeSemitones
+        let octaves = Double(semis) / 12
+        if semis % 12 == 0 && semis >= 12 {
+            return "\(semis) st · \(semis / 12) oct"
+        }
+        return String(format: "%d st · %.1f oct", semis, octaves)
     }
 
     private static let pitchClassNames = ["C", "C#", "D", "D#", "E", "F",
@@ -1126,7 +1258,11 @@ struct XYPadView: View {
         drawbarLevels[index] = clamped
         app.midi.controlChange(cfg.drawbars[index].cc,
                                value: clamped,
-                               channel: cfg.channel)
+                               // Per-bar channel, falling back to the pad's
+                               // own for any bar that has never been given
+                               // one. Reading cfg.channel here instead would
+                               // make the CC map's channel column a lie.
+                               channel: cfg.drawbars[index].channel ?? cfg.channel)
     }
 
     private func cancelDrawbarRamps(commit: Bool) {
@@ -1236,11 +1372,11 @@ struct XYPadView: View {
         let yv = Int((y * 127).rounded())
         if xv != lastX {
             lastX = xv
-            app.midi.controlChange(cfg.xCC, value: xv, channel: cfg.channel)
+            app.midi.controlChange(cfg.xCC, value: xv, channel: cfg.xChannel)
         }
         if yv != lastY {
             lastY = yv
-            app.midi.controlChange(cfg.yCC, value: yv, channel: cfg.channel)
+            app.midi.controlChange(cfg.yCC, value: yv, channel: cfg.yChannel)
         }
     }
 

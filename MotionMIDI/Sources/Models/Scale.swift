@@ -165,6 +165,41 @@ extension Scale {
         let scales: [Scale]
     }
 
+    /// Every scale in one flat list, most reached-for first.
+    ///
+    /// Ordered by how often it gets picked in practice, not by theory
+    /// family. The family grouping is still the right way to LEARN this
+    /// list, but it is the wrong way to use it mid-set: it buries the
+    /// pentatonics — the ones that sound good under any hand, which is what
+    /// you want on a pad you are sweeping with a finger — under a Chromatic
+    /// header, while Ionian sits sixth inside "Church Modes".
+    ///
+    /// Chromatic goes last despite being the default. It is the "no scale"
+    /// option, useful to fall back to and never the one being hunted for.
+    static let byUsefulness: [Scale] = [
+        // Forgiving under any finger — no wrong notes to land on.
+        .majorPentatonic, .minorPentatonic, .blues,
+
+        // The two everyone means by "major" and "minor".
+        .ionian, .aeolian,
+
+        // The modes with a distinct character worth reaching for.
+        .dorian, .mixolydian, .lydian, .phrygian,
+
+        // Minor variants.
+        .harmonicMinor, .melodicMinor, .phrygianDominant,
+
+        // Bebop.
+        .barryMajor6Diminished, .barryMinor6Diminished, .barryDominantBebop,
+
+        // Symmetric and outside.
+        .wholeTone, .diminishedWholeHalf, .diminishedHalfWhole, .altered,
+        .augmented, .prometheus, .tritoneScale,
+
+        // Everything, i.e. nothing filtered.
+        .chromatic
+    ]
+
     static let families: [Family] = [
         Family(title: "Chromatic", scales: [.chromatic]),
         Family(title: "Pentatonic", scales: [.majorPentatonic, .minorPentatonic]),

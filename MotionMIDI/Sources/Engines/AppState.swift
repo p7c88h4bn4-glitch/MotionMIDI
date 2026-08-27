@@ -413,6 +413,249 @@ final class AppState: ObservableObject {
         }
     }
 
+    // MARK: - CC map
+
+    /// Every CC this preset assigns, resolved through the dial library so
+    /// linked dials report the numbers they actually send.
+    var ccAssignments: [CCAssignment] {
+        preset.ccAssignments(dialLibrary: dialLibrary)
+    }
+
+    /// Write a new number into whichever place the slot names.
+    ///
+    /// Routing dial writes through `updateDial(at:)` rather than touching
+    /// `preset.dialSlots` directly is what makes this correct for a slot
+    /// linked to a shared library dial — that helper already knows to edit
+    /// the library copy, and going around it would silently write to a local
+    /// dial the slot isn't even showing.
+    func setCC(_ slot: CCSlot, to value: Int) {
+        let cc = min(max(value, 0), 127)
+
+        switch slot {
+        case .motion(let id):
+            guard let i = preset.motionMappings.firstIndex(where: { $0.id == id })
+            else { return }
+            preset.motionMappings[i].cc = cc
+
+        case .xyX:
+            preset.xyPad.xCC = cc
+        case .xyY:
+            preset.xyPad.yCC = cc
+
+        case .morphCorner(let i):
+            guard preset.xyPad.morphCorners.indices.contains(i) else { return }
+            preset.xyPad.morphCorners[i].cc = cc
+
+        case .drawbar(let i):
+            guard preset.xyPad.drawbars.indices.contains(i) else { return }
+            preset.xyPad.drawbars[i].cc = cc
+
+        case .button(let id):
+            guard let i = preset.buttons.firstIndex(where: { $0.id == id })
+            else { return }
+            // A latched button about to change number has to let go of the
+            // old one first, or the off message lands somewhere else and the
+            // original is left holding.
+            if isButtonLatched(id) {
+                emitButton(preset.buttons[i], on: false)
+                clearButtonLatch(id)
+            }
+            preset.buttons[i].cc = cc
+
+        case .dialSend(let slotIndex, let stepIndex, let actionIndex):
+            updateDial(at: slotIndex) { dial in
+                guard dial.steps.indices.contains(stepIndex),
+                      dial.steps[stepIndex].actions.indices.contains(actionIndex),
+                      case .sendCC(_, let value, let channel) =
+                        dial.steps[stepIndex].actions[actionIndex]
+                else { return }
+                dial.steps[stepIndex].actions[actionIndex] =
+                    .sendCC(cc: cc, value: value, channel: channel)
+            }
+
+        case .dialFader(let slotIndex, let stepIndex, let actionIndex):
+            updateDial(at: slotIndex) { dial in
+                guard dial.steps.indices.contains(stepIndex),
+                      dial.steps[stepIndex].actions.indices.contains(actionIndex),
+                      case .setFaderCC(_, let defaultValue, let channel) =
+                        dial.steps[stepIndex].actions[actionIndex]
+                else { return }
+                dial.steps[stepIndex].actions[actionIndex] =
+                    .setFaderCC(cc: cc, defaultValue: defaultValue, channel: channel)
+            }
+
+        case .portamentoTime, .portamentoSwitch:
+            // Fixed by the MIDI spec. Reaching here means a locked row was
+            // made editable by mistake; do nothing rather than write a
+            // number a synth will never look for.
+            return
+        }
+    }
+
+    /// Change the MIDI channel of whatever the slot names.
+    ///
+    /// Mirrors `setCC` exactly, including routing dial writes through
+    /// `updateDial(at:)` so a slot linked to a shared library dial is edited
+    /// in the library rather than in a local copy it isn't showing.
+    func setChannel(_ slot: CCSlot, to newChannel: Int) {
+        let channel = min(max(newChannel, 0), 15)
+
+        switch slot {
+        case .motion(let id):
+            guard let i = preset.motionMappings.firstIndex(where: { $0.id == id })
+            else { return }
+            preset.motionMappings[i].channel = channel
+
+        case .xyX:
+            preset.xyPad.xChannel = channel
+        case .xyY:
+            preset.xyPad.yChannel = channel
+
+        case .morphCorner(let i):
+            guard preset.xyPad.morphCorners.indices.contains(i) else { return }
+            preset.xyPad.morphCorners[i].channel = channel
+
+        case .drawbar(let i):
+            guard preset.xyPad.drawbars.indices.contains(i) else { return }
+            preset.xyPad.drawbars[i].channel = channel
+
+        case .button(let id):
+            guard let i = preset.buttons.firstIndex(where: { $0.id == id })
+            else { return }
+            // A latched button changing channel has to let go on the OLD one
+            // first, or the off message goes somewhere else and the original
+            // is left holding.
+            if isButtonLatched(id) {
+                emitButton(preset.buttons[i], on: false)
+                clearButtonLatch(id)
+            }
+            preset.buttons[i].channel = channel
+
+        case .dialSend(let slotIndex, let stepIndex, let actionIndex):
+            updateDial(at: slotIndex) { dial in
+                guard dial.steps.indices.contains(stepIndex),
+                      dial.steps[stepIndex].actions.indices.contains(actionIndex),
+                      case .sendCC(let cc, let value, _) =
+                        dial.steps[stepIndex].actions[actionIndex]
+                else { return }
+                dial.steps[stepIndex].actions[actionIndex] =
+                    .sendCC(cc: cc, value: value, channel: channel)
+            }
+
+        case .dialFader(let slotIndex, let stepIndex, let actionIndex):
+            updateDial(at: slotIndex) { dial in
+                guard dial.steps.indices.contains(stepIndex),
+                      dial.steps[stepIndex].actions.indices.contains(actionIndex),
+                      case .setFaderCC(let cc, let defaultValue, _) =
+                        dial.steps[stepIndex].actions[actionIndex]
+                else { return }
+                dial.steps[stepIndex].actions[actionIndex] =
+                    .setFaderCC(cc: cc, defaultValue: defaultValue, channel: channel)
+            }
+
+        case .portamentoTime, .portamentoSwitch:
+            return
+        }
+    }
+
+    /// Rename whatever the slot names.
+    ///
+    /// An empty string is stored as empty and MEANS "use the default" — the
+    /// map shows the default as placeholder text rather than a blank row, so
+    /// clearing a field reverts instead of leaving something nameless.
+    ///
+    /// Dial rows rename the STEP, which is the same label the knob face
+    /// shows. A step carrying both a send and a fader action appears as two
+    /// rows in the map, and renaming either renames both, because there is
+    /// one label underneath. That is worth knowing before you use the map to
+    /// tell two rows of the same step apart — you can't.
+    func setName(_ slot: CCSlot, to newName: String) {
+        let trimmed = newName.trimmingCharacters(in: .whitespaces)
+
+        switch slot {
+        case .motion(let id):
+            guard let i = preset.motionMappings.firstIndex(where: { $0.id == id })
+            else { return }
+            preset.motionMappings[i].name = trimmed
+
+        case .xyX:
+            preset.xyPad.xAxisName = trimmed
+        case .xyY:
+            preset.xyPad.yAxisName = trimmed
+
+        case .morphCorner(let i):
+            guard preset.xyPad.morphCorners.indices.contains(i) else { return }
+            preset.xyPad.morphCorners[i].label = trimmed
+
+        case .drawbar(let i):
+            guard preset.xyPad.drawbars.indices.contains(i) else { return }
+            preset.xyPad.drawbars[i].name = trimmed.isEmpty ? nil : trimmed
+
+        case .button(let id):
+            guard let i = preset.buttons.firstIndex(where: { $0.id == id })
+            else { return }
+            preset.buttons[i].name = trimmed
+
+        case .dialSend(let slotIndex, let stepIndex, _),
+             .dialFader(let slotIndex, let stepIndex, _):
+            updateDial(at: slotIndex) { dial in
+                guard dial.steps.indices.contains(stepIndex) else { return }
+                dial.steps[stepIndex].label = trimmed
+            }
+
+        case .portamentoTime, .portamentoSwitch:
+            return
+        }
+    }
+
+    /// Wiggle one CC so a host's MIDI Learn can catch it.
+    ///
+    /// Sends bottom, top, then the assignment's resting value. Three
+    /// messages rather than one because learn implementations differ: some
+    /// latch onto the first CC they see, others want to watch a control
+    /// MOVE before they will bind it, and a single message loses the second
+    /// kind. The spread is small enough to read as one gesture.
+    ///
+    /// Ending on `rest` matters. A sweep moves whatever is already listening
+    /// on that number, so stopping at 127 would leave a filter wide open or
+    /// a send fully up; stopping where the assignment would naturally sit
+    /// puts it back.
+    ///
+    /// Deliberately NOT debounced or queued. Tapping several in a row sends
+    /// several sweeps, which is what you want when teaching a host one
+    /// control after another.
+    func sendForLearn(cc: Int, channel: Int, rest: Int) {
+        let ch = min(max(channel, 0), 15)
+        let restValue = min(max(rest, 0), 127)
+
+        midi.controlChange(cc, value: 0, channel: ch)
+
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            midi.controlChange(cc, value: 127, channel: ch)
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            midi.controlChange(cc, value: restValue, channel: ch)
+        }
+    }
+
+    /// Lowest CC no assignment in this preset is using.
+    ///
+    /// Walks the spec-undefined numbers first, in the order they become
+    /// useful, and only then falls back to any free number at all. Returns
+    /// nil when all 128 are spoken for, so the caller can say so rather than
+    /// hand out a duplicate and call it an allocation.
+    func firstFreeCC() -> Int? {
+        // Only numbers taken on the DEFAULT channel block a new assignment;
+        // the same number on another channel is not a conflict.
+        let taken = Set(ccAssignments
+            .filter { $0.channel == MIDIDefaults.channel }
+            .map(\.cc))
+        let preferred = [9, 14, 15, 3] + Array(20...31)
+                        + Array(85...90) + Array(102...119)
+        if let free = preferred.first(where: { !taken.contains($0) }) { return free }
+        return (0...127).first { !taken.contains($0) }
+    }
+
     // MARK: - Latching buttons
 
     /// Buttons currently latched ON by a `.toggle` press.
@@ -517,6 +760,15 @@ final class AppState: ObservableObject {
     func setMasterScale(_ scale: Scale) {
         preset.xyPad.scale = scale
         if padOverrides.scale != nil { padOverrides.scale = nil }
+    }
+
+    /// Clear a range override after the master range is edited directly.
+    ///
+    /// Same rule as `setMasterScale`: an explicit edit should be audible
+    /// straight away rather than sitting behind a dial step that happens to
+    /// be holding a different range.
+    func clearRangeOverride() {
+        if padOverrides.rangeSemitones != nil { padOverrides.rangeSemitones = nil }
     }
 
     /// Master root note, same rule as `setMasterScale`.
