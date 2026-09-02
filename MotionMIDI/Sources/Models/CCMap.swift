@@ -195,7 +195,7 @@ extension Preset {
             slot: .xyX, group: .xyPad,
             name: xyPad.xAxisName.isEmpty ? "X Axis" : xyPad.xAxisName,
             storedName: xyPad.xAxisName, roleSuffix: nil,
-            cc: xyPad.xCC, channel: xyPad.xChannel, isEditable: true,
+            cc: xyPad.xCC, channel: xyPad.standardChannel, isEditable: true,
             isActive: xyPad.ccMode == .standard,
             defaultName: "X Axis", isRenamable: true, exclusion: nil,
             restValue: 64))
@@ -203,7 +203,7 @@ extension Preset {
             slot: .xyY, group: .xyPad,
             name: xyPad.yAxisName.isEmpty ? "Y Axis" : xyPad.yAxisName,
             storedName: xyPad.yAxisName, roleSuffix: nil,
-            cc: xyPad.yCC, channel: xyPad.yChannel, isEditable: true,
+            cc: xyPad.yCC, channel: xyPad.standardChannel, isEditable: true,
             isActive: xyPad.ccMode == .standard,
             defaultName: "Y Axis", isRenamable: true, exclusion: nil,
             restValue: 64))
@@ -236,7 +236,7 @@ extension Preset {
                 storedName: bar.name ?? "",
                 roleSuffix: nil,
                 cc: bar.cc,
-                channel: bar.resolvedChannel,
+                channel: xyPad.drawbarChannel,
                 isEditable: true,
                 isActive: xyPad.ccMode == .drawbars && i < xyPad.drawbarCount,
                 defaultName: "Drawbar \(i + 1)",
@@ -340,7 +340,7 @@ extension Preset {
             rows.append(CCAssignment(
                 slot: .portamentoTime, group: .fixed, name: "Portamento Time",
                 storedName: "Portamento Time", roleSuffix: nil,
-                cc: MIDIDefaults.portamentoTimeCC, channel: xyPad.channel,
+                cc: MIDIDefaults.portamentoTimeCC, channel: xyPad.notesChannel,
                 isEditable: false, isActive: true,
                 defaultName: "Portamento Time", isRenamable: false,
                 // glideTime is seconds, not a CC value — same 0...1 to
@@ -350,7 +350,7 @@ extension Preset {
             rows.append(CCAssignment(
                 slot: .portamentoSwitch, group: .fixed, name: "Portamento Switch",
                 storedName: "Portamento Switch", roleSuffix: nil,
-                cc: MIDIDefaults.portamentoSwitchCC, channel: xyPad.channel,
+                cc: MIDIDefaults.portamentoSwitchCC, channel: xyPad.notesChannel,
                 isEditable: false, isActive: true,
                 defaultName: "Portamento Switch", isRenamable: false,
                 exclusion: nil, restValue: xyPad.glide ? 127 : 0))

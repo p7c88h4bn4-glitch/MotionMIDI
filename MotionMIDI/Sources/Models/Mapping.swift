@@ -188,6 +188,57 @@ struct MotionMapping: Identifiable, Codable, Equatable {
 
 // MARK: - XY pad
 
+/// Where the standard XY puck springs to when the finger lifts.
+///
+/// Stored as a named position rather than a pair of numbers so the choice
+/// survives being read back — "bottom" stays meaningful if the resting
+/// convention ever changes, where a stored (0, 0) would not.
+enum SpringTarget: String, Codable, Equatable, CaseIterable, Identifiable {
+    /// Stay where it was left — no spring at all.
+    case hold
+    /// 50% X, 50% Y.
+    case center
+    /// 0% X, 50% Y.
+    case leftCenter
+    /// 100% X, 50% Y.
+    case rightCenter
+    /// 0% X, 0% Y.
+    case bottom
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .hold:        return "Hold Position"
+        case .center:      return "Center"
+        case .leftCenter:  return "Left Center"
+        case .rightCenter: return "Right Center"
+        case .bottom:      return "Bottom Left"
+        }
+    }
+
+    /// Nil for `hold`, which sends nothing on release.
+    var position: (x: Double, y: Double)? {
+        switch self {
+        case .hold:        return nil
+        case .center:      return (0.5, 0.5)
+        case .leftCenter:  return (0.0, 0.5)
+        case .rightCenter: return (1.0, 0.5)
+        case .bottom:      return (0.0, 0.0)
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .hold:        return "hand.raised"
+        case .center:      return "circle.and.line.horizontal"
+        case .leftCenter:  return "arrow.left.to.line"
+        case .rightCenter: return "arrow.right.to.line"
+        case .bottom:      return "arrow.down.left.to.line"
+        }
+    }
+}
+
 /// What the XY pad transmits.
 enum XYPadMode: String, Codable, CaseIterable, Identifiable {
     /// Classic: X drives one CC, Y drives another (independent).
@@ -407,22 +458,12 @@ struct DrawbarMapping: Identifiable, Codable, Equatable {
     /// so clearing the field in the UI reverts rather than blanking the row.
     var name: String?
 
-    /// 0-based, displayed as 1-16. Optional for the same decoding reason as
-    /// `name`: presets saved before drawbars had their own channel have no
-    /// key here, and nil resolves to the app default at read time.
-    var channel: Int?
-
-    init(id: UUID = UUID(), cc: Int, value: Int = 0,
-         name: String? = nil, channel: Int? = nil) {
+    init(id: UUID = UUID(), cc: Int, value: Int = 0, name: String? = nil) {
         self.id = id
         self.cc = min(max(cc, 0), 127)
         self.value = min(max(value, 0), 127)
         self.name = name
-        self.channel = channel.map { min(max($0, 0), 15) }
     }
-
-    /// The channel this bar actually sends on.
-    var resolvedChannel: Int { channel ?? MIDIDefaults.channel }
 
     static func defaults() -> [DrawbarMapping] {
         MIDIDefaults.drawbarCCs.map { DrawbarMapping(cc: $0) }
@@ -439,18 +480,48 @@ struct XYPadConfig: Codable, Equatable {
     var xAxisName: String = ""
     var yAxisName: String = ""
 
-    /// 0-based, displayed as 1-16. The two axes carry their own channels so
-    /// a pad can drive two different instruments at once — previously both
-    /// were pinned to the app default with no way to separate them.
-    var xChannel: Int = MIDIDefaults.channel
-    var yChannel: Int = MIDIDefaults.channel
+    // ── Per-mode channels ───────────────────────────────────────────────
+    //
+    // One channel per MODE rather than one for the whole pad. The modes are
+    // separate instruments in practice — a filter sweep, an organ, a melody
+    // — and pinning them to a single channel meant switching mode retargeted
+    // whatever the last one was driving. Morph is absent because each corner
+    // already carries its own channel, which is finer-grained than a mode
+    // channel could be.
+    //
+    // All default to 0 (channel 1), so nothing moves for an existing preset.
 
-    // ── Shared ───────────────────────────────────────────────────────────
-    /// 0-based channel.
+    /// Standard XY mode — both axes. One channel, not one per axis: X and Y
+    /// are two halves of one gesture and splitting them across instruments
+    /// makes a pad that cannot be played as a pad.
+    var standardChannel: Int = MIDIDefaults.channel
+
+    /// All drawbars. A drawbar bank is one instrument by definition — nine
+    /// levels of a single organ — so the channel belongs to the bank rather
+    /// than to each bar.
+    var drawbarChannel: Int = MIDIDefaults.channel
+
+    /// Note mode.
+    var notesChannel: Int = MIDIDefaults.channel
+
+    /// The old single channel for the whole pad.
+    ///
+    /// Nothing reads it any more — every mode has its own above. It stays as
+    /// a stored property so it round-trips through encode/decode, which is
+    /// what lets a preset written by this build still open on the previous
+    /// one with its channel intact. Delete it once that no longer matters.
     var channel: Int = MIDIDefaults.channel
-    /// When true the puck springs back to center on release (Spring return).
-    /// When false the puck holds its last position (Hold position).
-    var snapBack: Bool = true
+
+    /// Where the puck springs to when the finger lifts, in standard mode.
+    ///
+    /// Standard mode only. Morph has its own toggle (`morphSnapBack`) since
+    /// its "centre" means an even blend of four corners rather than a
+    /// position, and note mode has none at all — there is nothing to spring
+    /// BACK to when the output is a note that already ended on release.
+    var springTarget: SpringTarget = .center
+
+    /// Morph mode: return to an even four-corner blend on release.
+    var morphSnapBack: Bool = true
 
     // ── Note mode ────────────────────────────────────────────────────────
     var mode: XYPadMode = .cc
@@ -518,15 +589,33 @@ extension XYPadConfig {
     /// because a dial step still clamped the value back down to 3.
     static let maxVoices = 5
 
+    /// Keys for properties that CURRENTLY exist.
+    ///
+    /// Every case here must have a matching stored property. `encode(to:)`
+    /// is synthesised from this list, and a case with no property makes it
+    /// reference something that isn't there — which is why retired keys live
+    /// in `LegacyCodingKeys` below rather than lingering here.
     enum CodingKeys: String, CodingKey {
-        case xCC, yCC, channel, snapBack
+        case xCC, yCC, channel
+        case standardChannel, drawbarChannel, notesChannel
+        case springTarget, morphSnapBack
         case mode, diagonal, rootNote, rangeSemitones, scale
         case glide, glideTime, perpToVelocity, fixedVelocity
         case glideToggleButtonId, voiceCount
         case ccMode, morphCorners, morphCurve, morphCenterStrength, morphEqualPower
         case xAxisName, yAxisName
-        case xChannel, yChannel
         case drawbarCount, drawbarDirection, drawbarTouchMode, drawbarRamp, drawbars
+    }
+
+    /// Keys for properties that no longer exist, kept so old presets still
+    /// migrate. Read-only by construction: nothing encodes through these.
+    ///
+    /// - `snapBack`: one shared spring bool, now `springTarget` +
+    ///   `morphSnapBack`.
+    /// - `xChannel` / `yChannel`: the brief period when the two axes carried
+    ///   separate channels, now the single `standardChannel`.
+    private enum LegacyCodingKeys: String, CodingKey {
+        case snapBack, xChannel, yChannel
     }
 
     init(from decoder: Decoder) throws {
@@ -535,10 +624,30 @@ extension XYPadConfig {
         yCC            = try c.decodeIfPresent(Int.self,        forKey: .yCC)            ?? MIDIDefaults.xyYCC
         xAxisName      = try c.decodeIfPresent(String.self,     forKey: .xAxisName)      ?? ""
         yAxisName      = try c.decodeIfPresent(String.self,     forKey: .yAxisName)      ?? ""
-        xChannel       = try c.decodeIfPresent(Int.self,        forKey: .xChannel)       ?? MIDIDefaults.channel
-        yChannel       = try c.decodeIfPresent(Int.self,        forKey: .yChannel)       ?? MIDIDefaults.channel
         channel        = try c.decodeIfPresent(Int.self,        forKey: .channel)        ?? MIDIDefaults.channel
-        snapBack       = try c.decodeIfPresent(Bool.self,       forKey: .snapBack)       ?? true
+        // Retired keys come from their own container. `snapBack` was one
+        // shared bool for every mode, and it maps cleanly: true meant
+        // "spring to centre", false meant "stay put".
+        let legacy = try decoder.container(keyedBy: LegacyCodingKeys.self)
+        let legacySnapBack = try legacy.decodeIfPresent(Bool.self, forKey: .snapBack) ?? true
+
+        springTarget = try c.decodeIfPresent(SpringTarget.self, forKey: .springTarget)
+            ?? (legacySnapBack ? .center : .hold)
+        morphSnapBack = try c.decodeIfPresent(Bool.self, forKey: .morphSnapBack)
+            ?? legacySnapBack
+
+        // Per-mode channels fall back to the old shared one, so an existing
+        // preset keeps sending exactly where it did.
+        let legacyChannel = try c.decodeIfPresent(Int.self, forKey: .channel) ?? MIDIDefaults.channel
+        // `xChannel` existed only briefly, when the two axes carried
+        // separate channels. Reading it here means a preset saved in that
+        // window keeps the channel it was set to rather than silently
+        // reverting to the shared default.
+        let legacyAxisChannel = try legacy.decodeIfPresent(Int.self, forKey: .xChannel)
+        standardChannel = try c.decodeIfPresent(Int.self, forKey: .standardChannel)
+            ?? legacyAxisChannel ?? legacyChannel
+        drawbarChannel  = try c.decodeIfPresent(Int.self, forKey: .drawbarChannel)  ?? legacyChannel
+        notesChannel    = try c.decodeIfPresent(Int.self, forKey: .notesChannel)    ?? legacyChannel
         mode           = try c.decodeIfPresent(XYPadMode.self,  forKey: .mode)           ?? .cc
         diagonal       = try c.decodeIfPresent(XYDiagonal.self, forKey: .diagonal)       ?? .bottomLeftToTopRight
         rootNote       = try c.decodeIfPresent(Int.self,        forKey: .rootNote)       ?? 48

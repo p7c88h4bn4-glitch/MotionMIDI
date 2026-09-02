@@ -20,14 +20,20 @@ struct IntWheelRow: View {
     @Binding var selection: Int
     let range: ClosedRange<Int>
     let text: (Int) -> String
+    /// Wheel width. Rows whose text is longer than a bare number need more
+    /// than the default, or the label truncates to an ellipsis and the wheel
+    /// stops saying what it is showing.
+    let wheelWidth: CGFloat
 
     init(title: String,
          selection: Binding<Int>,
          range: ClosedRange<Int>,
+         wheelWidth: CGFloat = 140,
          text: @escaping (Int) -> String = { String($0) }) {
         self.title = title
         self._selection = selection
         self.range = range
+        self.wheelWidth = wheelWidth
         self.text = text
     }
 
@@ -42,7 +48,7 @@ struct IntWheelRow: View {
             }
             .labelsHidden()
             .pickerStyle(.wheel)
-            .frame(width: 140, height: 92)
+            .frame(width: wheelWidth, height: 92)
             .clipped()
         }
     }

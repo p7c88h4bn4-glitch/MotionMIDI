@@ -266,6 +266,45 @@ final class AppState: ObservableObject {
         }
     }
 
+    // MARK: - Preset files
+
+    /// The active preset, ready to write to a file.
+    ///
+    /// Flattened, so linked dials travel with it. See
+    /// `Preset.flattenedForExport(dialLibrary:)` for why.
+    func exportDocument(for id: UUID) -> PresetDocument? {
+        guard let source = presets.first(where: { $0.id == id }) else { return nil }
+        return PresetDocument(preset: source.flattenedForExport(dialLibrary: dialLibrary))
+    }
+
+    /// Add an imported preset to the library and switch to it.
+    ///
+    /// Always a NEW id, even when the file carries one this library already
+    /// has. Re-importing your own export should give you a second copy to
+    /// compare against, not silently overwrite the one you have been editing
+    /// — an import is additive, and an import that destroys work is the kind
+    /// of thing you only discover afterwards.
+    ///
+    /// Any dial link that survived in the file is cleared here too. The
+    /// exporter flattens, but a hand-edited file or one from an older build
+    /// might still carry an id, and a link to a dial this device doesn't
+    /// have would leave the slot silently empty.
+    @discardableResult
+    func importPreset(_ incoming: Preset) -> UUID {
+        var fresh = incoming
+        fresh.id = UUID()
+        fresh.name = uniqueName(from: incoming.name, ifEmpty: "Imported Preset")
+
+        for index in fresh.dialSlots.indices
+        where fresh.dialSlots[index].linkedDialPresetID != nil {
+            fresh.dialSlots[index].linkedDialPresetID = nil
+        }
+
+        presets.append(fresh)
+        activatePreset(fresh.id)
+        return fresh.id
+    }
+
     /// Appends a numeric suffix if the name is already taken, so the picker
     /// never shows two identical rows.
     private func uniqueName(from proposed: String, ifEmpty fallback: String) -> String {
@@ -506,18 +545,19 @@ final class AppState: ObservableObject {
             else { return }
             preset.motionMappings[i].channel = channel
 
-        case .xyX:
-            preset.xyPad.xChannel = channel
-        case .xyY:
-            preset.xyPad.yChannel = channel
+        case .xyX, .xyY:
+            // One channel for both axes — X and Y are two halves of one
+            // gesture, so the map edits the mode's channel from either row.
+            preset.xyPad.standardChannel = channel
 
         case .morphCorner(let i):
             guard preset.xyPad.morphCorners.indices.contains(i) else { return }
             preset.xyPad.morphCorners[i].channel = channel
 
-        case .drawbar(let i):
-            guard preset.xyPad.drawbars.indices.contains(i) else { return }
-            preset.xyPad.drawbars[i].channel = channel
+        case .drawbar:
+            // One channel for the whole bank — a drawbar organ is one
+            // instrument, so editing any bar's channel sets the bank's.
+            preset.xyPad.drawbarChannel = channel
 
         case .button(let id):
             guard let i = preset.buttons.firstIndex(where: { $0.id == id })
@@ -636,6 +676,61 @@ final class AppState: ObservableObject {
             try? await Task.sleep(nanoseconds: 50_000_000)
             midi.controlChange(cc, value: restValue, channel: ch)
         }
+    }
+
+    /// Flatten all linked dials into the preset's localDial slots.
+    ///
+    /// On export, a preset with linked library dials becomes independent.
+    /// The receiver gets the exact state the sender had, without needing
+    /// the dial library or any ID resolution.
+    func flattenDialsForExport(_ preset: Preset) -> Preset {
+        var flat = preset
+        for i in flat.dialSlots.indices {
+            if let linkedID = flat.dialSlots[i].linkedDialPresetID,
+               let shared = dialLibrary.first(where: { $0.id == linkedID }) {
+                // Copy the shared dial into localDial and break the link.
+                flat.dialSlots[i].linkedDialPresetID = nil
+                flat.dialSlots[i].localDial = shared
+            }
+        }
+        return flat
+    }
+
+    /// Import a preset from a file.
+    ///
+    /// The imported preset is added with a unique name (appends " 2", " 3", etc.
+    /// if the name already exists) and becomes the active preset.
+    func importPreset(_ data: Data) throws {
+        let imported = try JSONDecoder().decode(Preset.self, from: data)
+        
+        // Ensure the name is unique.
+        var name = imported.name
+        var counter = 2
+        while presets.contains(where: { $0.name == name }) {
+            name = "\(imported.name) \(counter)"
+            counter += 1
+        }
+        
+        var unique = imported
+        unique.name = name
+        presets.append(unique)
+        activatePreset(unique.id)
+    }
+
+    /// Export the active preset as JSON data.
+    ///
+    /// Flattens any linked dials first so the exported preset is complete
+    /// and self-contained.
+    func exportPreset(_ id: UUID) throws -> Data {
+        guard let preset = presets.first(where: { $0.id == id }) else {
+            throw ExportError.presetNotFound
+        }
+        let flat = flattenDialsForExport(preset)
+        return try JSONEncoder().encode(flat)
+    }
+
+    enum ExportError: Error {
+        case presetNotFound
     }
 
     /// Lowest CC no assignment in this preset is using.

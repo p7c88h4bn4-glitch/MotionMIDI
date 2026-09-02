@@ -1004,7 +1004,7 @@ struct XYPadView: View {
 
         // 1. Lifted fingers: release sounding voices, drop suspended ones.
         for voice in voices where !liveIDs.contains(voice.id) {
-            app.midi.noteOff(voice.note, channel: cfg.channel)
+            app.midi.noteOff(voice.note, channel: cfg.notesChannel)
         }
         voices.removeAll { !liveIDs.contains($0.id) }
         suspended.removeAll { !liveIDs.contains($0.id) }
@@ -1023,11 +1023,11 @@ struct XYPadView: View {
             if cfg.glide {
                 // Legato ordering: the new note sounds before the old one
                 // releases, so a portamento synth slides between them.
-                app.midi.noteOn(target, velocity: vel, channel: cfg.channel)
-                app.midi.noteOff(previous, channel: cfg.channel)
+                app.midi.noteOn(target, velocity: vel, channel: cfg.notesChannel)
+                app.midi.noteOff(previous, channel: cfg.notesChannel)
             } else {
-                app.midi.noteOff(previous, channel: cfg.channel)
-                app.midi.noteOn(target, velocity: vel, channel: cfg.channel)
+                app.midi.noteOff(previous, channel: cfg.notesChannel)
+                app.midi.noteOn(target, velocity: vel, channel: cfg.notesChannel)
             }
             voices[index].note = target
         }
@@ -1047,11 +1047,11 @@ struct XYPadView: View {
             if voices.count >= cfg.voiceCount {
                 guard !voices.isEmpty else { continue }
                 let stolen = voices.removeFirst()          // lowest id = oldest
-                app.midi.noteOff(stolen.note, channel: cfg.channel)
+                app.midi.noteOff(stolen.note, channel: cfg.notesChannel)
                 suspended.append(stolen)                   // most recent last
             }
             let target = note(at: point)
-            app.midi.noteOn(target, velocity: velocity(at: point), channel: cfg.channel)
+            app.midi.noteOn(target, velocity: velocity(at: point), channel: cfg.notesChannel)
             insertVoice(Voice(id: point.id, x: point.x, y: point.y, note: target))
         }
 
@@ -1059,7 +1059,7 @@ struct XYPadView: View {
         while voices.count < cfg.voiceCount, let restored = suspended.popLast() {
             app.midi.noteOn(restored.note,
                             velocity: min(max(cfg.fixedVelocity, 1), 127),
-                            channel: cfg.channel)
+                            channel: cfg.notesChannel)
             insertVoice(restored)
         }
     }
@@ -1260,9 +1260,7 @@ struct XYPadView: View {
                                value: clamped,
                                // Per-bar channel, falling back to the pad's
                                // own for any bar that has never been given
-                               // one. Reading cfg.channel here instead would
-                               // make the CC map's channel column a lie.
-                               channel: cfg.drawbars[index].channel ?? cfg.channel)
+                               channel: cfg.drawbarChannel)
     }
 
     private func cancelDrawbarRamps(commit: Bool) {
@@ -1305,13 +1303,17 @@ struct XYPadView: View {
         } else {
             voices.removeAll()
             suspended.removeAll()
-            if cfg.snapBack { emitCC(x: 0.5, y: 0.5) }
+            // Standard mode only. Morph handles its own release, and note
+            // mode has nothing to spring to — the notes already ended.
+            if let target = cfg.springTarget.position {
+                emitCC(x: target.x, y: target.y)
+            }
         }
     }
 
     private func releaseAllVoices() {
         for voice in voices where voice.note >= 0 {
-            app.midi.noteOff(voice.note, channel: cfg.channel)
+            app.midi.noteOff(voice.note, channel: cfg.notesChannel)
         }
         voices.removeAll()
         suspended.removeAll()   // never sounded, so nothing to release
@@ -1343,7 +1345,11 @@ struct XYPadView: View {
     private func sendPortamentoState(on: Bool) {
         app.midi.controlChange(MIDIDefaults.portamentoSwitchCC,
                                value: on ? 127 : 0,
-                               channel: cfg.channel)
+                               // Portamento is the slide between NOTES, so
+                               // it belongs on the note channel — sending it
+                               // anywhere else would set glide on a synth
+                               // that isn't the one playing.
+                               channel: cfg.notesChannel)
         if on { sendGlideTime() }
     }
 
@@ -1352,7 +1358,7 @@ struct XYPadView: View {
         let value = min(max(Int((cfg.glideTime * 127).rounded()), 0), 127)
         app.midi.controlChange(MIDIDefaults.portamentoTimeCC,
                                value: value,
-                               channel: cfg.channel)
+                               channel: cfg.notesChannel)
     }
 
     // MARK: - CC emission
@@ -1372,11 +1378,11 @@ struct XYPadView: View {
         let yv = Int((y * 127).rounded())
         if xv != lastX {
             lastX = xv
-            app.midi.controlChange(cfg.xCC, value: xv, channel: cfg.xChannel)
+            app.midi.controlChange(cfg.xCC, value: xv, channel: cfg.standardChannel)
         }
         if yv != lastY {
             lastY = yv
-            app.midi.controlChange(cfg.yCC, value: yv, channel: cfg.yChannel)
+            app.midi.controlChange(cfg.yCC, value: yv, channel: cfg.standardChannel)
         }
     }
 
@@ -1600,45 +1606,6 @@ struct XYPadConfigSheet: View {
 
                 }
 
-                Section {
-                    // A live preview of the real thing, at the real offset,
-                    // because the useful question here is "do the buttons
-                    // clear the window controls yet" and that is answered by
-                    // looking, not by reading a number.
-                    HStack(spacing: 6) {
-                        PadModeSelector(selection: surfaceModeBinding)
-                            .padding(.leading, padModeIndent)
-                            .allowsHitTesting(false)
-                        Spacer(minLength: 0)
-                    }
-                    .frame(height: 44)
-                    .listRowBackground(Theme.panel2)
-
-                    Slider(value: $padModeIndent, in: 0...140, step: 2) {
-                        Text("Indent")
-                    } minimumValueLabel: {
-                        Text("0").font(.caption2.monospaced())
-                    } maximumValueLabel: {
-                        Text("140").font(.caption2.monospaced())
-                    }
-                    .tint(Theme.accent)
-
-                    LabeledContent("Indent") {
-                        Text("\(Int(padModeIndent)) pt")
-                            .font(.callout.monospaced())
-                            .foregroundColor(Theme.dim)
-                    }
-
-                    if padModeIndent > 0 {
-                        Button("Remove Indent") { padModeIndent = 0 }
-                            .tint(Theme.accent)
-                    }
-                } header: {
-                    Text("Mode Button Indent")
-                } footer: {
-                    Text("Holds blank space to the left of the pad mode buttons, so the iPad's window controls don't sit on top of them in Split View or Stage Manager.\n\nThis one applies to every preset and both performer surfaces, unlike the settings below it — the window controls it dodges don't move when you change preset.")
-                }
-
                 switch surfaceMode {
                 case .standard:
                     Section("CC Assignments") {
@@ -1657,10 +1624,42 @@ struct XYPadConfigSheet: View {
                     notesSections
                 }
 
-                Section("Shared") {
-                    IntWheelRow(title: "MIDI Channel", selection: bind(\.channel), range: 0...15) { String($0 + 1) }
-                    if surfaceMode != .drawbars {
-                        Toggle("Spring return to center", isOn: bind(\.snapBack))
+                // Channel belongs to the MODE, not to the pad. Morph is
+                // absent because each corner already carries its own, which
+                // is finer than a mode channel could be.
+                switch surfaceMode {
+                case .standard:
+                    Section("Output") {
+                        IntWheelRow(title: "MIDI Channel",
+                                    selection: bind(\.standardChannel),
+                                    range: 0...15) { String($0 + 1) }
+
+                        Picker("On Release", selection: bind(\.springTarget)) {
+                            ForEach(SpringTarget.allCases) { target in
+                                Label(target.label, systemImage: target.symbol)
+                                    .tag(target)
+                            }
+                        }
+                    }
+
+                case .drawbars:
+                    Section("Output") {
+                        IntWheelRow(title: "MIDI Channel",
+                                    selection: bind(\.drawbarChannel),
+                                    range: 0...15) { String($0 + 1) }
+                    }
+
+                case .notes:
+                    Section("Output") {
+                        IntWheelRow(title: "MIDI Channel",
+                                    selection: bind(\.notesChannel),
+                                    range: 0...15) { String($0 + 1) }
+                    }
+
+                case .morph:
+                    Section("Output") {
+                        Toggle("Spring to even blend on release",
+                               isOn: bind(\.morphSnapBack))
                             .tint(Theme.accent)
                     }
                 }
@@ -1684,9 +1683,35 @@ struct XYPadConfigSheet: View {
                         }
                     } header: {
                         Text("Master Scale")
-                    } footer: {
-                        Text("The scale the pad returns to. A dial step carrying Set Scale overrides it for as long as that step is selected; turn the dial off it and this comes back.")
                     }
+                }
+
+                Section {
+                    HStack(spacing: 6) {
+                        PadModeSelector(selection: surfaceModeBinding)
+                            .padding(.leading, padModeIndent)
+                            .allowsHitTesting(false)
+                        Spacer(minLength: 0)
+                    }
+                    .frame(height: 44)
+                    .listRowBackground(Theme.panel2)
+
+                    HStack(spacing: 10) {
+                        Slider(value: $padModeIndent, in: 0...140, step: 2)
+                            .tint(Theme.accent)
+
+                        Text("\(Int(padModeIndent))")
+                            .font(.callout.monospaced())
+                            .foregroundColor(Theme.dim)
+                            .frame(minWidth: 30, alignment: .trailing)
+                    }
+
+                    if padModeIndent > 0 {
+                        Button("Remove Indent") { padModeIndent = 0 }
+                            .tint(Theme.accent)
+                    }
+                } header: {
+                    Text("Mode Button Indent")
                 }
             }
             .navigationTitle("XY Pad")
@@ -1736,8 +1761,14 @@ struct XYPadConfigSheet: View {
         }
 
         Section {
-            IntWheelRow(title: "Root", selection: bind(\.rootNote), range: 0...120) { MIDIWheelText.note($0) }
-            IntWheelRow(title: "Range", selection: bind(\.rangeSemitones), range: 1...60) { value in
+            IntWheelRow(title: "Root",
+                        selection: bind(\.rootNote),
+                        range: 0...120,
+                        wheelWidth: 170) { MIDIWheelText.note($0) }
+            IntWheelRow(title: "Range",
+                        selection: bind(\.rangeSemitones),
+                        range: 1...60,
+                        wheelWidth: 210) { value in
                 "\(value) st  ·  \(String(format: "%.1f", Double(value) / 12.0)) oct"
             }
             Text("Low \(noteName(cfg.rootNote)) → High \(noteName(cfg.rootNote + cfg.rangeSemitones))")
@@ -1824,9 +1855,6 @@ struct XYPadConfigSheet: View {
 
     // MARK: - Morph sections
 
-    private static let cornerPositions = ["Top Left", "Top Right",
-                                          "Bottom Left", "Bottom Right"]
-
     /// Laid out as an actual 2×2 grid rather than a four-row list, because
     /// the corners ARE a 2×2 arrangement — index order is TL, TR, BL, BR, so
     /// each card sits where its corner sits on the pad. Finding "the one at
@@ -1851,10 +1879,10 @@ struct XYPadConfigSheet: View {
 
     private func cornerCard(_ index: Int) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(Self.cornerPositions[index])
-                .font(.system(size: 10, weight: .bold, design: .rounded))
-                .foregroundColor(Theme.accent.opacity(0.8))
-
+            // No position caption. The cards are laid out as a 2x2 grid in
+            // the same arrangement as the pad, so the card in the top-left
+            // IS the top-left corner — naming it as well was the label
+            // repeating what the layout already said.
             TextField("Label", text: cornerLabelBinding(index))
                 .font(.subheadline.weight(.semibold))
                 .autocorrectionDisabled()

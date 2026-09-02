@@ -81,8 +81,6 @@ struct MappingListView: View {
                     Toggle("Show Meters on Deck", isOn: $app.preset.showMotionMeters)
                         .tint(Theme.accent)
                         .listRowBackground(Theme.panel2)
-                } footer: {
-                    Text("Hides the pitch/roll/yaw/magnitude bars from the performance screen. The mappings above keep running and keep sending — this only takes back the space the bars occupy.")
                 }
             }
             .scrollContentBackground(.hidden)
@@ -126,12 +124,6 @@ struct ButtonListView: View {
                     }
                     .onDelete { offsets in
                         app.preset.buttons.remove(atOffsets: offsets)
-                    }
-                } footer: {
-                    if isPadIdiom {
-                        Text("iPhone shows the first 6 buttons, in this order. Drag to reorder, swipe to delete.")
-                    } else {
-                        Text("Showing the first 6 buttons. Add more, and reorder which 6 appear here, from an iPad.")
                     }
                 }
 
@@ -277,8 +269,6 @@ struct ButtonEditorView: View {
                     }
                 } header: {
                     Text("MIDI")
-                } footer: {
-                    Text(behaviorFooter)
                 }
 
                 Section("XY Pad Glide Toggle") {
@@ -352,28 +342,6 @@ struct ButtonEditorView: View {
     private var onValueBinding: Binding<Int> { bind(\.onValue, default: 127) }
     private var offValueBinding: Binding<Int> { bind(\.offValue, default: 0) }
     private var channelBinding: Binding<Int> { bind(\.channel, default: 0) }
-    /// Plain-language description of what the selected behavior puts on the
-    /// wire, phrased for whichever message type the button is sending.
-    private var behaviorFooter: String {
-        guard let button else { return "" }
-        let isCC = button.message == .cc
-
-        switch button.behavior {
-        case .momentary:
-            return isCC
-                ? "Momentary sends the on value while held and the off value on release."
-                : "Momentary sends Note On while held and Note Off on release."
-        case .tap:
-            return isCC
-                ? "Tap sends the on value then the off value from a single press, for hosts that toggle internally."
-                : "Tap sends Note On then Note Off from a single press, for hosts that toggle internally."
-        case .toggle:
-            return isCC
-                ? "Toggle latches: the first press sends the on value and the button stays lit, the next sends the off value. Use it when the host has no toggle of its own, or when you want the button to be the record of what's on."
-                : "Toggle latches: the first press sends Note On and the button stays lit, the next sends Note Off. The note sustains in between. Switching preset releases it, so nothing is left sounding."
-        }
-    }
-
     /// Wraps the plain binding to clear a latch left behind when a lit
     /// toggle button is changed to some other behavior.
     ///
@@ -498,8 +466,6 @@ struct SettingsPageView: View {
                 MIDIDestinationStatus(midi: app.midi)
             } header: {
                 Text("Connection")
-            } footer: {
-                Text("Motion MIDI appears to hosts as a single source, no matter how many performer surfaces are on screen.")
             }
 
             Section {
@@ -527,8 +493,6 @@ struct SettingsPageView: View {
                 .tint(Theme.accent)
             } header: {
                 Text("MIDI")
-            } footer: {
-                Text("Every CC this preset sends, in one place — motion, pad, morph corners, drawbars, buttons and every dial step. Numbers and names are editable there.")
             }
 
             Section {
@@ -543,12 +507,6 @@ struct SettingsPageView: View {
                 }
             } header: {
                 Text("Layout")
-            } footer: {
-                if isPadIdiom {
-                    Text("Hiding the dial panel gives its height back to the XY pad, and moves Center and the settings button side by side. Dial steps keep their assignments and keep applying — the row is only hidden.\n\nA second surface splits the screen into two independent performers, each with its own preset, pad, buttons and dials. Both send down the same MIDI port, so keep them on different channels or CCs. The gyro drives the left surface only — there's one sensor, and it can follow one preset's mappings at a time.")
-                } else {
-                    Text("Hiding the dial panel gives its height back to the XY pad, and moves Center and the settings button side by side. Dial steps keep their assignments and keep applying — the row is only hidden.")
-                }
             }
 
             Section("Status") {
@@ -582,6 +540,14 @@ struct SettingsPageView: View {
                          "Glide (legato portamento) makes notes slide between pitches instead of retriggering. Enable it in the config sheet or assign it to a pad button. The glide time sends CC 5; the on/off toggle sends CC 65. The receiving synth must respond to these standard portamento CCs — some instruments expose portamento only in their own UI.")
                 helpItem("Voice Count",
                          "1, 2, or 3 simultaneous touches in Notes mode. When a new finger exceeds the limit, the oldest voice is stolen. Lift a finger and its stolen voice returns at its current position — the same note-priority behavior as a classic mono synth.")
+                helpItem("Drawbars",
+                         "Turns the pad into a bank of drawbars — up to nine, each sending its own CC. Drag across several at once to sweep the bank, or set Touch Mode to Individual to move one at a time. Direction flips which end of the pad is full level. Ramp smooths the sweep as your finger crosses bars, so a fast drag doesn't jump values.")
+                helpItem("MIDI Channel Per Mode",
+                         "Standard, Drawbars, and Notes each carry their own channel, so switching mode doesn't retarget whatever the last one was driving. Morph is the exception: each of the four corners has its own channel, which is finer than a mode channel could be. Everything defaults to channel 1.")
+                helpItem("On Release (Standard Mode)",
+                         "Where the puck goes when your finger lifts. Hold Position sends nothing and leaves it where you left it. Center returns to the middle of both axes. Left Center and Right Center pin X to one end while centering Y — useful when X is a sweep you want parked open or closed. Bottom Left returns both axes to zero. Morph has its own toggle for returning to an even four-corner blend; Notes has none, since the notes already ended on release.")
+                helpItem("Master Scale",
+                         "The scale the pad returns to. A dial step carrying Set Scale overrides it for as long as that step is selected; turn the dial off that step and the master scale comes back.")
             }
 
             helpSection("Stepped Dial", icon: "dial.low.fill") {
@@ -632,6 +598,28 @@ struct SettingsPageView: View {
                          "On iPad, the Buttons tab allows adding buttons without limit. iPhone always shows the first six — reorder them on iPad to choose which six appear on iPhone.")
             }
 
+            helpSection("Presets & Files", icon: "square.and.arrow.up") {
+                helpItem("Export a Preset",
+                         "Swipe right on any preset in the preset list and tap Export. The file is saved wherever you choose — Files, iCloud Drive, or straight into a Mail or Messages thread. Use it to back up a rig before a gig, move one between iPhone and iPad, or hand a setup to another performer.")
+                helpItem("Import a Preset",
+                         "Tap Import Preset at the bottom of the preset list, or open a .motionmidi file from Files, Mail, or AirDrop. Importing always adds — it never overwrites a preset you already have. If the name is taken, the new one gets a number appended. You can select several files at once; if one of them isn't a preset, the rest still import and Motion MIDI tells you which failed.")
+                helpItem("Linked Dials Travel With It",
+                         "A dial slot can link to a shared dial in the library. On export, that dial's steps are copied into the preset so the file is self-contained — the person receiving it gets exactly what you had, even though their library has never seen that dial. The copy is a snapshot: it no longer follows later edits to the shared dial. If you want it in your own library, save it there from the dial's settings.")
+                helpItem("Reset to Default",
+                         "Settings → Reset returns the active preset to the default layout while keeping its name and its place in the library. You are asked to confirm first, since it discards the preset's current mappings.")
+            }
+
+            helpSection("Screen Layout", icon: "rectangle.split.2x1") {
+                helpItem("Show Meters on Deck",
+                         "Hides the pitch, roll, yaw, and magnitude bars from the performance screen. The mappings above them keep running and keep sending — this only takes back the space the bars occupy.")
+                helpItem("Show Dial / Fader Panel",
+                         "Hiding the dial panel gives its height back to the XY pad and moves Center and the settings button side by side. Dial steps keep their assignments and keep applying; the row is only hidden.")
+                helpItem("Second Performer Surface",
+                         "On iPad, splits the screen into two independent performers, each with its own preset, pad, buttons, and dials. Both send down the same MIDI port, so keep them on different channels or CCs. The gyro drives the left surface only — there is one sensor, and it can follow one preset's mappings at a time.")
+                helpItem("Mode Button Indent",
+                         "Holds blank space to the left of the pad mode buttons so the iPad's window controls don't sit on top of them in Split View or Stage Manager. This one applies to every preset and both surfaces, unlike the other layout settings — the window controls it dodges don't move when you change preset.")
+            }
+
             helpSection("MIDI Routing", icon: "cable.connector") {
                 helpItem("Virtual MIDI Source",
                          "Motion MIDI creates a CoreMIDI virtual source named 'Motion MIDI'. Any app on the same device can receive from it without a physical connection. Look for 'Motion MIDI' in your host app's MIDI input source list.")
@@ -643,6 +631,12 @@ struct SettingsPageView: View {
                          "Motion MIDI creates a virtual MIDI destination named 'Motion MIDI'. Any app that supports MIDI feedback output can send CC values back here, and the vertical fader will update to reflect them. Only CC messages are processed; all other message types are ignored.")
                 helpItem("MIDI Channels",
                          "Every output in Motion MIDI — XY pad, buttons, motion mappings, dial steps, and fader — has its own MIDI channel setting. Use different channels to route to different instruments or parameters in the same app without conflicts.")
+                helpItem("CC Map",
+                         "Settings → MIDI → CC Map lists every CC this preset sends in one place: motion, pad, morph corners, drawbars, buttons, and every dial step. Numbers, channels, and names are editable there. View it by owner to see what each control sends, or by number to see what is free. A red badge on the way in counts conflicts — two controls on the same CC and channel that can both be active at once.")
+                helpItem("Send for MIDI Learn",
+                         "Each row in the CC Map has a send button. Tapping it sweeps that CC from 0 to 127 and back to its resting value, which is what most hosts need to latch onto during MIDI learn. Put the host in learn mode, tap send, and the parameter binds without you having to move the control on the pad.")
+                helpItem("One Source, Two Surfaces",
+                         "Motion MIDI appears to hosts as a single source no matter how many performer surfaces are on screen. Both surfaces send down the same port, so keep them on different channels or CCs if you are driving separate instruments.")
             }
         }
         .scrollContentBackground(.hidden)
