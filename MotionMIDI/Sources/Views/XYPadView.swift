@@ -13,7 +13,7 @@ import UIKit
 /// This exposes only the four real surfaces as one performer-facing choice.
 /// Existing presets remain compatible because the original `mode` and
 /// `ccMode` fields are still what gets persisted.
-enum XYSurfaceMode: String, CaseIterable, Identifiable {
+enum XYSurfaceMode: String, Codable, CaseIterable, Identifiable {
     case standard
     case morph
     case drawbars
@@ -1303,10 +1303,21 @@ struct XYPadView: View {
         } else {
             voices.removeAll()
             suspended.removeAll()
-            // Standard mode only. Morph handles its own release, and note
-            // mode has nothing to spring to — the notes already ended.
-            if let target = cfg.springTarget.position {
-                emitCC(x: target.x, y: target.y)
+
+            // Each mode springs by its own rule. Note mode is absent from
+            // both branches: the notes already ended on release, so there is
+            // nothing left to move.
+            switch cfg.ccMode {
+            case .morph:
+                if let target = cfg.morphSpringTarget.position {
+                    emitCC(x: target.x, y: target.y)
+                }
+            case .standard:
+                if let target = cfg.springTarget.position {
+                    emitCC(x: target.x, y: target.y)
+                }
+            default:
+                break
             }
         }
     }
@@ -1658,9 +1669,11 @@ struct XYPadConfigSheet: View {
 
                 case .morph:
                     Section("Output") {
-                        Toggle("Spring to even blend on release",
-                               isOn: bind(\.morphSnapBack))
-                            .tint(Theme.accent)
+                        Picker("On Release", selection: bind(\.morphSpringTarget)) {
+                            ForEach(MorphSpringTarget.allCases) { target in
+                                Text(morphTargetLabel(target)).tag(target)
+                            }
+                        }
                     }
                 }
 
@@ -1670,7 +1683,15 @@ struct XYPadConfigSheet: View {
                 // pad you are not currently playing is the awkward path.
                 if surfaceMode == .notes {
                     Section {
-                        Picker("Scale", selection: bind(\.scale)) {
+                        // Routed through setMasterScale, NOT bind(), so an
+                        // active dial-step override is cleared. Writing the
+                        // master straight through leaves the override in
+                        // place, and the picker moves while the pad keeps
+                        // playing the old scale — an edit that looks dead.
+                        Picker("Scale", selection: Binding(
+                            get: { app.preset.xyPad.scale },
+                            set: { app.setMasterScale($0) }
+                        )) {
                             ForEach(Scale.families) { family in
                                 Section(family.title) {
                                     ForEach(family.scales) { Text($0.label).tag($0) }
@@ -1761,12 +1782,24 @@ struct XYPadConfigSheet: View {
         }
 
         Section {
+            // Same rule as the scale picker: these clear their overrides, so
+            // an edit here is audible immediately instead of sitting behind
+            // whatever a dial step is holding.
             IntWheelRow(title: "Root",
-                        selection: bind(\.rootNote),
+                        selection: Binding(
+                            get: { app.preset.xyPad.rootNote },
+                            set: { app.setMasterRootNote($0) }
+                        ),
                         range: 0...120,
                         wheelWidth: 170) { MIDIWheelText.note($0) }
             IntWheelRow(title: "Range",
-                        selection: bind(\.rangeSemitones),
+                        selection: Binding(
+                            get: { app.preset.xyPad.rangeSemitones },
+                            set: {
+                                app.preset.xyPad.rangeSemitones = min(max($0, 1), 60)
+                                app.clearRangeOverride()
+                            }
+                        ),
                         range: 1...60,
                         wheelWidth: 210) { value in
                 "\(value) st  ·  \(String(format: "%.1f", Double(value) / 12.0)) oct"
@@ -2007,6 +2040,20 @@ struct XYPadConfigSheet: View {
     // Corner bindings write through the array by index. The decoder
     // guarantees exactly four entries, and these are only reachable from
     // the fixed 2×2 grid above, so the index is always valid.
+
+    /// "Corner B" is fine until the corner has been named "Lead" — then the
+    /// list should say so, since that is what the pad's own meter shows.
+    private func morphTargetLabel(_ target: MorphSpringTarget) -> String {
+        guard let index = target.cornerIndex,
+              index < cfg.morphCorners.count
+        else { return target.label }
+
+        let name = cfg.morphCorners[index].label
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return target.label }
+
+        return "\(target.label) — \(name)"
+    }
 
     private func cornerLabelBinding(_ index: Int) -> Binding<String> {
         Binding(

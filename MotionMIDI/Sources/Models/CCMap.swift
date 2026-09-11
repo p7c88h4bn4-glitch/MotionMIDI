@@ -99,6 +99,35 @@ struct CCExclusion: Hashable {
 }
 
 /// One row of the CC map.
+/// The parts of a button that the CC map lets you edit in place.
+///
+/// Buttons are the only owner in the map with more than a number, a channel
+/// and a name: what they put on the wire (CC or note) and how a press behaves
+/// are both editable here, so you can wire a whole bank without leaving the
+/// map for the button editor and back.
+struct ButtonRowInfo: Equatable {
+    var message: ButtonMessage
+    var behavior: ButtonBehavior
+    var light: ButtonLight
+    /// Kept so switching CC -> Note -> CC returns the number you had rather
+    /// than a default. The two numbering schemes are unrelated: CC 24 and
+    /// note 24 mean nothing to each other, so each keeps its own.
+    var cc: Int
+    var note: Int
+}
+
+/// A row's identity across BOTH surfaces.
+///
+/// `CCSlot` alone is not unique once two surfaces are running: each has its
+/// own `.xyX`, its own `.morphCorner(0)`, its own dial slot 0. Keying
+/// conflicts on the slot alone would make surface A's X axis and surface B's
+/// X axis the same row — one would mask the other's conflict, and clearing
+/// the clash on one would appear to clear it on both.
+struct CCSlotRef: Hashable {
+    let surface: Int
+    let slot: CCSlot
+}
+
 struct CCAssignment: Identifiable, Equatable {
     let slot: CCSlot
     let group: CCGroup
@@ -134,6 +163,15 @@ struct CCAssignment: Identifiable, Equatable {
     /// Nil where the row can always fire. See `CCExclusion`.
     let exclusion: CCExclusion?
 
+    /// Which performer surface this row belongs to. 0 when only one is
+    /// running.
+    var surface: Int = 0
+
+    /// Set only for button rows, which are the one owner whose message type
+    /// and press behavior are editable from the map. Nil everywhere else —
+    /// a drawbar has no behavior and a motion axis has no note number.
+    let button: ButtonRowInfo?
+
     /// Where to leave the parameter after a learn sweep.
     ///
     /// A sweep has to move to be learnable, which means it moves whatever is
@@ -143,6 +181,20 @@ struct CCAssignment: Identifiable, Equatable {
     /// an extreme. Where nothing is stored, centre is the least surprising
     /// place to stop.
     let restValue: Int
+
+    var ref: CCSlotRef { CCSlotRef(surface: surface, slot: slot) }
+
+    /// True when this row's number is a note rather than a CC.
+    ///
+    /// A note row still occupies the `cc` field — it is the row's number,
+    /// whatever kind — but it must never be counted as a CC conflict, and
+    /// the chip has to say "NOTE" rather than "CC".
+    var isNote: Bool { button?.message == .note }
+
+    /// The number with its kind, e.g. "CC 24" or "NOTE 60".
+    var numberLabel: String {
+        isNote ? "NOTE \(cc)" : "CC \(cc)"
+    }
 
     /// Name with its role, for places that show a row as one string.
     var displayName: String {
@@ -165,7 +217,8 @@ extension Preset {
     /// each with its real steps, and only the steps carrying a Send or Fader
     /// action. Nothing hypothetical is listed, so every index inside a
     /// `CCSlot` addresses something real at the moment it is built.
-    func ccAssignments(dialLibrary: [DialPreset] = []) -> [CCAssignment] {
+    func ccAssignments(dialLibrary: [DialPreset] = [],
+                       surface: Int = 0) -> [CCAssignment] {
         var rows: [CCAssignment] = []
 
         // ── Motion ──────────────────────────────────────────────────────
@@ -183,6 +236,7 @@ extension Preset {
                 defaultName: mapping.source.shortLabel,
                 isRenamable: true,
                 exclusion: nil,
+                button: nil,
                 restValue: 64
             ))
         }
@@ -198,7 +252,7 @@ extension Preset {
             cc: xyPad.xCC, channel: xyPad.standardChannel, isEditable: true,
             isActive: xyPad.ccMode == .standard,
             defaultName: "X Axis", isRenamable: true, exclusion: nil,
-            restValue: 64))
+            button: nil, restValue: 64))
         rows.append(CCAssignment(
             slot: .xyY, group: .xyPad,
             name: xyPad.yAxisName.isEmpty ? "Y Axis" : xyPad.yAxisName,
@@ -206,7 +260,7 @@ extension Preset {
             cc: xyPad.yCC, channel: xyPad.standardChannel, isEditable: true,
             isActive: xyPad.ccMode == .standard,
             defaultName: "Y Axis", isRenamable: true, exclusion: nil,
-            restValue: 64))
+            button: nil, restValue: 64))
 
         // ── Morph corners ───────────────────────────────────────────────
         for (i, corner) in xyPad.morphCorners.enumerated() {
@@ -223,6 +277,7 @@ extension Preset {
                 defaultName: Self.defaultCornerLabel(i),
                 isRenamable: true,
                 exclusion: nil,
+                button: nil,
                 restValue: 0
             ))
         }
@@ -242,27 +297,37 @@ extension Preset {
                 defaultName: "Drawbar \(i + 1)",
                 isRenamable: true,
                 exclusion: nil,
+                button: nil,
                 restValue: bar.value
             ))
         }
 
         // ── Buttons ─────────────────────────────────────────────────────
-        // Note-mode buttons occupy no CC and are skipped outright, rather
-        // than listed as inactive: they hold no number to conflict with.
-        for button in buttons where button.message == .cc {
+        // Every button is listed, note-mode included. They used to be
+        // filtered to CC only, on the reasoning that a note button holds no
+        // CC number to conflict with — true, but it meant flipping a button
+        // to Note made its row vanish from the map, which is exactly the
+        // wrong response to an edit made IN the map. A note row carries its
+        // note number in `cc` and is excluded from conflict checks instead.
+        for button in buttons {
             rows.append(CCAssignment(
                 slot: .button(button.id),
                 group: .buttons,
                 name: button.name.isEmpty ? "Button" : button.name,
                 storedName: button.name,
                 roleSuffix: nil,
-                cc: button.cc,
+                cc: button.message == .note ? button.note : button.cc,
                 channel: button.channel,
                 isEditable: true,
                 isActive: true,
                 defaultName: "Button",
                 isRenamable: true,
                 exclusion: nil,
+                button: ButtonRowInfo(message: button.message,
+                                      behavior: button.behavior,
+                                      light: button.light,
+                                      cc: button.cc,
+                                      note: button.note),
                 restValue: button.offValue
             ))
         }
@@ -307,6 +372,7 @@ extension Preset {
                             defaultName: "Step",
                             isRenamable: true,
                             exclusion: exclusion,
+                            button: nil,
                             restValue: value
                         ))
                     case .setFaderCC(let cc, let defaultValue, let channel):
@@ -324,6 +390,7 @@ extension Preset {
                             defaultName: "Step",
                             isRenamable: true,
                             exclusion: exclusion,
+                            button: nil,
                             restValue: defaultValue
                         ))
                     default:
@@ -346,6 +413,7 @@ extension Preset {
                 // glideTime is seconds, not a CC value — same 0...1 to
                 // 0...127 conversion the pad uses when it sends it.
                 exclusion: nil,
+                button: nil,
                 restValue: min(max(Int((xyPad.glideTime * 127).rounded()), 0), 127)))
             rows.append(CCAssignment(
                 slot: .portamentoSwitch, group: .fixed, name: "Portamento Switch",
@@ -353,10 +421,16 @@ extension Preset {
                 cc: MIDIDefaults.portamentoSwitchCC, channel: xyPad.notesChannel,
                 isEditable: false, isActive: true,
                 defaultName: "Portamento Switch", isRenamable: false,
-                exclusion: nil, restValue: xyPad.glide ? 127 : 0))
+                exclusion: nil, button: nil, restValue: xyPad.glide ? 127 : 0))
         }
 
-        return rows
+        // Stamped once here rather than at each of the ten construction
+        // sites, which is one place to get wrong instead of ten.
+        return rows.map { row in
+            var copy = row
+            copy.surface = surface
+            return copy
+        }
     }
 
     /// A/B/C/D, matching `MorphCorner.defaults()`.
@@ -380,22 +454,36 @@ extension Preset {
     /// Inactive rows still count. A drawbar hidden by the current pad mode
     /// holds its number the instant the mode changes, and a conflict that
     /// only appears mid-set is worse than one visible now.
-    static func conflictingSlots(in rows: [CCAssignment]) -> Set<CCSlot> {
-        var clashing: Set<CCSlot> = []
+    static func conflictingSlots(in rows: [CCAssignment]) -> Set<CCSlotRef> {
+        var clashing: Set<CCSlotRef> = []
 
         for i in rows.indices {
             for j in rows.index(after: i)..<rows.endIndex {
                 let a = rows[i], b = rows[j]
+
+                // A note number and a CC number are different namespaces.
+                // Note 24 and CC 24 on the same channel are unrelated
+                // messages and never collide; two notes on the same number
+                // and channel genuinely do.
+                guard a.isNote == b.isNote else { continue }
                 guard a.cc == b.cc, a.channel == b.channel else { continue }
 
                 // Same dial, different step — can never both be live.
-                if let ea = a.exclusion, let eb = b.exclusion,
+                //
+                // Surface-qualified: exclusion groups are numbered per
+                // preset, so surface A's dial 0 and surface B's dial 0 both
+                // carry group 0. Without this check they would look mutually
+                // exclusive and a genuine cross-surface clash would be
+                // silently dismissed — the one kind of conflict neither
+                // surface could otherwise see.
+                if a.surface == b.surface,
+                   let ea = a.exclusion, let eb = b.exclusion,
                    ea.group == eb.group, ea.member != eb.member {
                     continue
                 }
 
-                clashing.insert(a.slot)
-                clashing.insert(b.slot)
+                clashing.insert(a.ref)
+                clashing.insert(b.ref)
             }
         }
         return clashing
@@ -404,6 +492,8 @@ extension Preset {
     /// CC numbers involved in at least one real conflict.
     static func conflictingCCs(in rows: [CCAssignment]) -> Set<Int> {
         let slots = conflictingSlots(in: rows)
-        return Set(rows.filter { slots.contains($0.slot) }.map(\.cc))
+        // Note rows are excluded: this drives the by-number CC list, and a
+        // note number has no place on a chart of CCs 0-127.
+        return Set(rows.filter { slots.contains($0.ref) && !$0.isNote }.map(\.cc))
     }
 }

@@ -296,13 +296,18 @@ struct PadButton: View {
     /// touch feedback and lasts as long as the touch.
     @State private var pressed = false
 
-    /// Latched ON by a `.toggle` press and still holding.
-    private var latched: Bool { app.isButtonLatched(mapping.id) }
+    /// On per the button's chosen source: its own latch, or the host's
+    /// report of what the thing it controls is actually doing.
+    private var latched: Bool { app.buttonIsLit(mapping) }
 
     /// Lit for either reason. A latched button has to stay lit after the
     /// finger lifts — the whole point of latching is that the state is now
     /// the button's to report, so if it went dark on release there would be
     /// nothing on screen saying the message is still out there.
+    ///
+    /// `pressed` still counts for a host-following button: the touch should
+    /// respond instantly rather than waiting on a round trip, even though
+    /// the steady state comes from the host a moment later.
     private var lit: Bool { pressed || latched }
 
     var body: some View {

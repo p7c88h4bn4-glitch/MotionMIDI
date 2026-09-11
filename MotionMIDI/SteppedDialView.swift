@@ -320,6 +320,7 @@ struct SteppedDialView: View {
 // MARK: - Settings sheet
 
 struct DialSettingsSheet: View {
+    @AppStorage("MotionMIDIPro.dualSurface") private var dualSurface = false
     @EnvironmentObject var app: AppState
     @Environment(\.dismiss) private var dismiss
     let slot: Int
@@ -342,6 +343,10 @@ struct DialSettingsSheet: View {
 
     // ── Which dial: local or a shared library preset ─────────────────────
 
+    // Two sections now, so the builder attribute is required — a computed
+    // property with more than one expression has no single value to infer an
+    // opaque return type from.
+    @ViewBuilder
     private var sourceSection: some View {
         Section {
             NavigationLink {
@@ -366,6 +371,46 @@ struct DialSettingsSheet: View {
                     app.removeDialSlot(at: slot)
                     dismiss()
                 }
+            }
+        }
+
+        // Only offered when a second surface is actually running. A toggle
+        // for a surface that isn't on screen has nothing to link to and no
+        // way to show what it did.
+        if dualSurface, isPadIdiom, app.peer != nil {
+            Section {
+                Toggle("Sync With Other Surface", isOn: Binding(
+                    get: {
+                        app.preset.dialSlots.indices.contains(slot)
+                            ? app.preset.dialSlots[slot].syncsAcrossSurfaces
+                            : false
+                    },
+                    set: { newValue in
+                        guard app.preset.dialSlots.indices.contains(slot) else { return }
+                        app.preset.dialSlots[slot].syncsAcrossSurfaces = newValue
+                    }
+                ))
+                .tint(Theme.accent)
+
+                if app.preset.dialSlots.indices.contains(slot),
+                   app.preset.dialSlots[slot].syncsAcrossSurfaces {
+                    HStack {
+                        Text("Paired With")
+                        Spacer()
+                        // Says plainly whether the link found anything. A
+                        // toggle that is on but matches nothing looks like
+                        // it is working right up until the show.
+                        if let partner = app.peerSyncPartnerName(forSlot: slot) {
+                            Text(partner).foregroundColor(.secondary)
+                        } else {
+                            Text("No match").foregroundColor(Theme.danger)
+                        }
+                    }
+                }
+            } header: {
+                Text("Surfaces")
+            } footer: {
+                Text("Turn this dial and the dial with the SAME NAME on the other surface moves to the same step number. Each dial keeps its own steps — step 3 here and step 3 there can do completely different things. The other dial needs this turned on too, and its name has to match.")
             }
         }
     }
@@ -706,7 +751,75 @@ struct DialStepEditor: View {
             IntWheelRow(title: "Range", selection: Binding(
                 get: { r },
                 set: { setAction(.setNoteRange($0)) }
-            ), range: 1...60) { "\($0) semitones" }
+            ), range: 1...60, wheelWidth: 210) { "\($0) semitones" }
+
+        case .setPadMode(let mode):
+            Picker("Pad Mode", selection: Binding(
+                get: { mode },
+                set: { setAction(.setPadMode($0)) }
+            )) {
+                ForEach(XYSurfaceMode.allCases) { m in
+                    Text(m.longLabel).tag(m)
+                }
+            }
+
+        case .setXAxisCC(let cc, let channel):
+            IntWheelRow(title: "X Axis CC", selection: Binding(
+                get: { cc },
+                set: { setAction(.setXAxisCC(cc: $0, channel: channel)) }
+            ), range: 0...127)
+            channelWheel(channel) { newChannel in
+                setAction(.setXAxisCC(cc: cc, channel: newChannel))
+            }
+
+        case .setYAxisCC(let cc, let channel):
+            IntWheelRow(title: "Y Axis CC", selection: Binding(
+                get: { cc },
+                set: { setAction(.setYAxisCC(cc: $0, channel: channel)) }
+            ), range: 0...127)
+            channelWheel(channel) { newChannel in
+                setAction(.setYAxisCC(cc: cc, channel: newChannel))
+            }
+
+        case .setSpringTarget(let target):
+            Picker("On Release", selection: Binding(
+                get: { target },
+                set: { setAction(.setSpringTarget($0)) }
+            )) {
+                ForEach(SpringTarget.allCases) { t in
+                    Text(t.label).tag(t)
+                }
+            }
+
+        case .setMorphCornerCC(let corner, let cc):
+            Picker("Corner", selection: Binding(
+                get: { corner },
+                set: { setAction(.setMorphCornerCC(corner: $0, cc: cc)) }
+            )) {
+                ForEach(0..<4, id: \.self) { index in
+                    Text(["A", "B", "C", "D"][index]).tag(index)
+                }
+            }
+            .pickerStyle(.segmented)
+            IntWheelRow(title: "Corner CC", selection: Binding(
+                get: { cc },
+                set: { setAction(.setMorphCornerCC(corner: corner, cc: $0)) }
+            ), range: 0...127)
+
+        case .setMorphChannel(let channel):
+            channelWheel(channel) { newChannel in
+                setAction(.setMorphChannel(newChannel))
+            }
+
+        case .setMorphSpring(let target):
+            Picker("On Release", selection: Binding(
+                get: { target },
+                set: { setAction(.setMorphSpring($0)) }
+            )) {
+                ForEach(MorphSpringTarget.allCases) { t in
+                    Text(t.label).tag(t)
+                }
+            }
 
         // `defaultValue` is carried through untouched rather than edited
         // here. It only decides what the fader READS before any feedback

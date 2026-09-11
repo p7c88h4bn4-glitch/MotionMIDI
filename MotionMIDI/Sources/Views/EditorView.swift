@@ -130,21 +130,7 @@ struct ButtonListView: View {
                 if isPadIdiom {
                     Section {
                         Button {
-                            // Claim a CC no other button here is using, the
-                            // same way a new dial step picks a free number.
-                            app.preset.buttons.append(
-                                ButtonMapping(
-                                    name: "NEW",
-                                    // Avoids every CC the preset assigns —
-                                    // drawbars, morph corners, dial steps and
-                                    // motion included — not just other
-                                    // buttons. Only avoiding buttons is what
-                                    // let a new one land on a drawbar.
-                                    cc: app.firstFreeCC()
-                                        ?? MIDIDefaults.firstFreeButtonCC(
-                                            avoiding: app.preset.usedButtonCCs)
-                                )
-                            )
+                            app.addButton()
                         } label: {
                             Label("Add Button", systemImage: "plus.circle.fill")
                                 .foregroundColor(Theme.accent)
@@ -267,6 +253,11 @@ struct ButtonEditorView: View {
                             Text(b.label).tag(b)
                         }
                     }
+                    Picker("Lit From", selection: lightBinding) {
+                        ForEach(ButtonLight.allCases) { l in
+                            Text(l.label).tag(l)
+                        }
+                    }
                 } header: {
                     Text("MIDI")
                 }
@@ -349,6 +340,31 @@ struct ButtonEditorView: View {
     /// only `.toggle` presses clear a latch, and it just stopped being one.
     /// The "off" message goes out too, so the host isn't left holding a
     /// value nothing on screen still claims to be sending.
+    private var lightBinding: Binding<ButtonLight> {
+        Binding(
+            get: { self.button?.light ?? .local },
+            set: { newValue in
+                guard let i = self.app.preset.buttons
+                    .firstIndex(where: { $0.id == self.buttonID }) else { return }
+
+                // Leaving host mode strands nothing: the host's report is
+                // dropped, and a stale latch from before would otherwise
+                // reappear as a lit button nothing is driving.
+                if newValue == .local {
+                    self.app.clearHostLit(self.buttonID)
+                } else if self.app.isButtonLatched(self.buttonID) {
+                    // Entering host mode with a latch still set would show
+                    // the button lit on this app's say-so while claiming to
+                    // report the host's state.
+                    self.app.emitButton(self.app.preset.buttons[i], on: false)
+                    self.app.clearButtonLatch(self.buttonID)
+                }
+
+                self.app.preset.buttons[i].light = newValue
+            }
+        )
+    }
+
     private var behaviorBinding: Binding<ButtonBehavior> {
         let raw = bind(\.behavior, default: .tap)
         return Binding(
@@ -382,7 +398,7 @@ struct ButtonEditorView: View {
                     // nothing else took it while it was a note button.
                     let others = Set(
                         self.app.ccAssignments
-                            .filter { $0.slot != .button(self.buttonID) }
+                            .filter { $0.slot != .button(self.buttonID) && !$0.isNote }
                             .map(\.cc)
                     )
                     if others.contains(self.app.preset.buttons[i].cc) {
@@ -427,7 +443,15 @@ struct SettingsPageView: View {
     @State private var showCCMap = false
 
     private var ccConflictCount: Int {
-        Preset.conflictingSlots(in: app.ccAssignments).count
+        // Counts across BOTH surfaces when two are running. The badge is the
+        // only warning before you open the map, so a clash with the other
+        // surface has to raise it — otherwise the map opens showing a
+        // conflict the badge said was not there.
+        var rows = app.ccAssignments
+        if dualSurface, isPadIdiom, let peer = app.peer {
+            rows += peer.ccAssignments
+        }
+        return Preset.conflictingSlots(in: rows).count
     }
 
     /// Same key RootView reads. Toggling it from either surface's settings

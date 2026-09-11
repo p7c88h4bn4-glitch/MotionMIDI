@@ -239,6 +239,69 @@ enum SpringTarget: String, Codable, Equatable, CaseIterable, Identifiable {
     }
 }
 
+/// Where the morph blend lands when the finger lifts.
+///
+/// Morph needs its own list rather than sharing `SpringTarget`, because the
+/// meaningful destinations here are the four corners by name — "go back to
+/// corner B" is a musical instruction, where "go to x=1, y=1" is not. The
+/// corner cases resolve to positions that the morph engine turns back into
+/// a full-weight blend on that corner.
+///
+/// Corner layout is A=top-left, B=top-right, C=bottom-left, D=bottom-right,
+/// matching the on-pad meters and the settings grid.
+enum MorphSpringTarget: String, Codable, Equatable, CaseIterable, Identifiable {
+    case hold
+    case center
+    case cornerA, cornerB, cornerC, cornerD
+    case top, bottom, left, right
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .hold:    return "Hold Position"
+        case .center:  return "Center"
+        case .cornerA: return "Corner A"
+        case .cornerB: return "Corner B"
+        case .cornerC: return "Corner C"
+        case .cornerD: return "Corner D"
+        case .top:     return "Center Top"
+        case .bottom:  return "Center Bottom"
+        case .left:    return "Center Left"
+        case .right:   return "Center Right"
+        }
+    }
+
+    /// Pad coordinates, y pointing UP (0 = bottom) to match `TouchPoint`.
+    /// Nil for `hold`, which sends nothing on release.
+    var position: (x: Double, y: Double)? {
+        switch self {
+        case .hold:    return nil
+        case .center:  return (0.5, 0.5)
+        case .cornerA: return (0.0, 1.0)
+        case .cornerB: return (1.0, 1.0)
+        case .cornerC: return (0.0, 0.0)
+        case .cornerD: return (1.0, 0.0)
+        case .top:     return (0.5, 1.0)
+        case .bottom:  return (0.5, 0.0)
+        case .left:    return (0.0, 0.5)
+        case .right:   return (1.0, 0.5)
+        }
+    }
+
+    /// The corner this target sits on, when it sits on one. Lets the
+    /// settings list show the corner's own name instead of just "Corner A".
+    var cornerIndex: Int? {
+        switch self {
+        case .cornerA: return 0
+        case .cornerB: return 1
+        case .cornerC: return 2
+        case .cornerD: return 3
+        default:       return nil
+        }
+    }
+}
+
 /// What the XY pad transmits.
 enum XYPadMode: String, Codable, CaseIterable, Identifiable {
     /// Classic: X drives one CC, Y drives another (independent).
@@ -514,14 +577,14 @@ struct XYPadConfig: Codable, Equatable {
 
     /// Where the puck springs to when the finger lifts, in standard mode.
     ///
-    /// Standard mode only. Morph has its own toggle (`morphSnapBack`) since
+    /// Standard mode only. Morph has `morphSpringTarget` instead, since
     /// its "centre" means an even blend of four corners rather than a
     /// position, and note mode has none at all — there is nothing to spring
     /// BACK to when the output is a note that already ended on release.
     var springTarget: SpringTarget = .center
 
-    /// Morph mode: return to an even four-corner blend on release.
-    var morphSnapBack: Bool = true
+    /// Morph mode: where the blend lands on release.
+    var morphSpringTarget: MorphSpringTarget = .center
 
     // ── Note mode ────────────────────────────────────────────────────────
     var mode: XYPadMode = .cc
@@ -598,7 +661,7 @@ extension XYPadConfig {
     enum CodingKeys: String, CodingKey {
         case xCC, yCC, channel
         case standardChannel, drawbarChannel, notesChannel
-        case springTarget, morphSnapBack
+        case springTarget, morphSpringTarget
         case mode, diagonal, rootNote, rangeSemitones, scale
         case glide, glideTime, perpToVelocity, fixedVelocity
         case glideToggleButtonId, voiceCount
@@ -611,11 +674,12 @@ extension XYPadConfig {
     /// migrate. Read-only by construction: nothing encodes through these.
     ///
     /// - `snapBack`: one shared spring bool, now `springTarget` +
-    ///   `morphSnapBack`.
+    ///   `morphSpringTarget`.
+    /// - `morphSnapBack`: morph's own bool, now `morphSpringTarget`.
     /// - `xChannel` / `yChannel`: the brief period when the two axes carried
     ///   separate channels, now the single `standardChannel`.
     private enum LegacyCodingKeys: String, CodingKey {
-        case snapBack, xChannel, yChannel
+        case snapBack, xChannel, yChannel, morphSnapBack
     }
 
     init(from decoder: Decoder) throws {
@@ -633,8 +697,13 @@ extension XYPadConfig {
 
         springTarget = try c.decodeIfPresent(SpringTarget.self, forKey: .springTarget)
             ?? (legacySnapBack ? .center : .hold)
-        morphSnapBack = try c.decodeIfPresent(Bool.self, forKey: .morphSnapBack)
+        // `morphSnapBack` was a bool: on meant "return to an even blend",
+        // which is the centre. Off meant stay put.
+        let legacyMorphSnap = try legacy.decodeIfPresent(Bool.self, forKey: .morphSnapBack)
             ?? legacySnapBack
+        morphSpringTarget = try c.decodeIfPresent(MorphSpringTarget.self,
+                                                 forKey: .morphSpringTarget)
+            ?? (legacyMorphSnap ? .center : .hold)
 
         // Per-mode channels fall back to the old shared one, so an existing
         // preset keeps sending exactly where it did.
@@ -721,29 +790,114 @@ struct XYPadOverrides: Equatable {
     var voiceCount: Int?
     var rangeSemitones: Int?
 
+    // ── Pad mode ────────────────────────────────────────────────────────
+    /// Which surface the pad is showing. Lets one dial step turn the pad
+    /// into a morph blend and the next turn it back.
+    var surfaceMode: XYSurfaceMode?
+
+    // ── Standard XY ─────────────────────────────────────────────────────
+    var xCC: Int?
+    var yCC: Int?
+    var standardChannel: Int?
+    var springTarget: SpringTarget?
+
+    // ── Morph ───────────────────────────────────────────────────────────
+    /// Per-corner CC, indexed 0-3 (A, B, C, D). Sparse: a step can retarget
+    /// one corner without disturbing the other three.
+    var morphCornerCCs: [Int: Int] = [:]
+    var morphChannel: Int?
+    var morphSpringTarget: MorphSpringTarget?
+
     var isActive: Bool {
         scale != nil || rootNote != nil || fixedVelocity != nil
             || voiceCount != nil || rangeSemitones != nil
+            || surfaceMode != nil
+            || xCC != nil || yCC != nil || standardChannel != nil
+            || springTarget != nil
+            || !morphCornerCCs.isEmpty || morphChannel != nil
+            || morphSpringTarget != nil
     }
 
     /// The config the pad should actually play, given these overrides.
     ///
-    /// Note mode parameters only. Drawbar and morph settings are never
-    /// overridden here — no dial action targets them, and a bank of drawbars
-    /// silently rearranging itself as the dial turns would be a surprise
-    /// rather than a feature.
+    /// Drawbars are still never overridden. A bank of nine bars silently
+    /// rearranging itself as the dial turns would be a surprise rather than
+    /// a feature, and unlike an axis CC there is no single value to change —
+    /// it would have to be all nine or nothing.
     func applied(to base: XYPadConfig) -> XYPadConfig {
         var cfg = base
+
+        // Note mode
         if let scale          { cfg.scale = scale }
         if let rootNote       { cfg.rootNote = min(max(rootNote, 0), 120) }
         if let fixedVelocity  { cfg.fixedVelocity = min(max(fixedVelocity, 1), 127) }
         if let voiceCount     { cfg.voiceCount = min(max(voiceCount, 1), XYPadConfig.maxVoices) }
         if let rangeSemitones { cfg.rangeSemitones = min(max(rangeSemitones, 1), 60) }
+
+        // Pad mode. Notes is carried by `mode`, the other three by
+        // `ccMode`, so both fields have to move together — setting one and
+        // leaving the other is how the pad ends up claiming to be in Morph
+        // while still playing notes.
+        if let surfaceMode {
+            switch surfaceMode {
+            case .notes:    cfg.mode = .notes
+            case .standard: cfg.mode = .cc; cfg.ccMode = .standard
+            case .morph:    cfg.mode = .cc; cfg.ccMode = .morph
+            case .drawbars: cfg.mode = .cc; cfg.ccMode = .drawbars
+            }
+        }
+
+        // Standard XY
+        if let xCC             { cfg.xCC = min(max(xCC, 0), 127) }
+        if let yCC             { cfg.yCC = min(max(yCC, 0), 127) }
+        if let standardChannel { cfg.standardChannel = min(max(standardChannel, 0), 15) }
+        if let springTarget    { cfg.springTarget = springTarget }
+
+        // Morph
+        for (index, cc) in morphCornerCCs where cfg.morphCorners.indices.contains(index) {
+            cfg.morphCorners[index].cc = min(max(cc, 0), 127)
+        }
+        if let morphChannel {
+            // Corners carry their own channels, so a single "morph channel"
+            // sets all four. Retargeting one corner's channel and leaving
+            // the rest is a split nobody asked for — the four corners are
+            // one instrument being blended.
+            for index in cfg.morphCorners.indices {
+                cfg.morphCorners[index].channel = min(max(morphChannel, 0), 15)
+            }
+        }
+        if let morphSpringTarget { cfg.morphSpringTarget = morphSpringTarget }
+
         return cfg
     }
 }
 
 // MARK: - Buttons
+
+/// How a button decides whether it is lit.
+enum ButtonLight: String, Codable, Equatable, CaseIterable, Identifiable {
+    /// The button's own press state. A `.toggle` stays lit because it
+    /// latched; a `.tap` or `.momentary` lights only while held.
+    case local
+    /// The host's state, learned from incoming MIDI on this button's own
+    /// number and channel.
+    ///
+    /// For a clip in a looper this is the honest answer: the clip can start
+    /// or stop for reasons that have nothing to do with this button — the
+    /// clip was tapped on the host's own screen, a scene changed it, it ran
+    /// to the end. A local latch would go on claiming the clip is playing
+    /// long after it stopped.
+    case host
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .local: return "Own State"
+        case .host:  return "Host Feedback"
+        }
+    }
+}
 
 enum ButtonBehavior: String, Codable, CaseIterable, Identifiable {
     /// Held: the "on" message on press, the "off" message on release.
@@ -801,6 +955,10 @@ struct ButtonMapping: Identifiable, Codable, Equatable {
     var channel: Int = MIDIDefaults.channel
     var behavior: ButtonBehavior = .tap
 
+    /// Where the lit state comes from. Defaults to `.local`, which is how
+    /// every button behaved before feedback existed.
+    var light: ButtonLight = .local
+
     init(id: UUID = UUID(),
          name: String,
          message: ButtonMessage = .cc,
@@ -809,7 +967,8 @@ struct ButtonMapping: Identifiable, Codable, Equatable {
          onValue: Int = 127,
          offValue: Int = 0,
          channel: Int = MIDIDefaults.channel,
-         behavior: ButtonBehavior = .tap) {
+         behavior: ButtonBehavior = .tap,
+         light: ButtonLight = .local) {
         self.id = id
         self.name = name
         self.message = message
@@ -819,6 +978,7 @@ struct ButtonMapping: Identifiable, Codable, Equatable {
         self.offValue = offValue
         self.channel = channel
         self.behavior = behavior
+        self.light = light
     }
 
     /// One-line description for the editor list.
@@ -835,6 +995,7 @@ struct ButtonMapping: Identifiable, Codable, Equatable {
 extension ButtonMapping {
     enum CodingKeys: String, CodingKey {
         case id, name, message, note, cc, onValue, offValue, channel, behavior
+        case light
     }
 
     /// The default in the memberwise init above is `.cc`, but the default
@@ -860,6 +1021,9 @@ extension ButtonMapping {
         channel  = try c.decodeIfPresent(Int.self, forKey: .channel)
             ?? MIDIDefaults.channel
         behavior = try c.decodeIfPresent(ButtonBehavior.self, forKey: .behavior) ?? .tap
+        // Absent means a preset from before feedback existed, and back then
+        // every button reported its own press state.
+        light    = try c.decodeIfPresent(ButtonLight.self, forKey: .light) ?? .local
 
         note     = min(max(note, 0), 127)
         cc       = min(max(cc, 0), 127)

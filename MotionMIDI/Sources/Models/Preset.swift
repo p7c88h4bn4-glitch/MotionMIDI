@@ -17,6 +17,48 @@ struct DialSlot: Identifiable, Codable, Equatable {
     /// instead of `localDial`. Falls back to local if the id no longer
     /// exists in the library.
     var linkedDialPresetID: UUID? = nil
+
+    /// Follow the same slot on the other performer surface.
+    ///
+    /// Syncs the STEP INDEX only, never the contents. Step 3 here selects
+    /// step 3 there, and each dial does whatever its own step 3 declares —
+    /// so one turn can put this pad in Morph and the other pad on a
+    /// different scale. Copying the actions across would defeat the point of
+    /// running two surfaces.
+    ///
+    /// Both slots must opt in. A one-sided link would mean turning the dial
+    /// that opted out silently drives a dial that did not, which is the kind
+    /// of remote control you cannot see the cause of.
+    var syncsAcrossSurfaces: Bool = false
+
+    init(id: UUID = UUID(),
+         localDial: DialPreset = .factory,
+         linkedDialPresetID: UUID? = nil,
+         syncsAcrossSurfaces: Bool = false) {
+        self.id = id
+        self.localDial = localDial
+        self.linkedDialPresetID = linkedDialPresetID
+        self.syncsAcrossSurfaces = syncsAcrossSurfaces
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, localDial, linkedDialPresetID, syncsAcrossSurfaces
+    }
+
+    /// Lenient by hand, because synthesis is not.
+    ///
+    /// A default value on the property does NOT make the synthesized decoder
+    /// tolerate a missing key — it throws, and every preset saved before this
+    /// field existed would fail to load. That is the whole library, not one
+    /// slot.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        localDial = try c.decodeIfPresent(DialPreset.self, forKey: .localDial) ?? .factory
+        linkedDialPresetID = try c.decodeIfPresent(UUID.self, forKey: .linkedDialPresetID)
+        syncsAcrossSurfaces = try c.decodeIfPresent(Bool.self,
+                                                    forKey: .syncsAcrossSurfaces) ?? false
+    }
 }
 
 struct Preset: Identifiable, Codable, Equatable {

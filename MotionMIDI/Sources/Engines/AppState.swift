@@ -44,6 +44,18 @@ final class AppState: ObservableObject {
     /// preset, dial, and set of buttons.
     let surface: Int
 
+    /// The other performer surface, when two are running.
+    ///
+    /// Weak, and set by `SharedEngines` rather than discovered here: the two
+    /// surfaces are siblings owned by the same object, and a strong link
+    /// either way would keep the second alive after it is switched off.
+    ///
+    /// Exists so the CC map can see across the divide. Both surfaces send
+    /// down ONE MIDI port, so two rows on the same CC and channel collide
+    /// for real even when they sit in different presets — and neither
+    /// surface could see that on its own.
+    weak var peer: AppState?
+
     /// Only the primary surface drives the motion engine.
     ///
     /// The engine is SHARED, so both surfaces show live meters, but it can
@@ -105,6 +117,12 @@ final class AppState: ObservableObject {
         midi.addControlChangeObserver { [weak self] channel, cc, value in
             Task { @MainActor in
                 self?.handleIncomingCC(channel: channel, cc: cc, value: value)
+            }
+        }
+
+        midi.addNoteObserver { [weak self] channel, note, on in
+            Task { @MainActor in
+                self?.handleIncomingNote(channel: channel, note: note, on: on)
             }
         }
 
@@ -395,6 +413,81 @@ final class AppState: ObservableObject {
         // step declared stops applying — including parameters this step says
         // nothing about, which revert to master.
         refreshPadOverrides()
+
+        propagateStepToPeer(slot: slot, stepIndex: stepIndex)
+    }
+
+    /// True while a peer-driven selection is running, so the echo stops here.
+    ///
+    /// Without it A tells B, B tells A, and the two bounce forever on the
+    /// first turn of a linked dial.
+    private var isFollowingPeer = false
+
+    /// Mirror a step selection onto the same slot of the other surface.
+    ///
+    /// Index only. The two dials keep their own steps and their own actions —
+    /// step 3 there does whatever step 3 there declares, which is usually not
+    /// what step 3 here declares, and is the reason to link them at all.
+    private func propagateStepToPeer(slot: Int, stepIndex: Int) {
+        guard !isFollowingPeer,
+              preset.dialSlots.indices.contains(slot),
+              preset.dialSlots[slot].syncsAcrossSurfaces,
+              let peer
+        else { return }
+
+        // Matched by NAME, not position.
+        //
+        // Position is the wrong key: the two surfaces run different presets
+        // with their own slot counts and their own ordering, so "slot 2"
+        // means nothing in common between them. Adding a dial to one surface
+        // would silently repoint every link after it. A name is what the
+        // performer actually reasons about, and it survives reordering.
+        let name = Self.syncKey(dial(at: slot).name)
+        guard !name.isEmpty else { return }
+
+        guard let peerSlot = peer.preset.dialSlots.indices.first(where: { index in
+            // Both sides opt in. A one-sided link is remote control with no
+            // visible cause on the receiving surface.
+            peer.preset.dialSlots[index].syncsAcrossSurfaces
+                && Self.syncKey(peer.dial(at: index).name) == name
+        }) else { return }
+
+        // Dials can have different step counts. Rather than clamping — which
+        // would quietly park the shorter dial on its last step and stay there
+        // as the longer one kept turning — the mirror simply does not apply
+        // where there is no matching step.
+        guard peer.dial(at: peerSlot).steps.indices.contains(stepIndex) else { return }
+
+        peer.isFollowingPeer = true
+        peer.selectDialStep(at: peerSlot, stepIndex)
+        peer.isFollowingPeer = false
+    }
+
+    /// Normalised dial name for matching.
+    ///
+    /// Case- and whitespace-insensitive, so "Filter" and "filter " pair up.
+    /// Two dials named the same thing on one surface is a user problem the
+    /// first match resolves; being strict about capitalisation would be a
+    /// silent failure with no visible cause.
+    private static func syncKey(_ name: String) -> String {
+        name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    /// Names on the other surface that this slot could pair with.
+    ///
+    /// Drives the settings row, so the toggle can say whether the link has
+    /// anything to talk to rather than looking active and doing nothing.
+    func peerSyncPartnerName(forSlot slot: Int) -> String? {
+        guard preset.dialSlots.indices.contains(slot), let peer else { return nil }
+        let name = Self.syncKey(dial(at: slot).name)
+        guard !name.isEmpty else { return nil }
+
+        guard let index = peer.preset.dialSlots.indices.first(where: {
+            peer.preset.dialSlots[$0].syncsAcrossSurfaces
+                && Self.syncKey(peer.dial(at: $0).name) == name
+        }) else { return nil }
+
+        return peer.dial(at: index).name
     }
 
     /// Appends a new dial+fader slot (iPad only, in practice — see
@@ -434,7 +527,14 @@ final class AppState: ObservableObject {
             preset.xyPad.perpToVelocity.toggle()
 
         case .setRootNote, .setScale, .setFixedVelocity,
-             .setVoiceCount, .setNoteRange:
+             .setVoiceCount, .setNoteRange,
+             // The pad-surface actions belong to exactly the same category:
+             // they state what the pad IS while the step is selected, and
+             // writing them here would overwrite the preset's own mode, axis
+             // CCs and corner assignments the first time the dial turned —
+             // the same failure that once destroyed the preset's scale.
+             .setPadMode, .setXAxisCC, .setYAxisCC, .setSpringTarget,
+             .setMorphCornerCC, .setMorphChannel, .setMorphSpring:
             // DECLARATIVE, exactly like `.setFaderCC` below. These describe
             // what the pad looks like while their step is selected;
             // `refreshPadOverrides()` reads them off the step instead of
@@ -457,7 +557,7 @@ final class AppState: ObservableObject {
     /// Every CC this preset assigns, resolved through the dial library so
     /// linked dials report the numbers they actually send.
     var ccAssignments: [CCAssignment] {
-        preset.ccAssignments(dialLibrary: dialLibrary)
+        preset.ccAssignments(dialLibrary: dialLibrary, surface: surface)
     }
 
     /// Write a new number into whichever place the slot names.
@@ -499,7 +599,15 @@ final class AppState: ObservableObject {
                 emitButton(preset.buttons[i], on: false)
                 clearButtonLatch(id)
             }
-            preset.buttons[i].cc = cc
+            // The map's number field edits whichever number the button is
+            // actually using. Writing `cc` while the button is sending notes
+            // would change a number that isn't on the wire, and the row —
+            // which shows the note — would not move.
+            if preset.buttons[i].message == .note {
+                preset.buttons[i].note = min(max(cc, 0), 127)
+            } else {
+                preset.buttons[i].cc = cc
+            }
 
         case .dialSend(let slotIndex, let stepIndex, let actionIndex):
             updateDial(at: slotIndex) { dial in
@@ -664,6 +772,108 @@ final class AppState: ObservableObject {
     /// Deliberately NOT debounced or queued. Tapping several in a row sends
     /// several sweeps, which is what you want when teaching a host one
     /// control after another.
+    /// Adds a button to the preset and returns its id.
+    ///
+    /// Lives here rather than in a view because two places now create
+    /// buttons — the editor list and the CC map — and the free-number rule
+    /// is the part that must not drift between them. Duplicating it is how
+    /// one call site ends up avoiding only other buttons and lands a new
+    /// button on a drawbar.
+    @discardableResult
+    func addButton(named name: String = "NEW") -> UUID {
+        let button = ButtonMapping(
+            name: name,
+            // Avoids every CC the preset assigns — drawbars, morph corners,
+            // dial steps and motion included — not just other buttons.
+            cc: firstFreeCC()
+                ?? MIDIDefaults.firstFreeButtonCC(avoiding: preset.usedButtonCCs)
+        )
+        preset.buttons.append(button)
+        return button.id
+    }
+
+    /// Switch a button between CC and note.
+    ///
+    /// Buttons only. Every other row in the map has one kind of message by
+    /// nature — a drawbar is a CC, full stop — so there is nothing to switch.
+    ///
+    /// The two numbers are kept separately on the button, so flipping to
+    /// note and back returns the CC you had rather than a default. CC 24 and
+    /// note 24 are unrelated messages; carrying one number across would pick
+    /// a note out of the air.
+    func setButtonMessage(_ slot: CCSlot, to message: ButtonMessage) {
+        guard case .button(let id) = slot,
+              let i = preset.buttons.firstIndex(where: { $0.id == id }),
+              preset.buttons[i].message != message
+        else { return }
+
+        // A latched button has to release on the OLD message type before it
+        // changes, or the off never arrives in the form the receiver is
+        // listening for and the note or controller is left hanging.
+        if isButtonLatched(id) {
+            emitButton(preset.buttons[i], on: false)
+            clearButtonLatch(id)
+        }
+
+        preset.buttons[i].message = message
+    }
+
+    /// Switch a button between reporting its own state and the host's.
+    func setButtonLight(_ slot: CCSlot, to light: ButtonLight) {
+        guard case .button(let id) = slot,
+              let i = preset.buttons.firstIndex(where: { $0.id == id }),
+              preset.buttons[i].light != light
+        else { return }
+
+        if light == .local {
+            clearHostLit(id)
+        } else if isButtonLatched(id) {
+            // Same reasoning as the editor's picker: a latch left set while
+            // the button claims to report the host would show it lit on this
+            // app's say-so.
+            emitButton(preset.buttons[i], on: false)
+            clearButtonLatch(id)
+        }
+
+        preset.buttons[i].light = light
+    }
+
+    /// Change how a button's press behaves.
+    ///
+    /// Switching away from `.toggle` releases a latch first. A latched button
+    /// whose behavior changed underneath it would keep its lit state with no
+    /// way left to send the off — the next press would be a fresh momentary
+    /// or tap, and whatever it turned on in the host would stay on.
+    func setButtonBehavior(_ slot: CCSlot, to behavior: ButtonBehavior) {
+        guard case .button(let id) = slot,
+              let i = preset.buttons.firstIndex(where: { $0.id == id }),
+              preset.buttons[i].behavior != behavior
+        else { return }
+
+        if isButtonLatched(id) {
+            emitButton(preset.buttons[i], on: false)
+            clearButtonLatch(id)
+        }
+
+        preset.buttons[i].behavior = behavior
+    }
+
+    /// Plays a short note so a host can learn it.
+    ///
+    /// The CC sweep is meaningless for a note-mode button: a host waiting to
+    /// learn a note hears nothing from a stream of controller values. This
+    /// sends the note on and off instead, which is what a press would do.
+    func sendNoteForLearn(note: Int, channel: Int) {
+        let ch = min(max(channel, 0), 15)
+        let n = min(max(note, 0), 127)
+
+        midi.noteOn(n, velocity: 100, channel: ch)
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            self.midi.noteOff(n, channel: ch)
+        }
+    }
+
     func sendForLearn(cc: Int, channel: Int, rest: Int) {
         let ch = min(max(channel, 0), 15)
         let restValue = min(max(rest, 0), 127)
@@ -742,8 +952,11 @@ final class AppState: ObservableObject {
     func firstFreeCC() -> Int? {
         // Only numbers taken on the DEFAULT channel block a new assignment;
         // the same number on another channel is not a conflict.
+        // Note rows are excluded. They now appear in `ccAssignments` so the
+        // map can list them, but their number is a note — counting it here
+        // would reserve a CC that nothing is actually sending.
         let taken = Set(ccAssignments
-            .filter { $0.channel == MIDIDefaults.channel }
+            .filter { $0.channel == MIDIDefaults.channel && !$0.isNote }
             .map(\.cc))
         let preferred = [9, 14, 15, 3] + Array(20...31)
                         + Array(85...90) + Array(102...119)
@@ -891,6 +1104,18 @@ final class AppState: ObservableObject {
                 case .setFixedVelocity(let v):  next.fixedVelocity = v
                 case .setVoiceCount(let n):     next.voiceCount = n
                 case .setNoteRange(let r):      next.rangeSemitones = r
+                case .setPadMode(let m):        next.surfaceMode = m
+                case .setXAxisCC(let cc, let ch):
+                    next.xCC = cc
+                    next.standardChannel = ch
+                case .setYAxisCC(let cc, let ch):
+                    next.yCC = cc
+                    next.standardChannel = ch
+                case .setSpringTarget(let t):   next.springTarget = t
+                case .setMorphCornerCC(let corner, let cc):
+                    next.morphCornerCCs[corner] = cc
+                case .setMorphChannel(let ch):  next.morphChannel = ch
+                case .setMorphSpring(let t):    next.morphSpringTarget = t
                 default:                        break
                 }
             }
@@ -983,6 +1208,65 @@ final class AppState: ObservableObject {
     /// here can transmit.
     func handleIncomingCC(channel: Int, cc: Int, value: Int) {
         faderValueCache[CCKey(channel: channel, cc: cc)] = min(max(value, 0), 127)
+
+        // Anything at or above halfway counts as on. Hosts are inconsistent
+        // about the exact number — 127, 100, 64 all appear in the wild — so
+        // matching on the button's own onValue would leave a button dark
+        // whenever the host echoed a value it chose rather than the one we
+        // sent.
+        applyFeedback(message: .cc, number: cc, channel: channel, on: value >= 64)
+    }
+
+    /// Incoming notes, for buttons in note mode that follow host state.
+    func handleIncomingNote(channel: Int, note: Int, on: Bool) {
+        applyFeedback(message: .note, number: note, channel: channel, on: on)
+    }
+
+    /// Light or unlight every button that follows the host and matches this
+    /// message.
+    ///
+    /// Matching is on the button's OWN number and channel, which is the pair
+    /// it already sends on. A looper echoing a clip's state back on the same
+    /// controller it accepts is the common case, and it means the feature
+    /// needs no second mapping to maintain — get the send right and the
+    /// light follows.
+    private func applyFeedback(message: ButtonMessage,
+                               number: Int,
+                               channel: Int,
+                               on: Bool) {
+        for button in preset.buttons
+        where button.light == .host
+            && button.message == message
+            && button.channel == channel
+            && (message == .cc ? button.cc : button.note) == number {
+
+            if on {
+                hostLitButtons.insert(button.id)
+            } else {
+                hostLitButtons.remove(button.id)
+            }
+        }
+    }
+
+    /// Buttons the host currently reports as on.
+    ///
+    /// Kept apart from `latchedButtons` rather than reusing it: a latch is
+    /// something this app decided and can undo, while this is a report about
+    /// somewhere else. Merging them would let a press quietly overwrite what
+    /// the host said, which is the exact failure this feature exists to fix.
+    @Published private(set) var hostLitButtons: Set<UUID> = []
+
+    /// Forget the host's report for one button.
+    func clearHostLit(_ id: UUID) {
+        hostLitButtons.remove(id)
+    }
+
+    /// Whether a button should appear lit, whatever the reason.
+    func buttonIsLit(_ button: ButtonMapping) -> Bool {
+        switch button.light {
+        case .local: return latchedButtons.contains(button.id)
+        case .host:  return hostLitButtons.contains(button.id)
+        }
     }
 
     // MARK: - Dial library management

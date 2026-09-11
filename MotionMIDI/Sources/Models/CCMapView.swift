@@ -9,8 +9,33 @@ import SwiftUI
 /// see the holes. Sorting by owner buries the holes; sorting by number
 /// scatters each feature across the list.
 struct CCMapView: View {
-    @EnvironmentObject var app: AppState
+    @EnvironmentObject private var ownSurface: AppState
+
+    var body: some View {
+        // Both surfaces are handed in as observed objects so the map redraws
+        // when either changes. When only one is running, the peer slot is
+        // filled with the same object — one code path instead of two, and
+        // the selector simply doesn't appear.
+        CCMapBody(app: ownSurface, peer: ownSurface.peer ?? ownSurface)
+    }
+}
+
+private struct CCMapBody: View {
+    @ObservedObject var app: AppState
+    @ObservedObject var peer: AppState
     @Environment(\.dismiss) private var dismiss
+
+    @AppStorage("MotionMIDIPro.dualSurface") private var dualSurface = false
+
+    /// Which surface the list is showing and editing.
+    @State private var viewingPeer = false
+
+    /// True when there genuinely is a second surface on screen.
+    private var hasPeer: Bool { dualSurface && peer !== app && isPadIdiom }
+
+    /// The surface being edited. Every setter goes through this, so
+    /// switching the selector switches what the wheels and menus write to.
+    private var target: AppState { viewingPeer ? peer : app }
 
     enum Mode: String, CaseIterable, Identifiable {
         case owner  = "By Owner"
@@ -30,12 +55,46 @@ struct CCMapView: View {
     /// about confirming exactly that.
     @State private var justSent: CCSlot? = nil
 
-    private var rows: [CCAssignment] { app.ccAssignments }
-    private var conflicts: Set<CCSlot> { Preset.conflictingSlots(in: rows) }
+    /// The rows on screen — the selected surface only.
+    private var rows: [CCAssignment] { target.ccAssignments }
+
+    /// Every row from BOTH surfaces, for conflict detection.
+    ///
+    /// The two surfaces share one MIDI port, so a CC sent by one lands in
+    /// the same place as the same CC sent by the other. Checking a surface
+    /// against itself alone would call a real collision clean.
+    private var allRows: [CCAssignment] {
+        guard hasPeer else { return rows }
+        return app.ccAssignments + peer.ccAssignments
+    }
+
+    /// Section ids currently folded away.
+    ///
+    /// Keyed on the group's id string rather than the group itself so a dial
+    /// keeps its collapsed state when an unrelated dial is added or removed
+    /// and the section order shifts underneath it.
+    @State private var collapsedGroups: Set<String> = []
+    private var conflicts: Set<CCSlotRef> { Preset.conflictingSlots(in: allRows) }
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
+                if hasPeer {
+                    // Ordered by surface index, NOT by which one is local.
+                    // Opening the map from the right-hand surface makes
+                    // `app` the right one, and listing it first would put
+                    // "Right" on the left of the control.
+                    Picker("Surface", selection: $viewingPeer) {
+                        // tag is "am I the peer?", which flips depending on
+                        // which surface opened the map.
+                        Text(surfaceName(leftSurface)).tag(leftSurface === peer)
+                        Text(surfaceName(rightSurface)).tag(rightSurface === peer)
+                    }
+                    .pickerStyle(.segmented)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 8)
+                }
+
                 Picker("View", selection: $mode) {
                     ForEach(Mode.allCases) { Text($0.rawValue).tag($0) }
                 }
@@ -110,31 +169,111 @@ struct CCMapView: View {
             ForEach(orderedGroups, id: \.id) { group in
                 let groupRows = rows.filter { $0.group == group }
                 if !groupRows.isEmpty {
+                    let isCollapsed = collapsedGroups.contains(group.id)
+
                     Section {
-                        if case .dial = group {
-                            // One row per STEP, not per action. A step is
-                            // named once and can carry both a Send and a
-                            // Fader, so two rows sharing one name field was
-                            // always going to look like a duplicate — and
-                            // was, since both wrote the same DialStep.label.
-                            ForEach(stepGroups(in: groupRows), id: \.key) { step in
-                                dialStepRow(step.rows)
-                                    .listRowBackground(Theme.panel2)
+                        if !isCollapsed {
+                            if case .dial = group {
+                                // One row per STEP, not per action. A step is
+                                // named once and can carry both a Send and a
+                                // Fader, so two rows sharing one name field was
+                                // always going to look like a duplicate — and
+                                // was, since both wrote the same DialStep.label.
+                                ForEach(stepGroups(in: groupRows), id: \.key) { step in
+                                    dialStepRow(step.rows)
+                                        .listRowBackground(Theme.panel2)
+                                }
+                            } else {
+                                ForEach(groupRows) { row in
+                                    assignmentRow(row)
+                                        .listRowBackground(Theme.panel2)
+                                }
                             }
-                        } else {
-                            ForEach(groupRows) { row in
-                                assignmentRow(row)
+
+                            if group == .buttons {
+                                addButtonRow
                                     .listRowBackground(Theme.panel2)
                             }
                         }
                     } header: {
-                        Label(group.title, systemImage: group.symbol)
+                        sectionHeader(group,
+                                      rowCount: groupRows.count,
+                                      collapsed: isCollapsed)
                     }
                 }
             }
         }
         .scrollContentBackground(.hidden)
         .listStyle(.insetGrouped)
+    }
+
+    /// Tappable header that folds its section away.
+    ///
+    /// A collapsed section still reports how many rows it holds and whether
+    /// any of them conflict — folding a section must not hide a problem, or
+    /// the badge on the way in would count something you cannot find.
+    private func sectionHeader(_ group: CCGroup,
+                               rowCount: Int,
+                               collapsed: Bool) -> some View {
+        let conflicted = rows.filter {
+            $0.group == group && conflicts.contains($0.ref)
+        }.count
+
+        return Button {
+            withAnimation(.easeInOut(duration: 0.18)) {
+                if collapsed {
+                    collapsedGroups.remove(group.id)
+                } else {
+                    collapsedGroups.insert(group.id)
+                }
+            }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10, weight: .bold))
+                    .rotationEffect(.degrees(collapsed ? 0 : 90))
+                    .foregroundColor(Theme.dim)
+
+                Label(group.title, systemImage: group.symbol)
+
+                Spacer(minLength: 4)
+
+                if conflicted > 0 {
+                    Text("\(conflicted)")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(Capsule().fill(Theme.danger))
+                }
+
+                if collapsed {
+                    Text("\(rowCount)")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(Theme.dim)
+                        .monospacedDigit()
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// Adds a button without leaving the map.
+    ///
+    /// Sits inside the Buttons section rather than in a toolbar, so it adds
+    /// to the thing it is next to. The new button takes the first free CC by
+    /// the same rule the editor uses — they share one helper on AppState, so
+    /// the two cannot drift apart.
+    private var addButtonRow: some View {
+        Button {
+            target.addButton()
+        } label: {
+            Label("Add Button", systemImage: "plus.circle.fill")
+                .font(.system(size: 14, weight: .medium))
+                .foregroundColor(Theme.accent)
+        }
+        .buttonStyle(.plain)
     }
 
     /// Sections in a stable order, with each dial getting its own.
@@ -195,7 +334,7 @@ struct CCMapView: View {
         // Any row of the step will do for the name — they all read and write
         // the same label.
         let lead = rows[0]
-        let conflicted = rows.filter { conflicts.contains($0.slot) }
+        let conflicted = rows.filter { conflicts.contains($0.ref) }
         let openRow = rows.first { editing == $0.slot }
 
         return VStack(alignment: .leading, spacing: 6) {
@@ -203,7 +342,7 @@ struct CCMapView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     TextField(lead.defaultName, text: Binding(
                         get: { lead.storedName },
-                        set: { app.setName(lead.slot, to: $0) }
+                        set: { target.setName(lead.slot, to: $0) }
                     ))
                     .font(.system(size: 14, weight: .medium))
                     .foregroundColor(lead.isActive ? .white.opacity(0.9) : Theme.dim)
@@ -234,7 +373,7 @@ struct CCMapView: View {
                             editing = (editing == row.slot) ? nil : row.slot
                         } label: {
                             valueChip(row,
-                                      conflicted: conflicts.contains(row.slot),
+                                      conflicted: conflicts.contains(row.ref),
                                       open: editing == row.slot)
                         }
                         .buttonStyle(.plain)
@@ -252,7 +391,7 @@ struct CCMapView: View {
     }
 
     private func assignmentRow(_ row: CCAssignment) -> some View {
-        let isConflicted = conflicts.contains(row.slot)
+        let isConflicted = conflicts.contains(row.ref)
         let isOpen = editing == row.slot
 
         return VStack(alignment: .leading, spacing: 6) {
@@ -267,7 +406,7 @@ struct CCMapView: View {
                         // the whole step.
                         TextField(row.defaultName, text: Binding(
                             get: { row.storedName },
-                            set: { app.setName(row.slot, to: $0) }
+                            set: { target.setName(row.slot, to: $0) }
                         ))
                         .font(.system(size: 14, weight: .medium))
                         .foregroundColor(row.isActive ? .white.opacity(0.9) : Theme.dim)
@@ -280,6 +419,16 @@ struct CCMapView: View {
                     }
 
                     HStack(spacing: 6) {
+                        if let info = row.button {
+                            // Choosable on the row itself, not behind the
+                            // number editor. Message type and behavior are
+                            // what you come to a button row to change; making
+                            // them a caption you had to open a wheel sheet to
+                            // reach put them further away than the numbers.
+                            messageMenu(for: row, info: info)
+                            behaviorMenu(for: row, info: info)
+                            lightMenu(for: row, info: info)
+                        }
                         if !row.isActive {
                             // Reserved-but-idle needs saying outright,
                             // otherwise the number looks free.
@@ -342,7 +491,13 @@ struct CCMapView: View {
 
         return Button {
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
-            app.sendForLearn(cc: row.cc, channel: row.channel, rest: row.restValue)
+            // A note row has to be taught with a note. A CC sweep would
+            // teach the host nothing — it is listening for note on/off.
+            if row.isNote {
+                target.sendNoteForLearn(note: row.cc, channel: row.channel)
+            } else {
+                target.sendForLearn(cc: row.cc, channel: row.channel, rest: row.restValue)
+            }
 
             justSent = row.slot
             Task { @MainActor in
@@ -366,7 +521,7 @@ struct CCMapView: View {
                 )
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Send CC \(row.cc) for MIDI learn")
+        .accessibilityLabel("Send \(row.numberLabel) for MIDI learn")
     }
 
     /// The CC/CH chip used by EVERY row.
@@ -387,13 +542,17 @@ struct CCMapView: View {
             }
 
             VStack(spacing: 0) {
-                Text("CC").font(.system(size: 8, weight: .semibold))
+                // "NOTE" rather than "CC" when the button sends notes —
+                // the number alone would read as a CC and mean the wrong
+                // thing entirely.
+                Text(row.isNote ? "NOTE" : "CC")
+                    .font(.system(size: 8, weight: .semibold))
                     .foregroundColor(Theme.dim)
                 Text("\(row.cc)")
                     .font(.system(size: 15, weight: .bold, design: .rounded))
                     .monospacedDigit()
             }
-            .frame(minWidth: 30)
+            .frame(minWidth: 34)
 
             Divider().frame(height: 20)
 
@@ -427,18 +586,103 @@ struct CCMapView: View {
     /// tap through — a flick covers the range, and the wheel keeps spinning
     /// so a long move costs one gesture instead of a hundred.
     private func wheelPair(for row: CCAssignment) -> some View {
+        VStack(spacing: 10) {
+            wheels(for: row)
+        }
+        .padding(.top, 2)
+    }
+
+    /// CC or Note, chosen from the row.
+    private func messageMenu(for row: CCAssignment, info: ButtonRowInfo) -> some View {
+        Menu {
+            Picker("Message", selection: Binding(
+                get: { info.message },
+                set: { target.setButtonMessage(row.slot, to: $0) }
+            )) {
+                ForEach(ButtonMessage.allCases) { message in
+                    Text(message.label).tag(message)
+                }
+            }
+        } label: {
+            pill(info.message.label.uppercased())
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// Momentary, Tap or Toggle, chosen from the row.
+    private func behaviorMenu(for row: CCAssignment, info: ButtonRowInfo) -> some View {
+        Menu {
+            Picker("Behavior", selection: Binding(
+                get: { info.behavior },
+                set: { target.setButtonBehavior(row.slot, to: $0) }
+            )) {
+                ForEach(ButtonBehavior.allCases) { behavior in
+                    Text(behavior.label).tag(behavior)
+                }
+            }
+        } label: {
+            pill(info.behavior.label.uppercased())
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// Own state or host feedback, chosen from the row.
+    private func lightMenu(for row: CCAssignment, info: ButtonRowInfo) -> some View {
+        Menu {
+            Picker("Lit From", selection: Binding(
+                get: { info.light },
+                set: { target.setButtonLight(row.slot, to: $0) }
+            )) {
+                ForEach(ButtonLight.allCases) { light in
+                    Text(light.label).tag(light)
+                }
+            }
+        } label: {
+            pill(info.light == .host ? "HOST" : "OWN")
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// Small tappable label. Bordered rather than bare text, so it reads as
+    /// a control instead of a caption — the difference between seeing the
+    /// behavior and knowing you can change it.
+    private func pill(_ text: String) -> some View {
+        HStack(spacing: 3) {
+            Text(text)
+                .font(.system(size: 9, weight: .bold))
+            Image(systemName: "chevron.down")
+                .font(.system(size: 6, weight: .bold))
+        }
+        .foregroundColor(Theme.accent)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 3)
+        .background(
+            RoundedRectangle(cornerRadius: 5)
+                .fill(Theme.accent.opacity(0.12))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 5)
+                .strokeBorder(Theme.accent.opacity(0.35), lineWidth: 1)
+        )
+    }
+
+    private func wheels(for row: CCAssignment) -> some View {
         HStack(spacing: 12) {
             VStack(spacing: 2) {
-                Text("CC Number")
+                Text(row.isNote ? "Note Number" : "CC Number")
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundColor(Theme.dim)
 
-                Picker("CC", selection: Binding(
+                Picker(row.isNote ? "Note" : "CC", selection: Binding(
                     get: { row.cc },
-                    set: { app.setCC(row.slot, to: $0) }
+                    set: { target.setCC(row.slot, to: $0) }
                 )) {
                     ForEach(0...127, id: \.self) { n in
-                        Text("\(n)")
+                        // Note rows get the name too. "60" is a number you
+                        // have to translate; "C3 · 60" is the one you can
+                        // check against the part you are playing.
+                        // MIDIWheelText.note already appends the number.
+                        Text(row.isNote ? MIDIWheelText.note(n) : "\(n)")
                             .font(.system(size: 16, weight: .semibold, design: .rounded))
                             .monospacedDigit()
                             .tag(n)
@@ -456,7 +700,7 @@ struct CCMapView: View {
 
                 Picker("Channel", selection: Binding(
                     get: { row.channel },
-                    set: { app.setChannel(row.slot, to: $0) }
+                    set: { target.setChannel(row.slot, to: $0) }
                 )) {
                     ForEach(0...15, id: \.self) { c in
                         Text("\(c + 1)")
@@ -470,21 +714,51 @@ struct CCMapView: View {
                 .clipped()
             }
         }
-        .padding(.top, 2)
+    }
+
+    private var leftSurface: AppState { app.surface == 0 ? app : peer }
+    private var rightSurface: AppState { app.surface == 0 ? peer : app }
+
+    /// Short tag for the surface you are NOT looking at.
+    private var otherSurfaceLabel: String {
+        (viewingPeer ? app.surface : peer.surface) == 0 ? "Left:" : "Right:"
+    }
+
+    /// "Left" and "Right" rather than "A" and "B", because that is where
+    /// they are on screen. The preset name comes along so the row says which
+    /// rig you are looking at, not just which half of the glass.
+    private func surfaceName(_ state: AppState) -> String {
+        let side = state.surface == 0 ? "Left" : "Right"
+        let name = state.preset.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? side : "\(side) · \(name)"
     }
 
     /// Names the other owner rather than just flagging a clash, so the fix
     /// doesn't require hunting the rest of the list to find who you are
     /// fighting with.
     private func conflictText(for row: CCAssignment) -> String {
-        let others = rows.filter {
-            $0.cc == row.cc && $0.channel == row.channel
-                && $0.slot != row.slot && conflicts.contains($0.slot)
+        // Searches BOTH surfaces. A row whose only opponent is on the other
+        // surface would otherwise show a conflict badge with no explanation
+        // — the list it was searching does not contain the culprit.
+        let others = allRows.filter {
+            // isNote has to match, exactly as in conflictingSlots. Without
+            // it a note row would name a CC row on the same number as its
+            // opponent, when the two never collide in the first place.
+            $0.isNote == row.isNote
+                && $0.cc == row.cc && $0.channel == row.channel
+                && $0.ref != row.ref && conflicts.contains($0.ref)
         }
         guard let first = others.first else { return "conflict" }
+
+        // Named when it is on the other surface. "also Drawbar 3" sends you
+        // hunting through a list that does not contain it.
+        let name = first.surface == row.surface
+            ? first.displayName
+            : "\(otherSurfaceLabel) \(first.displayName)"
+
         return others.count == 1
-            ? "also \(first.displayName)"
-            : "also \(first.displayName) +\(others.count - 1)"
+            ? "also \(name)"
+            : "also \(name) +\(others.count - 1)"
     }
 
     // MARK: - By number
@@ -519,7 +793,10 @@ struct CCMapView: View {
     }
 
     private var numberSections: [NumberSection] {
-        let byNumber = Dictionary(grouping: rows, by: \.cc)
+        // Note rows carry a note number, not a CC, so they have no place on
+        // a 0-127 CC chart — listing them would claim a CC is spoken for
+        // when it is still free.
+        let byNumber = Dictionary(grouping: rows.filter { !$0.isNote }, by: \.cc)
         var sections: [NumberSection] = []
         var runStart: Int? = nil
 
@@ -545,7 +822,7 @@ struct CCMapView: View {
     }
 
     private func numberRow(_ section: NumberSection) -> some View {
-        let clash = section.owners.contains { conflicts.contains($0.slot) }
+        let clash = section.owners.contains { conflicts.contains($0.ref) }
 
         return HStack(alignment: .top, spacing: 12) {
             Text("\(section.start)")

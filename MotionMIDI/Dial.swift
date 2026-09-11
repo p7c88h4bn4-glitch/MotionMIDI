@@ -41,6 +41,31 @@ enum DialAction: Equatable {
     /// feedback for this CC has arrived during this session.
     case setFaderCC(cc: Int, defaultValue: Int, channel: Int)
 
+    // ── Pad surface ─────────────────────────────────────────────────────
+    /// Switch the pad between Standard, Morph, Notes and Drawbars.
+    ///
+    /// Takes the four-way surface mode rather than `CCPadMode`, which has no
+    /// case for Notes — notes live in a separate `mode` field. An action
+    /// carrying only `CCPadMode` could never select Notes, which is half the
+    /// reason to want this.
+    case setPadMode(XYSurfaceMode)
+
+    // ── Standard XY ─────────────────────────────────────────────────────
+    /// Retarget the X axis while this step is selected.
+    case setXAxisCC(cc: Int, channel: Int)
+    /// Retarget the Y axis while this step is selected.
+    case setYAxisCC(cc: Int, channel: Int)
+    /// Where the puck springs to on release, in standard mode.
+    case setSpringTarget(SpringTarget)
+
+    // ── Morph ───────────────────────────────────────────────────────────
+    /// Retarget one morph corner. `corner` is 0-3 for A-D.
+    case setMorphCornerCC(corner: Int, cc: Int)
+    /// Set the channel for all four corners at once.
+    case setMorphChannel(Int)
+    /// Where the blend lands on release, in morph mode.
+    case setMorphSpring(MorphSpringTarget)
+
     /// Sentinel written by the decoder when an old preset said "inherit the
     /// dial's channel". `DialPreset.init(from:)` replaces every one of these
     /// with the dial's actual channel as soon as it is known, so a value
@@ -66,6 +91,20 @@ enum DialAction: Equatable {
             return "Velocity → \(v)"
         case .setVoiceCount(let n):
             return "Voices → \(n)"
+        case .setPadMode(let m):
+            return "Pad → \(m.longLabel)"
+        case .setXAxisCC(let cc, let channel):
+            return "X → CC\(cc) ch\(channel + 1)"
+        case .setYAxisCC(let cc, let channel):
+            return "Y → CC\(cc) ch\(channel + 1)"
+        case .setSpringTarget(let t):
+            return "Release → \(t.label)"
+        case .setMorphCornerCC(let corner, let cc):
+            return "Corner \(["A", "B", "C", "D"][min(max(corner, 0), 3)]) → CC\(cc)"
+        case .setMorphChannel(let channel):
+            return "Morph ch\(channel + 1)"
+        case .setMorphSpring(let t):
+            return "Morph release → \(t.label)"
         case .setNoteRange(let r):
             return "Range → \(r)s"
         case .setFaderCC(let cc, _, let channel):
@@ -128,6 +167,16 @@ extension DialAction: Codable {
         case sendCC, sendProgramChange, setRootNote, setScale
         case toggleGlide, togglePerpVelocity, setFixedVelocity
         case setVoiceCount, setNoteRange, setFaderCC
+        case setPadMode, setXAxisCC, setYAxisCC, setSpringTarget
+        case setMorphCornerCC, setMorphChannel, setMorphSpring
+    }
+
+    private enum AxisKeys: String, CodingKey {
+        case cc, channel
+    }
+
+    private enum CornerKeys: String, CodingKey {
+        case corner, cc
     }
 
     private enum SendCCKeys: String, CodingKey {
@@ -213,6 +262,43 @@ extension DialAction: Codable {
 
         case .togglePerpVelocity:
             self = .togglePerpVelocity
+
+        case .setPadMode:
+            let n = try c.nestedContainer(keyedBy: SingleKeys.self, forKey: .setPadMode)
+            self = .setPadMode(try n.decodeIfPresent(XYSurfaceMode.self, forKey: ._0) ?? .standard)
+
+        case .setXAxisCC:
+            let n = try c.nestedContainer(keyedBy: AxisKeys.self, forKey: .setXAxisCC)
+            self = .setXAxisCC(
+                cc: try n.decodeIfPresent(Int.self, forKey: .cc) ?? MIDIDefaults.xyXCC,
+                channel: try n.decodeIfPresent(Int.self, forKey: .channel) ?? MIDIDefaults.channel
+            )
+
+        case .setYAxisCC:
+            let n = try c.nestedContainer(keyedBy: AxisKeys.self, forKey: .setYAxisCC)
+            self = .setYAxisCC(
+                cc: try n.decodeIfPresent(Int.self, forKey: .cc) ?? MIDIDefaults.xyYCC,
+                channel: try n.decodeIfPresent(Int.self, forKey: .channel) ?? MIDIDefaults.channel
+            )
+
+        case .setSpringTarget:
+            let n = try c.nestedContainer(keyedBy: SingleKeys.self, forKey: .setSpringTarget)
+            self = .setSpringTarget(try n.decodeIfPresent(SpringTarget.self, forKey: ._0) ?? .center)
+
+        case .setMorphCornerCC:
+            let n = try c.nestedContainer(keyedBy: CornerKeys.self, forKey: .setMorphCornerCC)
+            self = .setMorphCornerCC(
+                corner: try n.decodeIfPresent(Int.self, forKey: .corner) ?? 0,
+                cc: try n.decodeIfPresent(Int.self, forKey: .cc) ?? MIDIDefaults.morphCornerCCs[0]
+            )
+
+        case .setMorphChannel:
+            let n = try c.nestedContainer(keyedBy: SingleKeys.self, forKey: .setMorphChannel)
+            self = .setMorphChannel(try n.decodeIfPresent(Int.self, forKey: ._0) ?? MIDIDefaults.channel)
+
+        case .setMorphSpring:
+            let n = try c.nestedContainer(keyedBy: SingleKeys.self, forKey: .setMorphSpring)
+            self = .setMorphSpring(try n.decodeIfPresent(MorphSpringTarget.self, forKey: ._0) ?? .center)
         }
     }
 
@@ -279,6 +365,37 @@ extension DialAction: Codable {
 
         case .togglePerpVelocity:
             _ = c.nestedContainer(keyedBy: EmptyKeys.self, forKey: .togglePerpVelocity)
+
+        case .setPadMode(let v):
+            var n = c.nestedContainer(keyedBy: SingleKeys.self, forKey: .setPadMode)
+            try n.encode(v, forKey: ._0)
+
+        case .setXAxisCC(let cc, let channel):
+            var n = c.nestedContainer(keyedBy: AxisKeys.self, forKey: .setXAxisCC)
+            try n.encode(cc, forKey: .cc)
+            try n.encode(channel, forKey: .channel)
+
+        case .setYAxisCC(let cc, let channel):
+            var n = c.nestedContainer(keyedBy: AxisKeys.self, forKey: .setYAxisCC)
+            try n.encode(cc, forKey: .cc)
+            try n.encode(channel, forKey: .channel)
+
+        case .setSpringTarget(let v):
+            var n = c.nestedContainer(keyedBy: SingleKeys.self, forKey: .setSpringTarget)
+            try n.encode(v, forKey: ._0)
+
+        case .setMorphCornerCC(let corner, let cc):
+            var n = c.nestedContainer(keyedBy: CornerKeys.self, forKey: .setMorphCornerCC)
+            try n.encode(corner, forKey: .corner)
+            try n.encode(cc, forKey: .cc)
+
+        case .setMorphChannel(let v):
+            var n = c.nestedContainer(keyedBy: SingleKeys.self, forKey: .setMorphChannel)
+            try n.encode(v, forKey: ._0)
+
+        case .setMorphSpring(let v):
+            var n = c.nestedContainer(keyedBy: SingleKeys.self, forKey: .setMorphSpring)
+            try n.encode(v, forKey: ._0)
         }
     }
 }
@@ -289,6 +406,8 @@ extension DialAction: Codable {
 /// simple type picker and then per-type parameter controls.
 enum DialActionKind: String, CaseIterable, Identifiable {
     case cc, faderCC, programChange, rootNote, scale, glide, perpVelocity, fixedVelocity, voiceCount, noteRange
+    case padMode, xAxisCC, yAxisCC, springTarget
+    case morphCornerCC, morphChannel, morphSpring
 
     var id: String { rawValue }
 
@@ -304,6 +423,13 @@ enum DialActionKind: String, CaseIterable, Identifiable {
         case .fixedVelocity: return "Set Velocity"
         case .voiceCount:    return "Voices"
         case .noteRange:     return "Note Range"
+        case .padMode:       return "Set Pad Mode"
+        case .xAxisCC:       return "Set X Axis CC"
+        case .yAxisCC:       return "Set Y Axis CC"
+        case .springTarget:  return "XY On Release"
+        case .morphCornerCC: return "Set Corner CC"
+        case .morphChannel:  return "Set Morph Channel"
+        case .morphSpring:   return "Morph On Release"
         }
     }
 
@@ -313,7 +439,9 @@ enum DialActionKind: String, CaseIterable, Identifiable {
         case .cc, .faderCC, .programChange:
             return .dialFader
         case .rootNote, .scale, .glide, .perpVelocity,
-             .fixedVelocity, .voiceCount, .noteRange:
+             .fixedVelocity, .voiceCount, .noteRange,
+             .padMode, .xAxisCC, .yAxisCC, .springTarget,
+             .morphCornerCC, .morphChannel, .morphSpring:
             return .padControl
         }
     }
@@ -341,7 +469,7 @@ enum DialActionGroup: String, CaseIterable, Identifiable {
     var footer: String {
         switch self {
         case .padControl:
-            return "Reshapes the XY pad when this step is selected — key, scale, range and voicing. Nothing is transmitted."
+            return "Reshapes the XY pad when this step is selected — mode, axis CCs, morph corners, key, scale, range and voicing. Nothing is transmitted."
         case .dialFader:
             return "Sends MIDI when this step is selected, and decides what the fader beside the dial drives. Each carries its own channel."
         }
@@ -366,6 +494,13 @@ extension DialAction {
         case .setVoiceCount:     return .voiceCount
         case .setNoteRange:      return .noteRange
         case .setFaderCC:        return .faderCC
+        case .setPadMode:        return .padMode
+        case .setXAxisCC:        return .xAxisCC
+        case .setYAxisCC:        return .yAxisCC
+        case .setSpringTarget:   return .springTarget
+        case .setMorphCornerCC:  return .morphCornerCC
+        case .setMorphChannel:   return .morphChannel
+        case .setMorphSpring:    return .morphSpring
         }
     }
 
@@ -404,6 +539,19 @@ extension DialAction {
         case .fixedVelocity: return .setFixedVelocity(100)
         case .voiceCount:    return .setVoiceCount(1)
         case .noteRange:     return .setNoteRange(24)
+        case .padMode:       return .setPadMode(.standard)
+        case .xAxisCC:
+            // The axes default to the numbers the pad already uses, so
+            // enabling the action and changing nothing is a no-op rather
+            // than a silent retarget to whatever number happened to be free.
+            return .setXAxisCC(cc: MIDIDefaults.xyXCC, channel: ch)
+        case .yAxisCC:
+            return .setYAxisCC(cc: MIDIDefaults.xyYCC, channel: ch)
+        case .springTarget:  return .setSpringTarget(.center)
+        case .morphCornerCC:
+            return .setMorphCornerCC(corner: 0, cc: MIDIDefaults.morphCornerCCs[0])
+        case .morphChannel:  return .setMorphChannel(ch)
+        case .morphSpring:   return .setMorphSpring(.center)
         }
     }
 
@@ -413,6 +561,13 @@ extension DialAction {
         switch self {
         case .sendCC(let cc, _, _):      return cc
         case .setFaderCC(let cc, _, _):  return cc
+        // These retarget the pad rather than sending, but they still put a
+        // number on the wire the moment the pad is touched — so the free-CC
+        // search has to see them, or a later step would hand out a number
+        // this one already aimed an axis at.
+        case .setXAxisCC(let cc, _):     return cc
+        case .setYAxisCC(let cc, _):     return cc
+        case .setMorphCornerCC(_, let cc): return cc
         default:                         return nil
         }
     }

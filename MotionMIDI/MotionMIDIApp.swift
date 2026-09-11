@@ -47,6 +47,13 @@ final class SharedEngines: ObservableObject {
         if let _surfaceB { return _surfaceB }
         let state = AppState(surface: 1, midi: midi, motion: motion)
         _surfaceB = state
+
+        // Wired both ways the moment the second surface exists, so the CC
+        // map on either side can see what the other is sending. They share
+        // one MIDI port, so a clash between them is a real clash.
+        state.peer = surfaceA
+        surfaceA.peer = state
+
         return state
     }
 

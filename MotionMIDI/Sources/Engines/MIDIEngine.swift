@@ -46,6 +46,18 @@ final class MIDIEngine: ObservableObject {
         controlChangeObservers.append(observer)
     }
 
+    /// Called on the MAIN queue for every incoming note:
+    /// (channel 0-15, note 0-127, isOn).
+    ///
+    /// A list for the same reason as the CC observers: one engine is shared
+    /// by every performer surface, so a single closure would mean whichever
+    /// surface registered last silently replaced the other's handler.
+    private var noteObservers: [(Int, Int, Bool) -> Void] = []
+
+    func addNoteObserver(_ observer: @escaping (Int, Int, Bool) -> Void) {
+        noteObservers.append(observer)
+    }
+
     private var client = MIDIClientRef()
     private var outPort = MIDIPortRef()
     private var inPort = MIDIPortRef()
@@ -146,17 +158,34 @@ final class MIDIEngine: ObservableObject {
         // Universal MIDI Packet, message type 2 = MIDI 1.0 channel voice.
         guard (word >> 28) & 0xF == 0x2 else { return }
         let statusByte = Int((word >> 16) & 0xFF)
-        guard statusByte & 0xF0 == 0xB0 else { return }   // Control Change only
 
         let channel = statusByte & 0x0F
-        let controller = Int((word >> 8) & 0x7F)
-        let value = Int(word & 0x7F)
+        let d1 = Int((word >> 8) & 0x7F)
+        let d2 = Int(word & 0x7F)
 
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            for observer in self.controlChangeObservers {
-                observer(channel, controller, value)
+        switch statusByte & 0xF0 {
+        case 0xB0:
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                for observer in self.controlChangeObservers {
+                    observer(channel, d1, d2)
+                }
             }
+
+        case 0x90, 0x80:
+            // Note On with velocity 0 is Note Off. Hosts differ on which
+            // they send, and a button tracking host state would stay lit
+            // forever if only the 0x80 form counted as "stopped".
+            let on = (statusByte & 0xF0) == 0x90 && d2 > 0
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                for observer in self.noteObservers {
+                    observer(channel, d1, on)
+                }
+            }
+
+        default:
+            return
         }
     }
 
