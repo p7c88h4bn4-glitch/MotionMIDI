@@ -3,7 +3,10 @@ import SwiftUI
 /// Bottom third: collapsible editor. Fully hidden during performance.
 struct EditorView: View {
     @EnvironmentObject var app: AppState
-    @State private var page: Page = .mappings
+    /// Opens on Settings. It is the page with the CC map, the destinations
+    /// and the layout switches — the things reached mid-setup — where
+    /// Mappings is somewhere you go deliberately.
+    @State private var page: Page = .settings
 
     /// The XY Pad page is deliberately absent. Everything it held now lives
     /// in the pad's own config sheet, reachable from the gear in the pad
@@ -101,9 +104,30 @@ struct MappingListView: View {
 struct ButtonListView: View {
     @EnvironmentObject var app: AppState
 
+    /// Edit mode is driven from here rather than by an `EditButton` in the
+    /// toolbar.
+    ///
+    /// This list sets `navigationBarHidden(true)` — it lives inside the
+    /// bottom-third editor panel, where a navigation bar would eat height
+    /// that belongs to the list. A toolbar item placed in the navigation bar
+    /// therefore has nowhere to render, which is why reordering was
+    /// unreachable even on iPad, despite the help text saying otherwise. The
+    /// toggle lives in a section header instead, which always renders.
+    @State private var editMode: EditMode = .inactive
+
     var body: some View {
         NavigationStack {
             List {
+                // First, because it is the switch you reach for mid-set when
+                // the pad needs the room. Stored on the preset like the other
+                // deck toggles, so a pad-only preset and a button-heavy one
+                // can sit side by side in the library.
+                Section {
+                    Toggle("Show Buttons on Deck", isOn: $app.preset.showButtons)
+                        .tint(Theme.accent)
+                        .listRowBackground(Theme.panel2)
+                }
+
                 Section {
                     ForEach(app.preset.buttons) { button in
                         NavigationLink {
@@ -115,6 +139,7 @@ struct ButtonListView: View {
                                 Text(button.summary)
                                     .font(.caption.monospaced())
                                     .foregroundColor(Theme.dim)
+
                             }
                         }
                         .listRowBackground(Theme.panel2)
@@ -125,28 +150,44 @@ struct ButtonListView: View {
                     .onDelete { offsets in
                         app.preset.buttons.remove(atOffsets: offsets)
                     }
-                }
-
-                if isPadIdiom {
-                    Section {
-                        Button {
-                            app.addButton()
-                        } label: {
-                            Label("Add Button", systemImage: "plus.circle.fill")
-                                .foregroundColor(Theme.accent)
+                } header: {
+                    // The reorder toggle lives in the HEADER, not in a row.
+                    // A plain Button inside a list row can stop responding
+                    // once the list enters edit mode, which would leave no
+                    // way back out of reordering. A header is outside the
+                    // rows and keeps working either way.
+                    HStack {
+                        Text("Buttons")
+                        Spacer()
+                        if app.preset.buttons.count > 1 {
+                            Button {
+                                withAnimation {
+                                    editMode = editMode.isEditing ? .inactive : .active
+                                }
+                            } label: {
+                                Text(editMode.isEditing ? "Done" : "Reorder")
+                                    .font(.caption.bold())
+                                    .foregroundColor(Theme.accent)
+                            }
+                            .buttonStyle(.plain)
                         }
                     }
+                }
+
+                Section {
+                    Button {
+                        app.addButton()
+                    } label: {
+                        Label("Add Button", systemImage: "plus.circle.fill")
+                            .foregroundColor(Theme.accent)
+                    }
+                } footer: {
+                    Text("Swipe a button left to delete it.")
                 }
             }
             .scrollContentBackground(.hidden)
             .navigationBarHidden(true)
-            .toolbar {
-                if isPadIdiom {
-                    ToolbarItem(placement: .navigationBarTrailing) {
-                        EditButton()
-                    }
-                }
-            }
+            .environment(\.editMode, $editMode)
         }
     }
 }
@@ -284,7 +325,10 @@ struct ButtonEditorView: View {
                     }
                 }
 
-                if isPadIdiom && app.preset.buttons.count > 1 {
+                // The only guard that matters is the last one: a preset with
+                // no buttons has nothing to press. Device idiom never had a
+                // bearing on whether a button should be deletable.
+                if app.preset.buttons.count > 1 {
                     Section {
                         Button("Delete Button", role: .destructive) {
                             confirmDelete = true
@@ -461,6 +505,33 @@ struct SettingsPageView: View {
 
     var body: some View {
         Form {
+            Section {
+                Button {
+                    showCCMap = true
+                } label: {
+                    HStack {
+                        Label("CC Map", systemImage: "tablecells")
+                        Spacer()
+                        // The conflict count is the reason to open it, so it
+                        // belongs on the way in rather than inside.
+                        if ccConflictCount > 0 {
+                            Text("\(ccConflictCount)")
+                                .font(.caption.bold())
+                                .foregroundColor(Theme.bg)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 2)
+                                .background(Capsule().fill(Theme.danger))
+                        }
+                        Image(systemName: "chevron.right")
+                            .font(.caption.weight(.semibold))
+                            .foregroundColor(Theme.dim)
+                    }
+                }
+                .tint(Theme.accent)
+            } header: {
+                Text("MIDI")
+            }
+
             Section("Preset") {
                 // With two surfaces on screen, both editors look identical.
                 // This says which one is being edited.
@@ -490,33 +561,6 @@ struct SettingsPageView: View {
                 MIDIDestinationStatus(midi: app.midi)
             } header: {
                 Text("Connection")
-            }
-
-            Section {
-                Button {
-                    showCCMap = true
-                } label: {
-                    HStack {
-                        Label("CC Map", systemImage: "tablecells")
-                        Spacer()
-                        // The conflict count is the reason to open it, so it
-                        // belongs on the way in rather than inside.
-                        if ccConflictCount > 0 {
-                            Text("\(ccConflictCount)")
-                                .font(.caption.bold())
-                                .foregroundColor(Theme.bg)
-                                .padding(.horizontal, 7)
-                                .padding(.vertical, 2)
-                                .background(Capsule().fill(Theme.danger))
-                        }
-                        Image(systemName: "chevron.right")
-                            .font(.caption.weight(.semibold))
-                            .foregroundColor(Theme.dim)
-                    }
-                }
-                .tint(Theme.accent)
-            } header: {
-                Text("MIDI")
             }
 
             Section {
@@ -565,13 +609,17 @@ struct SettingsPageView: View {
                 helpItem("Voice Count",
                          "1, 2, or 3 simultaneous touches in Notes mode. When a new finger exceeds the limit, the oldest voice is stolen. Lift a finger and its stolen voice returns at its current position — the same note-priority behavior as a classic mono synth.")
                 helpItem("Drawbars",
-                         "Turns the pad into a bank of drawbars — up to nine, each sending its own CC. Drag across several at once to sweep the bank, or set Touch Mode to Individual to move one at a time. Direction flips which end of the pad is full level. Ramp smooths the sweep as your finger crosses bars, so a fast drag doesn't jump values.")
+                         "Turns the pad into a bank of drawbars — up to nine, each sending its own CC. Drag across several at once to sweep the bank, or set Touch Mode to Individual to move one at a time. Direction flips which end of the pad is full level. Invert Values, just below it, leaves the bars looking and moving the same but sends the opposite value — a full bar sends 0 and an empty one sends 127 — for a host parameter that works backwards. The number on each handle is always the value being sent. Ramp smooths the sweep as your finger crosses bars, so a fast drag doesn't jump values.")
+                helpItem("Held Notes: Release, Latch, Carry",
+                         "Pad settings → Notes → Held Notes decides what happens to a note once its finger is no longer driving it. Release is the original behaviour: lifting a finger ends its note, and switching to another pad ends them all. Latch keeps every note sounding after you lift; the next fresh touch — a finger landing when none are down — clears the chord and starts a new one, while fingers added during a held chord join it. Carry plays like Release in Notes, but switching to another pad keeps whatever you were holding; the finger is then free to work the new pad, and back in Notes your first touch lets the carried notes go. While anything is held, a HOLD chip with a count appears in the pad header on every mode — tap it to release everything. Held notes also end when you switch preset or turn off the second surface. They keep sounding if you switch to another app, so a drone can ring on while you work in your host.")
                 helpItem("MIDI Channel Per Mode",
                          "Standard, Drawbars, and Notes each carry their own channel, so switching mode doesn't retarget whatever the last one was driving. Morph is the exception: each of the four corners has its own channel, which is finer than a mode channel could be. Everything defaults to channel 1.")
                 helpItem("On Release (Standard Mode)",
-                         "Where the puck goes when your finger lifts. Hold Position sends nothing and leaves it where you left it. Center returns to the middle of both axes. Left Center and Right Center pin X to one end while centering Y — useful when X is a sweep you want parked open or closed. Bottom Left returns both axes to zero. Morph has its own toggle for returning to an even four-corner blend; Notes has none, since the notes already ended on release.")
+                         "Where the puck goes when your finger lifts. Hold Position sends nothing and leaves it where you left it. Center returns to the middle of both axes. Left Center and Right Center pin X to one end while centering Y — useful when X is a sweep you want parked open or closed. Bottom Left returns both axes to zero. Morph has its own separate list of targets; Notes has none, since the notes already ended on release.")
+                helpItem("On Release (Morph Mode)",
+                         "Where the blend lands when your finger lifts, chosen separately from Standard mode. Hold Position leaves it where you left it. Center returns to an even four-corner blend. Corner A, B, C or D snap to full weight on that one corner — and when you have named a corner, the picker shows that name. Center Top, Center Bottom, Center Left and Center Right park on an edge.")
                 helpItem("Master Scale",
-                         "The scale the pad returns to. A dial step carrying Set Scale overrides it for as long as that step is selected; turn the dial off that step and the master scale comes back.")
+                         "The scale the pad uses unless a dial says otherwise. The dial you last turned is the one that describes the pad: what its current step declares applies, and anything its step says nothing about falls back to the master value. So turning a dial with no Set Scale on it returns the pad to the master scale, even if another dial is parked on a step that carries one. Editing the master scale, root or range from Settings or the on-pad chip takes effect immediately and overrules the step that was holding it, until that dial moves again.")
             }
 
             helpSection("Stepped Dial", icon: "dial.low.fill") {
@@ -579,12 +627,20 @@ struct SettingsPageView: View {
                          "Drag around the knob to sweep through steps. Swipe up to advance one step; swipe down to go back. Long-press for 0.5 seconds to open dial settings.")
                 helpItem("Steps and Actions",
                          "Each step can fire any combination of actions: Send CC, Program Change, Set Root Note, Set Scale, Toggle Glide, Toggle Perp→Velocity, Set Fixed Velocity, Set Voice Count, Set Note Range, and Fader Control. Tap a step in dial settings to edit it.")
+                helpItem("Reshaping the Pad from a Step",
+                         "A step can also change what the pad itself is. Set Pad Mode switches between Standard XY, 4-Corner Morph, Drawbars and Notes. Set X Axis CC and Set Y Axis CC retarget the axes, each with its own channel. Set Corner CC retargets one morph corner without disturbing the other three, and Set Morph Channel moves all four corners at once. XY On Release and Morph On Release set the spring target per step. All of these are declarative: they describe the pad while the step is selected and transmit nothing by themselves.")
                 helpItem("Program Change",
                          "Each step can send a Program Change to switch patches, scenes, or presets on any connected device or app. Combine with Send CC or Fader Control on the same step to set up a complete scene in one detent.")
                 helpItem("Fader Control Action",
                          "Assigns the vertical fader beside the dial to a specific CC while that step is selected. If a step has no Fader Control action, the fader falls back to that step's Send CC assignment. If neither exists, the fader is dimmed.")
                 helpItem("Shared Dial Presets",
                          "Any dial configuration can be saved to the shared library and linked from multiple presets. Changes to a shared dial affect all presets using it. Tap Dial Preset in dial settings to manage this.")
+                helpItem("Saving a Dial",
+                         "Dial settings has two save paths. Save as New Dial asks for a name, adds a fresh entry to the shared library and links this slot to it — nothing existing is touched. Save to Existing Dial replaces a library dial's steps while keeping its name and identity, so every preset linked to it picks up the change. That second one asks first and tells you how many presets are affected.")
+                helpItem("Opening Dial Settings",
+                         "Tap the dial's name under the knob, or long-press the knob itself for half a second.")
+                helpItem("Pairing Dials Across Surfaces",
+                         "With two performer surfaces running, a dial on the left can be paired with any dial on the right. Turn either one and the other moves to the same step number. Names do not need to match — you pick the partner from a list. Each dial keeps its own steps, so step 3 on the left and step 3 on the right can do entirely different things. Pairing is set from the left surface; the right surface shows what it is paired with.")
                 helpItem("Multiple Dials",
                          "Tap the + button at the end of the dial row to add another dial+fader combo. Each operates independently. On iPhone, scroll the row to reach dials past the first. Long-press any dial to open its settings, where you can delete it.")
             }
@@ -618,8 +674,16 @@ struct SettingsPageView: View {
                          "Each button sends either a CC or a note, on its own number and channel. CC is the default for new buttons: it can be MIDI-learned to anything a host exposes — a mixer send, a plugin parameter, a transport control — while a note is only heard by something listening for notes. Common uses: transport control, clip launching, mute toggles, and patch changes.")
                 helpItem("Glide Toggle",
                          "One button can be assigned as a glide toggle for the XY pad. Pressing it flips glide on or off in addition to sending its note. Assign it in the button editor under the Buttons tab.")
-                helpItem("iPad: More Buttons",
-                         "On iPad, the Buttons tab allows adding buttons without limit. iPhone always shows the first six — reorder them on iPad to choose which six appear on iPhone.")
+                helpItem("Adding, Deleting and Reordering",
+                         "The Buttons tab adds and deletes buttons on iPhone and iPad alike, with no limit on how many a preset holds. Add Button claims the first free CC. Swipe a button left to delete it, or open it and use Delete Button — the last one cannot be deleted, since a preset with no buttons has nothing to press. Reorder Buttons lets you drag them into the order you want.")
+                helpItem("How Many Buttons Show",
+                         "Every button in the preset appears on the deck, on iPhone and iPad alike. Past what fits on one row they wrap onto another, and the XY pad above gives up the height. Reorder them to decide which sit at the top.")
+                helpItem("Hiding the Buttons",
+                         "Show Buttons on Deck, at the top of the Buttons tab, removes the whole button grid from the performance screen and gives its height to the XY pad. Nothing about the buttons changes while they are hidden: assignments stay, a latched button stays latched, and one set to follow host feedback keeps tracking it. The setting belongs to the preset, so a pad-only preset and a button-heavy one can sit side by side.")
+                helpItem("Lit From: Own State or Host Feedback",
+                         "Own State is the original behavior: the button lights from its own press, so a Toggle stays lit because it latched. Host Feedback lights it from incoming MIDI on the button's own number and channel instead. That matters for anything the host can also change on its own — a looper clip started from the host's own screen, stopped by a scene change, or run to the end. With Own State the button would go on claiming it is playing; with Host Feedback it follows what is actually happening. Set it in the button editor or from the button's row in the CC Map.")
+                helpItem("Host Feedback Requirements",
+                         "The host has to echo the state back over MIDI on the same number and channel the button sends. Any value at or above 64 counts as on, since hosts differ about which value they reply with. For note buttons, a Note On with velocity above zero is on, and both Note Off and Note On with velocity zero are off. If your host only reports state over OSC rather than MIDI, this will not light — Motion MIDI speaks MIDI only.")
             }
 
             helpSection("Presets & Files", icon: "square.and.arrow.up") {
@@ -644,6 +708,13 @@ struct SettingsPageView: View {
                          "Holds blank space to the left of the pad mode buttons so the iPad's window controls don't sit on top of them in Split View or Stage Manager. This one applies to every preset and both surfaces, unlike the other layout settings — the window controls it dodges don't move when you change preset.")
             }
 
+            helpSection("Playing Live", icon: "music.mic") {
+                helpItem("Stop iPadOS Swiping Between Apps",
+                         "Four and five finger gestures switch apps and can fire while you are playing a chord on the pad. No app can turn that off, but you can: Settings → General → Gestures, and switch off the four and five finger gestures. Do this once and it stays off.")
+                helpItem("Guided Access for Shows",
+                         "For a stronger lock, turn on Settings → Accessibility → Guided Access, then triple-click the side button once you are inside Motion MIDI. Nothing can leave the app — no switching, no Control Centre, no notifications landing on your pad mid-song. Triple-click again to exit.")
+            }
+
             helpSection("MIDI Routing", icon: "cable.connector") {
                 helpItem("Virtual MIDI Source",
                          "Motion MIDI creates a CoreMIDI virtual source named 'Motion MIDI'. Any app on the same device can receive from it without a physical connection. Look for 'Motion MIDI' in your host app's MIDI input source list.")
@@ -651,16 +722,24 @@ struct SettingsPageView: View {
                          "Settings → Connection → Bluetooth MIDI opens the browser. Connect to a Bluetooth MIDI peripheral, a Mac, or another iOS device. Motion MIDI broadcasts to all connected destinations simultaneously, so one device can drive multiple apps or hardware at once.")
                 helpItem("Wired Connection",
                          "Connecting the iPhone to a Mac via USB also exposes Motion MIDI as a MIDI source over the wired connection. No additional setup is required.")
-                helpItem("MIDI Feedback / Incoming CC",
-                         "Motion MIDI creates a virtual MIDI destination named 'Motion MIDI'. Any app that supports MIDI feedback output can send CC values back here, and the vertical fader will update to reflect them. Only CC messages are processed; all other message types are ignored.")
+                helpItem("MIDI Feedback / Incoming MIDI",
+                         "Motion MIDI creates a virtual MIDI destination named 'Motion MIDI'. Any app that supports MIDI feedback output can send messages back here. Incoming CC updates the vertical fader, and both CC and notes can drive pad buttons set to Host Feedback. Other message types are ignored. Motion MIDI never hears its own output, so a button lighting from feedback is always reporting the host, not itself.")
                 helpItem("MIDI Channels",
                          "Every output in Motion MIDI — XY pad, buttons, motion mappings, dial steps, and fader — has its own MIDI channel setting. Use different channels to route to different instruments or parameters in the same app without conflicts.")
                 helpItem("CC Map",
-                         "Settings → MIDI → CC Map lists every CC this preset sends in one place: motion, pad, morph corners, drawbars, buttons, and every dial step. Numbers, channels, and names are editable there. View it by owner to see what each control sends, or by number to see what is free. A red badge on the way in counts conflicts — two controls on the same CC and channel that can both be active at once.")
+                         "Settings → MIDI → CC Map lists everything this preset sends in one place: motion, pad, morph corners, drawbars, buttons, and every dial step. Numbers, channels, and names are editable there. View it by owner to see what each control sends, or by number to see what is free. A red badge on the way in counts conflicts — two controls on the same number and channel that can both be active at once.")
+                helpItem("Editing Buttons in the Map",
+                         "Button rows carry three menus the other rows do not: CC or Note, the press behavior (Momentary, Tap, Toggle), and whether the button lights from its own state or from host feedback. Add Button at the foot of the Buttons section creates one without leaving the map, on the first free CC. Note buttons appear in the map alongside CC buttons, showing NOTE and their note number.")
+                helpItem("Collapsing Sections and Shifting Channels",
+                         "Tap any section header to fold it away; a collapsed section still shows its row count and any conflicts inside it. The − CH + buttons on the right of each header move every channel in that section together by one, keeping the spread between rows that sit on different channels. They stop at the edges rather than piling rows onto the last channel.")
+                helpItem("Notes and CCs Do Not Collide",
+                         "A note number and a CC number are separate namespaces. Note 24 and CC 24 on the same channel are unrelated messages and are never reported as a conflict. Two notes on the same number and channel still are. Note rows are also left out of the by-number view and out of the free-CC search, so a note never makes a CC look taken.")
                 helpItem("Send for MIDI Learn",
-                         "Each row in the CC Map has a send button. Tapping it sweeps that CC from 0 to 127 and back to its resting value, which is what most hosts need to latch onto during MIDI learn. Put the host in learn mode, tap send, and the parameter binds without you having to move the control on the pad.")
+                         "Each row in the CC Map has a send button. Tapping it sweeps that CC from 0 to 127 and back to its resting value, which is what most hosts need to latch onto during MIDI learn. Put the host in learn mode, tap send, and the parameter binds without you having to move the control on the pad. On a note row it plays the note on and off instead, since a host waiting to learn a note hears nothing from a stream of controller values.")
                 helpItem("One Source, Two Surfaces",
                          "Motion MIDI appears to hosts as a single source no matter how many performer surfaces are on screen. Both surfaces send down the same port, so keep them on different channels or CCs if you are driving separate instruments.")
+                helpItem("The CC Map with Two Surfaces",
+                         "With a second surface running, the map gains a Left / Right selector above the view picker. Rows and edits follow the selector, so you can retarget the other surface without leaving the pad you are standing at. Conflict detection always spans both surfaces, because they share one port — and when the clash is with the other surface, the row names it, for example 'also Right: Drawbar 3'. The badge in Settings counts both surfaces too.")
             }
         }
         .scrollContentBackground(.hidden)

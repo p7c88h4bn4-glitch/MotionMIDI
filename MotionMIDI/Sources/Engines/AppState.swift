@@ -233,12 +233,22 @@ final class AppState: ObservableObject {
         // still holding messages on the host, and in a moment their buttons
         // will be gone.
         releaseAllButtonLatches()
+        // Same for latched notes. The incoming preset may use a different
+        // notes channel or not be in Notes at all, and nothing on its pad
+        // would give a way to stop them.
+        releaseLatchedNotes()
 
         activePresetID = id
         if isPrimary { motion.preset = presets[index] }
         // The incoming preset has its own dials on their own steps. Without
         // this the outgoing preset's overrides would linger and silently
         // reshape the pad just switched to.
+        //
+        // Ownership resets with it: the slot index that was describing the
+        // old pad means something different here, and nothing in this preset
+        // has been turned yet, so every parked step applies as it was left.
+        activeOverrideSlot = nil
+        suppressedSteps.removeAll()
         refreshPadOverrides()
     }
 
@@ -412,6 +422,8 @@ final class AppState: ObservableObject {
         // What this step declares takes effect now, and what the PREVIOUS
         // step declared stops applying — including parameters this step says
         // nothing about, which revert to master.
+        // This dial now describes the pad.
+        activeOverrideSlot = slot
         refreshPadOverrides()
 
         propagateStepToPeer(slot: slot, stepIndex: stepIndex)
@@ -431,26 +443,25 @@ final class AppState: ObservableObject {
     private func propagateStepToPeer(slot: Int, stepIndex: Int) {
         guard !isFollowingPeer,
               preset.dialSlots.indices.contains(slot),
-              preset.dialSlots[slot].syncsAcrossSurfaces,
               let peer
         else { return }
 
-        // Matched by NAME, not position.
-        //
-        // Position is the wrong key: the two surfaces run different presets
-        // with their own slot counts and their own ordering, so "slot 2"
-        // means nothing in common between them. Adding a dial to one surface
-        // would silently repoint every link after it. A name is what the
-        // performer actually reasons about, and it survives reordering.
-        let name = Self.syncKey(dial(at: slot).name)
-        guard !name.isEmpty else { return }
+        // Pairings are stored on ONE side only — see `ownsPairings`. So the
+        // lookup runs in whichever direction this surface sits:
+        //   owner  -> read my slot's pairedSlotID
+        //   other  -> find the owner's slot that points at me
+        let peerSlot: Int?
+        if ownsPairings {
+            let partnerID = preset.dialSlots[slot].pairedSlotID
+            peerSlot = partnerID.flatMap { id in
+                peer.preset.dialSlots.firstIndex { $0.id == id }
+            }
+        } else {
+            let myID = preset.dialSlots[slot].id
+            peerSlot = peer.preset.dialSlots.firstIndex { $0.pairedSlotID == myID }
+        }
 
-        guard let peerSlot = peer.preset.dialSlots.indices.first(where: { index in
-            // Both sides opt in. A one-sided link is remote control with no
-            // visible cause on the receiving surface.
-            peer.preset.dialSlots[index].syncsAcrossSurfaces
-                && Self.syncKey(peer.dial(at: index).name) == name
-        }) else { return }
+        guard let peerSlot else { return }
 
         // Dials can have different step counts. Rather than clamping — which
         // would quietly park the shorter dial on its last step and stay there
@@ -463,31 +474,88 @@ final class AppState: ObservableObject {
         peer.isFollowingPeer = false
     }
 
-    /// Normalised dial name for matching.
+    /// Only the left surface stores pairings.
     ///
-    /// Case- and whitespace-insensitive, so "Filter" and "filter " pair up.
-    /// Two dials named the same thing on one surface is a user problem the
-    /// first match resolves; being strict about capitalisation would be a
-    /// silent failure with no visible cause.
-    private static func syncKey(_ name: String) -> String {
-        name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    /// One owner instead of two reciprocal links. Writing both sides meant
+    /// two records of one fact that could disagree, and a cross-surface write
+    /// that fails silently if the far surface is mid-preset-switch. It also
+    /// asked the performer to set the same pairing twice and left them
+    /// wondering which side was authoritative.
+    ///
+    /// The link still works whichever dial is turned — only the bookkeeping
+    /// is one-sided.
+    var ownsPairings: Bool { surface == 0 }
+
+    /// Pair one of THIS surface's slots with a slot on the other surface, or
+    /// clear it. Left surface only.
+    func pairDial(at slot: Int, withPeerSlotID partnerID: UUID?) {
+        guard ownsPairings, preset.dialSlots.indices.contains(slot) else { return }
+
+        // One partner each way. If another slot already claims this partner,
+        // release it — otherwise two dials would drive the same one and the
+        // last turn would win unpredictably.
+        if let partnerID {
+            for index in preset.dialSlots.indices
+            where index != slot && preset.dialSlots[index].pairedSlotID == partnerID {
+                preset.dialSlots[index].pairedSlotID = nil
+            }
+        }
+
+        preset.dialSlots[slot].pairedSlotID = partnerID
     }
 
-    /// Names on the other surface that this slot could pair with.
+    /// One dial on the other surface, as offered in the pairing menu.
     ///
-    /// Drives the settings row, so the toggle can say whether the link has
-    /// anything to talk to rather than looking active and doing nothing.
-    func peerSyncPartnerName(forSlot slot: Int) -> String? {
+    /// A named struct rather than a tuple: `ForEach` over a tuple array does
+    /// not give `Picker` tags it can match reliably, and the symptom is a
+    /// menu that opens, lists everything, and refuses to commit any choice.
+    struct PeerDialChoice: Identifiable, Hashable {
+        let id: UUID
+        let name: String
+    }
+
+    /// The dials on the other surface, for the pairing menu.
+    func peerDialChoices() -> [PeerDialChoice] {
+        guard let peer else { return [] }
+        return peer.preset.dialSlots.indices.map { index in
+            let name = peer.dial(at: index).name
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return PeerDialChoice(id: peer.preset.dialSlots[index].id,
+                                  name: name.isEmpty ? "Dial \(index + 1)" : name)
+        }
+    }
+
+    /// Name of the dial this slot is paired with, looked up in whichever
+    /// direction this surface sits. Nil when unpaired or when the partner
+    /// has gone.
+    func pairedDialName(forSlot slot: Int) -> String? {
         guard preset.dialSlots.indices.contains(slot), let peer else { return nil }
-        let name = Self.syncKey(dial(at: slot).name)
-        guard !name.isEmpty else { return nil }
 
-        guard let index = peer.preset.dialSlots.indices.first(where: {
-            peer.preset.dialSlots[$0].syncsAcrossSurfaces
-                && Self.syncKey(peer.dial(at: $0).name) == name
-        }) else { return nil }
+        let peerIndex: Int?
+        if ownsPairings {
+            peerIndex = preset.dialSlots[slot].pairedSlotID.flatMap { id in
+                peer.preset.dialSlots.firstIndex { $0.id == id }
+            }
+        } else {
+            let myID = preset.dialSlots[slot].id
+            peerIndex = peer.preset.dialSlots.firstIndex { $0.pairedSlotID == myID }
+        }
 
-        return peer.dial(at: index).name
+        guard let peerIndex else { return nil }
+        let name = peer.dial(at: peerIndex).name
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? "Dial \(peerIndex + 1)" : name
+    }
+
+    /// True when this slot points at a partner that no longer exists —
+    /// deleted, or on a preset the other surface has since switched away
+    /// from. Owner side only; the far side simply shows nothing.
+    func pairedPartnerIsMissing(forSlot slot: Int) -> Bool {
+        guard ownsPairings,
+              preset.dialSlots.indices.contains(slot),
+              preset.dialSlots[slot].pairedSlotID != nil
+        else { return false }
+        return pairedDialName(forSlot: slot) == nil
     }
 
     /// Appends a new dial+fader slot (iPad only, in practice — see
@@ -503,6 +571,14 @@ final class AppState: ObservableObject {
         guard preset.dialSlots.count > 1,
               preset.dialSlots.indices.contains(slot) else { return }
         preset.dialSlots.remove(at: slot)
+
+        // Indices after the removed one shift down, so a stored owner would
+        // now point at a different dial — or past the end. Dropping it puts
+        // the pad back on master values until something is turned, which is
+        // honest about the fact that the dial describing it is gone.
+        activeOverrideSlot = nil
+        suppressedSteps.removeAll()
+        refreshPadOverrides()
     }
 
     /// Execute one dial action.
@@ -1002,6 +1078,51 @@ final class AppState: ObservableObject {
     /// have no Note Off coming — the note would sound until the host was
     /// restarted, and the button that could have released it no longer
     /// exists on screen.
+    // MARK: - Latched notes
+
+    /// A note left sounding with no finger behind it.
+    ///
+    /// Carries the channel it was PLAYED on. If the notes channel changes
+    /// while something is latched — from settings, or a preset edit — the
+    /// Note Off still has to reach the channel the Note On went to, or the
+    /// note never stops.
+    struct LatchedNote: Hashable {
+        let note: Int
+        let channel: Int
+    }
+
+    /// Notes sounding with no finger owning them, from Latch or Carry.
+    ///
+    /// Lives here rather than in the pad view because the things that must
+    /// release them — switching preset, the second surface being turned off
+    /// — happen outside the pad. Published so the pad can show a HOLD chip
+    /// while any are ringing: in Latch mode notes can sound with nothing on
+    /// screen to say so, which is how a stuck-sounding note gets hunted for
+    /// mid-show.
+    @Published private(set) var latchedNotes: [LatchedNote] = []
+
+    /// Hand a sounding note over to the latch. The caller has already sent
+    /// its Note On and must NOT send a Note Off — that is now this store's
+    /// job.
+    func latchNote(_ note: Int, channel: Int) {
+        latchedNotes.append(LatchedNote(note: min(max(note, 0), 127),
+                                        channel: min(max(channel, 0), 15)))
+    }
+
+    /// Send a Note Off for every latched note and forget them.
+    ///
+    /// Duplicates are released individually rather than collapsed. Two
+    /// entries on one note mean two Note Ons went out; one Note Off per entry
+    /// is harmless to a synth that retriggers, and it is the only balanced
+    /// answer for one that stacks.
+    func releaseLatchedNotes() {
+        guard !latchedNotes.isEmpty else { return }
+        for entry in latchedNotes {
+            midi.noteOff(entry.note, channel: entry.channel)
+        }
+        latchedNotes.removeAll()
+    }
+
     func releaseAllButtonLatches() {
         guard !latchedButtons.isEmpty else { return }
         for button in preset.buttons where latchedButtons.contains(button.id) {
@@ -1059,30 +1180,76 @@ final class AppState: ObservableObject {
         padOverrides.applied(to: preset.xyPad)
     }
 
-    /// Set the master scale from a live control (the on-pad chip).
+    /// A pad parameter a dial step can declare and a master edit can overrule.
+    enum PadParam: Hashable {
+        case scale, rootNote, range
+    }
+
+    /// Steps whose declaration the performer has overruled by editing the
+    /// master directly: parameter -> (dial slot -> the step index that was
+    /// overruled).
     ///
-    /// Clears any scale override too. Without that, changing key mid-set
-    /// while a dial step happened to be holding a scale would edit the
-    /// master, produce no audible change, and look broken. An explicit touch
-    /// wins — until the dial next moves and re-asserts.
+    /// Needed because `refreshPadOverrides()` is a FULL REBUILD with no
+    /// memory. Clearing `padOverrides.scale` on its own lasts only until the
+    /// next rebuild — and every dial triggers a rebuild across every slot,
+    /// so turning an unrelated dial would resurrect the scale a different,
+    /// untouched dial was parked on. The master edit appeared to work and
+    /// then silently reverted.
+    ///
+    /// Keyed by step INDEX so the suppression is precise: it lasts exactly
+    /// as long as that dial stays on the step that was overruled. Move it
+    /// and its declaration takes effect again, which is what turning a dial
+    /// should mean.
+    private var suppressedSteps: [PadParam: [Int: Int]] = [:]
+
+    /// Record that every step currently declaring `param` has been overruled.
+    private func suppressCurrentAssertions(of param: PadParam) {
+        var byslot: [Int: Int] = [:]
+
+        for slot in preset.dialSlots.indices {
+            let d = dial(at: slot)
+            guard let step = d.currentStep else { continue }
+            let declares = step.actions.contains { action in
+                switch (param, action) {
+                case (.scale, .setScale):        return true
+                case (.rootNote, .setRootNote):  return true
+                case (.range, .setNoteRange):    return true
+                default:                         return false
+                }
+            }
+            if declares { byslot[slot] = d.currentStepIndex }
+        }
+
+        suppressedSteps[param] = byslot
+    }
+
+    /// True when this slot's current step was overruled and has not moved.
+    private func isSuppressed(_ param: PadParam, slot: Int, stepIndex: Int) -> Bool {
+        suppressedSteps[param]?[slot] == stepIndex
+    }
+
+    /// Set the master scale from a live control (the on-pad chip or the
+    /// settings picker).
+    ///
+    /// An explicit touch wins until the dial HOLDING that value moves. Any
+    /// other dial turning must not bring it back.
     func setMasterScale(_ scale: Scale) {
         preset.xyPad.scale = scale
-        if padOverrides.scale != nil { padOverrides.scale = nil }
+        suppressCurrentAssertions(of: .scale)
+        refreshPadOverrides()
     }
 
     /// Clear a range override after the master range is edited directly.
-    ///
-    /// Same rule as `setMasterScale`: an explicit edit should be audible
-    /// straight away rather than sitting behind a dial step that happens to
-    /// be holding a different range.
     func clearRangeOverride() {
-        if padOverrides.rangeSemitones != nil { padOverrides.rangeSemitones = nil }
+        suppressCurrentAssertions(of: .range)
+        refreshPadOverrides()
     }
 
     /// Master root note, same rule as `setMasterScale`.
     func setMasterRootNote(_ note: Int) {
         preset.xyPad.rootNote = min(max(note, 0), 120)
-        if padOverrides.rootNote != nil { padOverrides.rootNote = nil }
+        suppressCurrentAssertions(of: .rootNote)
+        refreshPadOverrides()
     }
 
     /// Rebuild the override set from every dial's currently selected step.
@@ -1092,18 +1259,52 @@ final class AppState: ObservableObject {
     /// dials both name a scale, the rightmost is the one you hear. Arbitrary,
     /// but it has to be one of them, and "the last one you set up" is the
     /// more predictable rule.
+    /// The dial that last moved, and therefore the one whose step describes
+    /// the pad right now.
+    ///
+    /// Nil until the first turn of the session, when every slot's parked step
+    /// still applies — a preset should open looking the way it was left.
+    private var activeOverrideSlot: Int? = nil
+
     func refreshPadOverrides() {
         var next = XYPadOverrides()
 
-        for slot in preset.dialSlots.indices {
-            guard let step = dial(at: slot).currentStep else { continue }
+        // Only the dial you last turned gets a vote.
+        //
+        // Aggregating every slot meant a dial parked on a scale step kept
+        // asserting it forever, so turning a DIFFERENT dial — one with no
+        // scale on it at all — left that scale in force. The pad was being
+        // described by a dial nobody had touched.
+        //
+        // Now the last dial turned describes the pad: what its step declares
+        // applies, and what its step says nothing about falls back to the
+        // preset's own master values.
+        let slots = activeOverrideSlot.map { [$0] } ?? Array(preset.dialSlots.indices)
+
+        for slot in slots where preset.dialSlots.indices.contains(slot) {
+            let d = dial(at: slot)
+            guard let step = d.currentStep else { continue }
+            let stepIndex = d.currentStepIndex
+
             for action in step.actions {
                 switch action {
-                case .setScale(let s):          next.scale = s
-                case .setRootNote(let n):       next.rootNote = n
+                // The three overrulable parameters check their suppression
+                // first, so a master edit survives every later rebuild until
+                // the dial holding the value actually moves off that step.
+                case .setScale(let s):
+                    if !isSuppressed(.scale, slot: slot, stepIndex: stepIndex) {
+                        next.scale = s
+                    }
+                case .setRootNote(let n):
+                    if !isSuppressed(.rootNote, slot: slot, stepIndex: stepIndex) {
+                        next.rootNote = n
+                    }
+                case .setNoteRange(let r):
+                    if !isSuppressed(.range, slot: slot, stepIndex: stepIndex) {
+                        next.rangeSemitones = r
+                    }
                 case .setFixedVelocity(let v):  next.fixedVelocity = v
                 case .setVoiceCount(let n):     next.voiceCount = n
-                case .setNoteRange(let r):      next.rangeSemitones = r
                 case .setPadMode(let m):        next.surfaceMode = m
                 case .setXAxisCC(let cc, let ch):
                     next.xCC = cc
@@ -1118,6 +1319,22 @@ final class AppState: ObservableObject {
                 case .setMorphSpring(let t):    next.morphSpringTarget = t
                 default:                        break
                 }
+            }
+        }
+
+        // Drop suppression entries whose dial has since moved off the step
+        // that was overruled. Left in place they would sit there forever and
+        // silently veto that step's declaration the next time the dial came
+        // back round to it.
+        for (param, slots) in suppressedSteps {
+            let live = slots.filter { slot, stepIndex in
+                preset.dialSlots.indices.contains(slot)
+                    && dial(at: slot).currentStepIndex == stepIndex
+            }
+            if live.isEmpty {
+                suppressedSteps[param] = nil
+            } else if live.count != slots.count {
+                suppressedSteps[param] = live
             }
         }
 
@@ -1273,13 +1490,85 @@ final class AppState: ObservableObject {
 
     /// Copy a slot's active dial into the shared library and link that slot
     /// to the copy.
-    func saveDialToLibrary(at slot: Int) {
-        guard preset.dialSlots.indices.contains(slot) else { return }
+    /// Save this slot's dial into the library as a NEW entry, and link the
+    /// slot to it.
+    ///
+    /// Always a fresh id, so this never disturbs an existing library dial or
+    /// the other presets using it.
+    @discardableResult
+    func saveDialToLibrary(at slot: Int, named name: String? = nil) -> UUID? {
+        guard preset.dialSlots.indices.contains(slot) else { return nil }
         var copy = dial(at: slot)
         copy.id = UUID()
-        if dialIsLinked(at: slot) { copy.name += " Copy" }
+
+        if let name {
+            copy.name = uniqueDialName(from: name)
+        } else if dialIsLinked(at: slot) {
+            // Saving a linked dial as new would otherwise produce two library
+            // entries with the same name and no way to tell them apart.
+            copy.name = uniqueDialName(from: copy.name + " Copy")
+        } else {
+            copy.name = uniqueDialName(from: copy.name)
+        }
+
         dialLibrary.append(copy)
         preset.dialSlots[slot].linkedDialPresetID = copy.id
+        return copy.id
+    }
+
+    /// Overwrite an existing library dial with this slot's steps.
+    ///
+    /// The library entry keeps its own id and name — this replaces what the
+    /// dial DOES, not which dial it is. Keeping the id matters: every other
+    /// preset linking to it keeps its link and picks up the new steps, which
+    /// is the reason to overwrite rather than save a copy.
+    ///
+    /// The slot is linked to that entry afterwards, so what you see on the
+    /// dial is what the library now holds rather than a local copy that has
+    /// already started drifting.
+    func overwriteLibraryDial(_ libraryID: UUID, from slot: Int) {
+        guard preset.dialSlots.indices.contains(slot),
+              let index = dialLibrary.firstIndex(where: { $0.id == libraryID })
+        else { return }
+
+        let source = dial(at: slot)
+        let keptName = dialLibrary[index].name
+
+        var replacement = source
+        replacement.id = libraryID
+        replacement.name = keptName
+
+        dialLibrary[index] = replacement
+        preset.dialSlots[slot].linkedDialPresetID = libraryID
+
+        // The slot was local a moment ago and its steps now live in the
+        // library. Leaving the stale copy behind would mean unlinking later
+        // silently restored an older version of the same dial.
+        preset.dialSlots[slot].localDial = replacement
+    }
+
+    /// How many presets link to a library dial.
+    ///
+    /// Drives the overwrite warning. Changing a dial that four presets share
+    /// is a different act from changing one only this preset uses, and the
+    /// confirmation should say which it is.
+    func presetsUsingDial(_ libraryID: UUID) -> Int {
+        presets.filter { preset in
+            preset.dialSlots.contains { $0.linkedDialPresetID == libraryID }
+        }.count
+    }
+
+    /// Library names are how dials are told apart in the picker, so a
+    /// duplicate is worse than a numbered one.
+    private func uniqueDialName(from proposed: String) -> String {
+        let base = proposed.trimmingCharacters(in: .whitespacesAndNewlines)
+        let seed = base.isEmpty ? "Dial" : base
+        let taken = Set(dialLibrary.map(\.name))
+        guard taken.contains(seed) else { return seed }
+
+        var n = 2
+        while taken.contains("\(seed) \(n)") { n += 1 }
+        return "\(seed) \(n)"
     }
 
     func linkDial(at slot: Int, to id: UUID?) {

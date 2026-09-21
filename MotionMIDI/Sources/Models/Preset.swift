@@ -18,7 +18,13 @@ struct DialSlot: Identifiable, Codable, Equatable {
     /// exists in the library.
     var linkedDialPresetID: UUID? = nil
 
-    /// Follow the same slot on the other performer surface.
+    /// The dial slot on the OTHER performer surface this one is paired with.
+    ///
+    /// Holds that slot's id, chosen explicitly from a list. Matching used to
+    /// be by dial name, which forced two dials to be called the same thing
+    /// to work together — a naming rule standing in for a choice. Now the
+    /// pairing is the choice, and the dials can be called whatever suits
+    /// each surface.
     ///
     /// Syncs the STEP INDEX only, never the contents. Step 3 here selects
     /// step 3 there, and each dial does whatever its own step 3 declares —
@@ -26,23 +32,22 @@ struct DialSlot: Identifiable, Codable, Equatable {
     /// different scale. Copying the actions across would defeat the point of
     /// running two surfaces.
     ///
-    /// Both slots must opt in. A one-sided link would mean turning the dial
-    /// that opted out silently drives a dial that did not, which is the kind
-    /// of remote control you cannot see the cause of.
-    var syncsAcrossSurfaces: Bool = false
+    /// Written on BOTH slots when a pair is made, so the link works whichever
+    /// dial is turned.
+    var pairedSlotID: UUID? = nil
 
     init(id: UUID = UUID(),
          localDial: DialPreset = .factory,
          linkedDialPresetID: UUID? = nil,
-         syncsAcrossSurfaces: Bool = false) {
+         pairedSlotID: UUID? = nil) {
         self.id = id
         self.localDial = localDial
         self.linkedDialPresetID = linkedDialPresetID
-        self.syncsAcrossSurfaces = syncsAcrossSurfaces
+        self.pairedSlotID = pairedSlotID
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, localDial, linkedDialPresetID, syncsAcrossSurfaces
+        case id, localDial, linkedDialPresetID, pairedSlotID
     }
 
     /// Lenient by hand, because synthesis is not.
@@ -56,8 +61,12 @@ struct DialSlot: Identifiable, Codable, Equatable {
         id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
         localDial = try c.decodeIfPresent(DialPreset.self, forKey: .localDial) ?? .factory
         linkedDialPresetID = try c.decodeIfPresent(UUID.self, forKey: .linkedDialPresetID)
-        syncsAcrossSurfaces = try c.decodeIfPresent(Bool.self,
-                                                    forKey: .syncsAcrossSurfaces) ?? false
+        // The old `syncsAcrossSurfaces` bool is deliberately not migrated.
+        // It recorded that a slot wanted to pair, but not with what — the
+        // partner was worked out from names at runtime. There is no honest
+        // way to turn that into a specific slot id, and guessing would
+        // silently pair dials the performer never chose.
+        pairedSlotID = try c.decodeIfPresent(UUID.self, forKey: .pairedSlotID)
     }
 }
 
@@ -91,6 +100,14 @@ struct Preset: Identifiable, Codable, Equatable {
 
     /// Show the dial + fader row on the control deck.
     var showDialPanel: Bool = true
+
+    /// Show the pad buttons on the control deck.
+    ///
+    /// Hiding them changes the layout only. Every button keeps its
+    /// assignment, a latched button stays latched, and a button set to
+    /// follow host feedback keeps tracking it — so turning them back on
+    /// shows the true state rather than a reset one.
+    var showButtons: Bool = true
 
     // MARK: - Factory default
     //
@@ -173,7 +190,7 @@ extension Preset {
     enum CodingKeys: String, CodingKey {
         case id, name, motionMappings, xyPad, buttons, calibration
         case lastUsed, dialSlots
-        case showMotionMeters, showDialPanel
+        case showMotionMeters, showDialPanel, showButtons
     }
 
     /// Pre-iPad-multi-dial presets stored a single dial under these keys.
@@ -201,6 +218,7 @@ extension Preset {
         // default to true, so an upgrade never hides something already in use.
         showMotionMeters = try c.decodeIfPresent(Bool.self, forKey: .showMotionMeters) ?? true
         showDialPanel    = try c.decodeIfPresent(Bool.self, forKey: .showDialPanel)    ?? true
+        showButtons      = try c.decodeIfPresent(Bool.self, forKey: .showButtons)      ?? true
 
         if let slots = try c.decodeIfPresent([DialSlot].self, forKey: .dialSlots), !slots.isEmpty {
             dialSlots = slots

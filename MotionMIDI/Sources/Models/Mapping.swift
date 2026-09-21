@@ -302,6 +302,45 @@ enum MorphSpringTarget: String, Codable, Equatable, CaseIterable, Identifiable {
     }
 }
 
+extension XYPadConfig {
+    /// The CC value a drawbar at `level` actually transmits.
+    ///
+    /// The ONLY place the invert is applied. The pad, the CC map's learn
+    /// sweep and the resend on toggling all go through here, so none of them
+    /// can disagree about what a bar is sending.
+    func drawbarOutput(_ level: Int) -> Int {
+        let clamped = min(max(level, 0), 127)
+        return drawbarInvert ? 127 - clamped : clamped
+    }
+}
+
+/// What happens to sounding notes that no longer have a finger driving them.
+///
+/// Three answers to one question. `release` is the original behaviour and
+/// stays the default, so an upgrade never leaves a note ringing that used to
+/// stop.
+enum NoteHoldMode: String, Codable, Equatable, CaseIterable, Identifiable {
+    /// Lifting a finger ends its note, and switching pads ends all of them.
+    case release
+    /// Lifting a finger never ends a note. The next fresh touch — a finger
+    /// landing when none are down — clears the chord and starts a new one.
+    /// Fingers added while others are held join the chord instead.
+    case latch
+    /// Plays exactly like `release` while in Notes. Only switching to another
+    /// pad latches what is held; back in Notes, the first touch clears it.
+    case carry
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .release: return "Release"
+        case .latch:   return "Latch"
+        case .carry:   return "Carry"
+        }
+    }
+}
+
 /// What the XY pad transmits.
 enum XYPadMode: String, Codable, CaseIterable, Identifiable {
     /// Classic: X drives one CC, Y drives another (independent).
@@ -588,6 +627,10 @@ struct XYPadConfig: Codable, Equatable {
 
     // ── Note mode ────────────────────────────────────────────────────────
     var mode: XYPadMode = .cc
+
+    /// What happens to held notes when their finger lifts or the pad leaves
+    /// Notes. See `NoteHoldMode`.
+    var noteHold: NoteHoldMode = .release
     var diagonal: XYDiagonal = .bottomLeftToTopRight
     /// Lowest MIDI note, emitted at the "low" end of the active diagonal.
     var rootNote: Int = 48            // C3
@@ -636,6 +679,15 @@ struct XYPadConfig: Codable, Equatable {
     /// not throw away CC assignments or held positions.
     var drawbarCount: Int = 4
     var drawbarDirection: DrawbarDirection = .up
+
+    /// Send `127 - level` instead of the level.
+    ///
+    /// Separate from `drawbarDirection` on purpose. Direction decides which
+    /// way the bar grows on screen; this decides what a full bar MEANS to
+    /// the receiver. A host parameter that works backwards — a cut amount, a
+    /// dry/wet that reads wet-first — wants the second without the first.
+    var drawbarInvert: Bool = false
+
     var drawbarTouchMode: DrawbarTouchMode = .individual
     /// Sweep-only glide amount in 100 ms steps: 0 = instant, 10 = 1 second.
     var drawbarRamp: Int = 0
@@ -662,12 +714,12 @@ extension XYPadConfig {
         case xCC, yCC, channel
         case standardChannel, drawbarChannel, notesChannel
         case springTarget, morphSpringTarget
-        case mode, diagonal, rootNote, rangeSemitones, scale
+        case mode, noteHold, diagonal, rootNote, rangeSemitones, scale
         case glide, glideTime, perpToVelocity, fixedVelocity
         case glideToggleButtonId, voiceCount
         case ccMode, morphCorners, morphCurve, morphCenterStrength, morphEqualPower
         case xAxisName, yAxisName
-        case drawbarCount, drawbarDirection, drawbarTouchMode, drawbarRamp, drawbars
+        case drawbarCount, drawbarDirection, drawbarInvert, drawbarTouchMode, drawbarRamp, drawbars
     }
 
     /// Keys for properties that no longer exist, kept so old presets still
@@ -704,6 +756,10 @@ extension XYPadConfig {
         morphSpringTarget = try c.decodeIfPresent(MorphSpringTarget.self,
                                                  forKey: .morphSpringTarget)
             ?? (legacyMorphSnap ? .center : .hold)
+
+        // Absent means a preset from before held notes could outlive their
+        // finger, and back then every note stopped when its finger lifted.
+        noteHold = try c.decodeIfPresent(NoteHoldMode.self, forKey: .noteHold) ?? .release
 
         // Per-mode channels fall back to the old shared one, so an existing
         // preset keeps sending exactly where it did.
@@ -748,6 +804,7 @@ extension XYPadConfig {
         // Drawbar settings absent from presets saved before this feature.
         drawbarCount = min(max(try c.decodeIfPresent(Int.self, forKey: .drawbarCount) ?? 4, 1), 9)
         drawbarDirection = try c.decodeIfPresent(DrawbarDirection.self, forKey: .drawbarDirection) ?? .up
+        drawbarInvert = try c.decodeIfPresent(Bool.self, forKey: .drawbarInvert) ?? false
         drawbarTouchMode = try c.decodeIfPresent(DrawbarTouchMode.self, forKey: .drawbarTouchMode) ?? .individual
         drawbarRamp = min(max(try c.decodeIfPresent(Int.self, forKey: .drawbarRamp) ?? 0, 0), 10)
 

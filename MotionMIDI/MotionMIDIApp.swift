@@ -43,6 +43,14 @@ final class SharedEngines: ObservableObject {
     /// they will never see.
     private var _surfaceB: AppState?
 
+    /// Let go of anything the second surface has latched.
+    ///
+    /// Reads the stored instance rather than `surfaceB`, which would build a
+    /// whole second surface just to find it had nothing to release.
+    func releaseSecondSurfaceNotes() {
+        _surfaceB?.releaseLatchedNotes()
+    }
+
     var surfaceB: AppState {
         if let _surfaceB { return _surfaceB }
         let state = AppState(surface: 1, midi: midi, motion: motion)
@@ -110,5 +118,11 @@ struct RootView: View {
             }
         }
         .background(Theme.bg.ignoresSafeArea())
+        // Turning the second surface off takes its pad — and its HOLD chip —
+        // off screen. Anything it had latched would ring on with no control
+        // left to stop it.
+        .onChange(of: dualSurface) { _, isOn in
+            if !isOn { engines.releaseSecondSurfaceNotes() }
+        }
     }
 }

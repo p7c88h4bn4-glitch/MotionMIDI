@@ -215,48 +215,125 @@ private struct CCMapBody: View {
     private func sectionHeader(_ group: CCGroup,
                                rowCount: Int,
                                collapsed: Bool) -> some View {
-        let conflicted = rows.filter {
-            $0.group == group && conflicts.contains($0.ref)
-        }.count
+        let groupRows = rows.filter { $0.group == group }
+        let conflicted = groupRows.filter { conflicts.contains($0.ref) }.count
 
-        return Button {
-            withAnimation(.easeInOut(duration: 0.18)) {
-                if collapsed {
-                    collapsedGroups.remove(group.id)
-                } else {
-                    collapsedGroups.insert(group.id)
+        // Split into three tap targets. The whole header used to be one
+        // Button, and a Button nested inside another Button's label does not
+        // reliably receive taps — the channel steppers would have collapsed
+        // the section instead of shifting anything.
+        return HStack(spacing: 6) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    if collapsed {
+                        collapsedGroups.remove(group.id)
+                    } else {
+                        collapsedGroups.insert(group.id)
+                    }
                 }
-            }
-        } label: {
-            HStack(spacing: 6) {
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 10, weight: .bold))
-                    .rotationEffect(.degrees(collapsed ? 0 : 90))
-                    .foregroundColor(Theme.dim)
-
-                Label(group.title, systemImage: group.symbol)
-
-                Spacer(minLength: 4)
-
-                if conflicted > 0 {
-                    Text("\(conflicted)")
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.right")
                         .font(.system(size: 10, weight: .bold))
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 1)
-                        .background(Capsule().fill(Theme.danger))
-                }
-
-                if collapsed {
-                    Text("\(rowCount)")
-                        .font(.system(size: 11, weight: .semibold))
+                        .rotationEffect(.degrees(collapsed ? 0 : 90))
                         .foregroundColor(Theme.dim)
-                        .monospacedDigit()
+
+                    Label(group.title, systemImage: group.symbol)
+
+                    Spacer(minLength: 4)
                 }
+                .contentShape(Rectangle())
             }
-            .contentShape(Rectangle())
+            .buttonStyle(.plain)
+
+            if conflicted > 0 {
+                Text("\(conflicted)")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(Capsule().fill(Theme.danger))
+            }
+
+            if collapsed {
+                Text("\(rowCount)")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(Theme.dim)
+                    .monospacedDigit()
+            }
+
+            channelStepper(for: groupRows)
         }
-        .buttonStyle(.plain)
+    }
+
+    /// Move every channel in a section together.
+    ///
+    /// Shifts by one rather than setting them all equal, so a section whose
+    /// rows sit on different channels keeps its spread. Setting them all to
+    /// one number would be destructive in a way a single tap should not be.
+    private func channelStepper(for groupRows: [CCAssignment]) -> some View {
+        let editable = groupRows.filter(\.isEditable)
+
+        // Disabled at the edges rather than clamping. Clamping would pile
+        // rows onto channel 16 one at a time and quietly destroy the spacing
+        // between them — and tapping back would not restore it.
+        let canRaise = !editable.isEmpty && editable.allSatisfy { $0.channel < 15 }
+        let canLower = !editable.isEmpty && editable.allSatisfy { $0.channel > 0 }
+
+        return HStack(spacing: 2) {
+            Button {
+                shiftChannels(editable, by: -1)
+            } label: {
+                stepperGlyph("minus")
+            }
+            .buttonStyle(.plain)
+            .disabled(!canLower)
+            .opacity(canLower ? 1 : 0.3)
+
+            Text("CH")
+                .font(.system(size: 8, weight: .bold))
+                .foregroundColor(Theme.dim)
+
+            Button {
+                shiftChannels(editable, by: 1)
+            } label: {
+                stepperGlyph("plus")
+            }
+            .buttonStyle(.plain)
+            .disabled(!canRaise)
+            .opacity(canRaise ? 1 : 0.3)
+        }
+    }
+
+    private func stepperGlyph(_ name: String) -> some View {
+        Image(systemName: name)
+            .font(.system(size: 9, weight: .bold))
+            .foregroundColor(Theme.accent)
+            .frame(width: 22, height: 20)
+            .background(
+                RoundedRectangle(cornerRadius: 5)
+                    .fill(Theme.accent.opacity(0.12))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 5)
+                    .strokeBorder(Theme.accent.opacity(0.35), lineWidth: 1)
+            )
+            .contentShape(Rectangle())
+    }
+
+    /// Applies the shift from a SNAPSHOT of each row's channel.
+    ///
+    /// Several rows can share one stored channel — both XY axes write
+    /// `standardChannel`, every drawbar writes `drawbarChannel`. Reading the
+    /// live value per row and adding one would apply the shift once per row
+    /// and move a shared channel by four or nine instead of one. Computing
+    /// from the snapshot makes those writes idempotent: each row asks for
+    /// the same destination.
+    private func shiftChannels(_ rowsToShift: [CCAssignment], by delta: Int) {
+        for row in rowsToShift {
+            target.setChannel(row.slot, to: min(max(row.channel + delta, 0), 15))
+        }
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
     }
 
     /// Adds a button without leaving the map.
@@ -667,10 +744,20 @@ private struct CCMapBody: View {
     }
 
     private func wheels(for row: CCAssignment) -> some View {
-        HStack(spacing: 12) {
+        // Note rows carry "C3 · 60"; CC rows carry at most "127". Sizing the
+        // number wheel to its content keeps the spin target no bigger than
+        // the thing being spun — a wheel stretched across the row is a wheel
+        // your thumb lands on while reaching for something else.
+        let numberWidth: CGFloat = row.isNote ? 104 : 60
+
+        return HStack(spacing: 10) {
+            // Pushed right so each wheel sits under the chip it edits,
+            // instead of across the row from it.
+            Spacer(minLength: 0)
+
             VStack(spacing: 2) {
-                Text(row.isNote ? "Note Number" : "CC Number")
-                    .font(.system(size: 10, weight: .semibold))
+                Text(row.isNote ? "NOTE" : "CC")
+                    .font(.system(size: 9, weight: .semibold))
                     .foregroundColor(Theme.dim)
 
                 Picker(row.isNote ? "Note" : "CC", selection: Binding(
@@ -683,19 +770,19 @@ private struct CCMapBody: View {
                         // check against the part you are playing.
                         // MIDIWheelText.note already appends the number.
                         Text(row.isNote ? MIDIWheelText.note(n) : "\(n)")
-                            .font(.system(size: 16, weight: .semibold, design: .rounded))
+                            .font(.system(size: 15, weight: .semibold, design: .rounded))
                             .monospacedDigit()
                             .tag(n)
                     }
                 }
                 .pickerStyle(.wheel)
-                .frame(height: 110)
+                .frame(width: numberWidth, height: 96)
                 .clipped()
             }
 
             VStack(spacing: 2) {
-                Text("Channel")
-                    .font(.system(size: 10, weight: .semibold))
+                Text("CH")
+                    .font(.system(size: 9, weight: .semibold))
                     .foregroundColor(Theme.dim)
 
                 Picker("Channel", selection: Binding(
@@ -704,13 +791,13 @@ private struct CCMapBody: View {
                 )) {
                     ForEach(0...15, id: \.self) { c in
                         Text("\(c + 1)")
-                            .font(.system(size: 16, weight: .semibold, design: .rounded))
+                            .font(.system(size: 15, weight: .semibold, design: .rounded))
                             .monospacedDigit()
                             .tag(c)
                     }
                 }
                 .pickerStyle(.wheel)
-                .frame(height: 110)
+                .frame(width: 48, height: 96)
                 .clipped()
             }
         }

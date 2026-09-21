@@ -7,20 +7,26 @@ struct ControlDeckView: View {
 
     private let columns = [GridItem(.adaptive(minimum: 90), spacing: 10)]
 
-    /// iPhone shows the first 6 buttons only, matching the original fixed
-    /// layout exactly — the array itself can hold more (iPad-only editing
-    /// adds to it), but the phone never renders past its usual set. Order
-    /// in the array (reorderable in the editor) decides which 6 those are.
+    /// Every button, on every device.
+    ///
+    /// iPhone used to stop at six. With adding available on the phone, that
+    /// cap meant a new button landed in the preset and never appeared. The
+    /// grid is adaptive, so extra buttons wrap onto another row; the pad
+    /// above is flexible height and gives up the space. Anyone who wants the
+    /// pad back can hide the buttons from the Buttons tab.
     private var visibleButtons: [ButtonMapping] {
-        isPadIdiom ? app.preset.buttons : Array(app.preset.buttons.prefix(6))
+        app.preset.buttons
     }
 
     var body: some View {
         VStack(spacing: 8) {
-            // Transport pads
-            LazyVGrid(columns: columns, spacing: 10) {
-                ForEach(visibleButtons) { button in
-                    PadButton(mapping: button)
+            // Transport pads. Removed from the layout entirely when hidden,
+            // not just made invisible, so their height goes back to the pad.
+            if app.preset.showButtons {
+                LazyVGrid(columns: columns, spacing: 10) {
+                    ForEach(visibleButtons) { button in
+                        PadButton(mapping: button)
+                    }
                 }
             }
 

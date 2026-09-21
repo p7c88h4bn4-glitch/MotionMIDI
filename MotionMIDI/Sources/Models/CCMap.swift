@@ -298,7 +298,9 @@ extension Preset {
                 isRenamable: true,
                 exclusion: nil,
                 button: nil,
-                restValue: bar.value
+                // Where the bar actually sends from, so a learn sweep puts
+                // the receiver back where the bar leaves it — inverted or not.
+                restValue: xyPad.drawbarOutput(bar.value)
             ))
         }
 

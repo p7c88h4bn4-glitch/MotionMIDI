@@ -190,6 +190,15 @@ struct XYPadView: View {
     /// since ids are handed out in contact order). Index 0 is stolen first.
     @State private var voices: [Voice] = []
 
+    /// Fingers on the glass at the last report, whatever the mode.
+    ///
+    /// Decides what counts as a FRESH touch. It cannot be inferred from
+    /// `voices` being empty: changing key, scale or range mid-chord empties
+    /// the voices while fingers stay down, and in Latch that would make the
+    /// next finger movement look like a new gesture and wipe a drone nobody
+    /// asked to stop.
+    @State private var fingersDown: Set<Int> = []
+
     /// Fingers still on the glass whose voice was taken. Ordered by WHEN they
     /// were suspended, most recent LAST — so restoring pops from the end.
     @State private var suspended: [Voice] = []
@@ -251,6 +260,27 @@ struct XYPadView: View {
         .onChange(of: cfg.glideTime) { _, _ in
             if cfg.glide { sendGlideTime() }
         }
+        // Every way out of Notes lands here: the pad's selector, the config
+        // sheet's selector, and a dial step's Set Pad Mode. Only the first
+        // used to release anything, so the other two could strand notes.
+        .onChange(of: cfg.mode) { oldMode, newMode in
+            if oldMode == .notes && newMode != .notes {
+                handOffVoicesLeavingNotes()
+            }
+        }
+        // Flipping the invert changes what every bar MEANS without moving
+        // any of them. Without a resend the host keeps the old values while
+        // the bars display the reverse — the screen and the sound disagree
+        // until each bar happens to be touched.
+        .onChange(of: cfg.drawbarInvert) { _, _ in
+            guard cfg.mode == .cc, cfg.ccMode == .drawbars else { return }
+            for index in 0..<visibleDrawbarCount
+            where cfg.drawbars.indices.contains(index) && drawbarLevels.indices.contains(index) {
+                app.midi.controlChange(cfg.drawbars[index].cc,
+                                       value: cfg.drawbarOutput(drawbarLevels[index]),
+                                       channel: cfg.drawbarChannel)
+            }
+        }
         .onChange(of: cfg.ccMode) { _, _ in
             cancelDrawbarRamps(commit: true)
             // Clear dedupe state both ways, so the first move after a mode
@@ -281,6 +311,33 @@ struct XYPadView: View {
 
     // MARK: - Header (four mode buttons + preset + config) — outside the touch area
 
+    /// Shown while any note is latched; tapping it releases them all.
+    ///
+    /// In the header rather than on the pad, so it can never be hit while
+    /// playing — and so it stays visible in XY, Morph and Drawbars, which is
+    /// exactly where a carried note is most easily forgotten.
+    private var holdChip: some View {
+        Button {
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            app.releaseLatchedNotes()
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "pause.circle.fill")
+                    .font(.system(size: 12, weight: .bold))
+                Text("HOLD \(app.latchedNotes.count)")
+                    .font(.system(size: 12, weight: .bold, design: .rounded))
+                    .monospacedDigit()
+            }
+            .foregroundColor(Theme.bg)
+            .padding(.horizontal, 9)
+            .frame(height: 30)
+            .background(Capsule().fill(Theme.accent))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(app.latchedNotes.count) held notes. Tap to release.")
+        .transition(.scale.combined(with: .opacity))
+    }
+
     private var header: some View {
         HStack(spacing: 6) {
             PadModeSelector(selection: surfaceModeBinding)
@@ -289,6 +346,10 @@ struct XYPadView: View {
                 .padding(.leading, padModeIndent)
 
             Spacer(minLength: 4)
+
+            if !app.latchedNotes.isEmpty {
+                holdChip
+            }
 
             // Moved here from the app-title row, which no longer exists. It
             // sits left of the gear because both are "leave the pad alone and
@@ -856,20 +917,26 @@ struct XYPadView: View {
             let zeroY = cfg.drawbarDirection == .up ? bottom : top
             let fillHeight = max(abs(zeroY - y), 1)
             let handleWidth = max(16, min(42, laneWidth * 0.66))
+            // The shaft is a real bar now, not a 4pt line — sized to the
+            // lane so nine bars on a phone and four on an iPad both read as
+            // solid. Kept narrower than the handle, which is what makes the
+            // handle look like something you can grab.
+            let shaftWidth = max(8, handleWidth * 0.6)
+            let shaftCorner = min(shaftWidth * 0.3, 6)
 
             Rectangle()
                 .fill(Color.white.opacity(0.045))
                 .frame(width: 1, height: size.height)
                 .position(x: laneWidth * CGFloat(index + 1), y: size.height / 2)
 
-            Capsule()
-                .fill(Color.white.opacity(0.13))
-                .frame(width: 4, height: travel)
+            RoundedRectangle(cornerRadius: shaftCorner)
+                .fill(Color.white.opacity(0.08))
+                .frame(width: shaftWidth, height: travel)
                 .position(x: x, y: (top + bottom) / 2)
 
-            Capsule()
-                .fill(Theme.accent.opacity(0.42))
-                .frame(width: 4, height: fillHeight)
+            RoundedRectangle(cornerRadius: shaftCorner)
+                .fill(Theme.accent.opacity(0.55))
+                .frame(width: shaftWidth, height: fillHeight)
                 .position(x: x, y: (zeroY + y) / 2)
 
             RoundedRectangle(cornerRadius: 5)
@@ -877,7 +944,10 @@ struct XYPadView: View {
                 .frame(width: handleWidth, height: 18)
                 .shadow(color: Theme.accent.opacity(0.45), radius: 5)
                 .overlay(
-                    Text("\(level)")
+                    // The number shown is what the host RECEIVES, so it
+                    // matches the CC map and the host's own display even
+                    // when the invert is on.
+                    Text("\(cfg.drawbarOutput(level))")
                         .font(.system(size: 7, weight: .bold, design: .monospaced))
                         .foregroundColor(Theme.bg.opacity(0.9))
                 )
@@ -900,20 +970,22 @@ struct XYPadView: View {
             let zeroX = cfg.drawbarDirection == .right ? left : right
             let fillWidth = max(abs(zeroX - x), 1)
             let handleHeight = max(16, min(42, laneHeight * 0.66))
+            let shaftHeight = max(8, handleHeight * 0.6)
+            let shaftCorner = min(shaftHeight * 0.3, 6)
 
             Rectangle()
                 .fill(Color.white.opacity(0.045))
                 .frame(width: size.width, height: 1)
                 .position(x: size.width / 2, y: laneHeight * CGFloat(index + 1))
 
-            Capsule()
-                .fill(Color.white.opacity(0.13))
-                .frame(width: travel, height: 4)
+            RoundedRectangle(cornerRadius: shaftCorner)
+                .fill(Color.white.opacity(0.08))
+                .frame(width: travel, height: shaftHeight)
                 .position(x: (left + right) / 2, y: y)
 
-            Capsule()
-                .fill(Theme.accent.opacity(0.42))
-                .frame(width: fillWidth, height: 4)
+            RoundedRectangle(cornerRadius: shaftCorner)
+                .fill(Theme.accent.opacity(0.55))
+                .frame(width: fillWidth, height: shaftHeight)
                 .position(x: (zeroX + x) / 2, y: y)
 
             RoundedRectangle(cornerRadius: 5)
@@ -921,7 +993,7 @@ struct XYPadView: View {
                 .frame(width: 18, height: handleHeight)
                 .shadow(color: Theme.accent.opacity(0.45), radius: 5)
                 .overlay(
-                    Text("\(level)")
+                    Text("\(cfg.drawbarOutput(level))")
                         .font(.system(size: 7, weight: .bold, design: .monospaced))
                         .foregroundColor(Theme.bg.opacity(0.9))
                         .rotationEffect(.degrees(-90))
@@ -990,7 +1062,18 @@ struct XYPadView: View {
     /// Called on every touch begin / move / end with the CURRENT full set of
     /// fingers on the pad, already normalized to 0...1 with y pointing up.
     private func handleTouches(_ points: [TouchPoint]) {
+        // Taken before anything else, in every mode, so a finger that went
+        // down during XY is still "already down" if the pad returns to Notes.
+        let wasIdle = fingersDown.isEmpty
+        fingersDown = Set(points.map(\.id))
+
         if cfg.mode != .notes {
+            // The mode watcher normally does this, but a touch can arrive
+            // between the mode changing and the watcher running. Handing off
+            // here as well means those notes are never dropped — which is
+            // exactly how a dial step used to leave notes stuck on.
+            handOffVoicesLeavingNotes()
+
             if cfg.ccMode == .drawbars {
                 handleDrawbarTouches(points)
             } else {
@@ -999,12 +1082,28 @@ struct XYPadView: View {
             return
         }
 
+        // A FRESH touch — a finger landing when none were down — clears
+        // anything latched before it plays. That is the whole of how Latch
+        // starts a new chord and how Carry lets go once you are back in
+        // Notes. It applies in Release too: latched notes only exist there
+        // if the setting was changed while something was held, and a fresh
+        // touch is the natural moment to let them go.
+        if wasIdle, !points.isEmpty, !app.latchedNotes.isEmpty {
+            app.releaseLatchedNotes()
+        }
+
         let liveIDs = Set(points.map(\.id))
         let byID = Dictionary(uniqueKeysWithValues: points.map { ($0.id, $0) })
 
-        // 1. Lifted fingers: release sounding voices, drop suspended ones.
-        for voice in voices where !liveIDs.contains(voice.id) {
-            app.midi.noteOff(voice.note, channel: cfg.notesChannel)
+        // 1. Lifted fingers: release sounding voices — or, in Latch, hand
+        //    them to the latch so they keep sounding — and drop suspended
+        //    ones, which never sounded.
+        for voice in voices where !liveIDs.contains(voice.id) && voice.note >= 0 {
+            if cfg.noteHold == .latch {
+                app.latchNote(voice.note, channel: cfg.notesChannel)
+            } else {
+                app.midi.noteOff(voice.note, channel: cfg.notesChannel)
+            }
         }
         voices.removeAll { !liveIDs.contains($0.id) }
         suspended.removeAll { !liveIDs.contains($0.id) }
@@ -1256,8 +1355,10 @@ struct XYPadView: View {
         let clamped = min(max(value, 0), 127)
         guard drawbarLevels[index] != clamped else { return }
         drawbarLevels[index] = clamped
+        // `drawbarLevels` holds where the bar SITS; the wire gets what that
+        // position means, which the invert may flip.
         app.midi.controlChange(cfg.drawbars[index].cc,
-                               value: clamped,
+                               value: cfg.drawbarOutput(clamped),
                                // Per-bar channel, falling back to the pad's
                                // own for any bar that has never been given
                                channel: cfg.drawbarChannel)
@@ -1292,17 +1393,27 @@ struct XYPadView: View {
     }
 
     private func handleAllTouchesEnded() {
+        fingersDown.removeAll()
+
         if cfg.mode == .notes {
-            releaseAllVoices()
+            // The last finger lifting. Latch keeps the chord; Release and
+            // Carry end it — Carry only holds notes across a pad switch.
+            if cfg.noteHold == .latch {
+                latchAllVoices()
+            } else {
+                releaseAllVoices()
+            }
         } else if cfg.ccMode == .drawbars {
             commitDrawbarLevels()
             drawbarFingerBars.removeAll()
             drawbarPreviousPoints.removeAll()
-            voices.removeAll()
-            suspended.removeAll()
+            // Was a bare `voices.removeAll()`, which dropped any note still
+            // owned by a finger without a Note Off. That is the stuck note a
+            // dial step could leave behind by switching away from Notes
+            // mid-chord.
+            handOffVoicesLeavingNotes()
         } else {
-            voices.removeAll()
-            suspended.removeAll()
+            handOffVoicesLeavingNotes()
 
             // Each mode springs by its own rule. Note mode is absent from
             // both branches: the notes already ended on release, so there is
@@ -1328,6 +1439,33 @@ struct XYPadView: View {
         }
         voices.removeAll()
         suspended.removeAll()   // never sounded, so nothing to release
+    }
+
+    /// Hand every sounding voice to the latch. They keep sounding, and no
+    /// finger owns them any more — so a finger still on the glass is free to
+    /// do whatever the pad is now for, and lifting it ends nothing.
+    private func latchAllVoices() {
+        for voice in voices where voice.note >= 0 {
+            app.latchNote(voice.note, channel: cfg.notesChannel)
+        }
+        voices.removeAll()
+        suspended.removeAll()   // never sounded, so nothing to latch
+    }
+
+    /// What happens to held notes as the pad leaves Notes.
+    ///
+    /// Release ends them. Latch and Carry both hand them to the latch —
+    /// that is the one moment the two agree.
+    ///
+    /// Idempotent: once the voices are gone it does nothing, so the mode
+    /// watcher and the touch handlers can both call it, in either order,
+    /// without releasing or latching anything twice.
+    private func handOffVoicesLeavingNotes() {
+        guard !voices.isEmpty || !suspended.isEmpty else { return }
+        switch cfg.noteHold {
+        case .release:          releaseAllVoices()
+        case .latch, .carry:    latchAllVoices()
+        }
     }
 
     // MARK: - Note / velocity derivation
@@ -1450,7 +1588,9 @@ struct XYPadView: View {
                 if app.preset.xyPad.ccMode == .drawbars {
                     cancelDrawbarRamps(commit: true)
                 }
-                releaseAllVoices()
+                // No release here any more. Doing it before the mode changed
+                // would end the notes before Latch or Carry got the chance to
+                // keep them; the `cfg.mode` watcher decides instead.
                 drawbarFingerBars.removeAll()
                 drawbarPreviousPoints.removeAll()
                 switch newMode {
@@ -1665,6 +1805,25 @@ struct XYPadConfigSheet: View {
                         IntWheelRow(title: "MIDI Channel",
                                     selection: bind(\.notesChannel),
                                     range: 0...15) { String($0 + 1) }
+
+                        Picker("Held Notes", selection: Binding(
+                            get: { app.preset.xyPad.noteHold },
+                            set: { newValue in
+                                app.preset.xyPad.noteHold = newValue
+                                // Going back to Release means nothing should
+                                // be left ringing on its own. Letting latched
+                                // notes go now beats leaving them for the
+                                // next fresh touch to find.
+                                if newValue == .release {
+                                    app.releaseLatchedNotes()
+                                }
+                            }
+                        )) {
+                            ForEach(NoteHoldMode.allCases) { mode in
+                                Text(mode.label).tag(mode)
+                            }
+                        }
+                        .pickerStyle(.segmented)
                     }
 
                 case .morph:
@@ -1854,6 +2013,9 @@ struct XYPadConfigSheet: View {
                 }
             }
             .pickerStyle(.segmented)
+
+            Toggle("Invert Values", isOn: bind(\.drawbarInvert))
+                .tint(Theme.accent)
         } header: {
             Text("Layout")
         }

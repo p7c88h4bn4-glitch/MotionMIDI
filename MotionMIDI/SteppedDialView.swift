@@ -72,15 +72,27 @@ struct SteppedDialView: View {
                 .frame(width: knobSize + 14, height: knobSize + 14)
 
             HStack(spacing: 4) {
-                Text(dial.name.uppercased())
-                    .font(.system(size: 8, weight: .semibold).monospaced())
-                    .foregroundColor(Theme.dim)
-                    .lineLimit(1)
-                if app.dialIsLinked(at: slot) {
-                    Image(systemName: "link")
-                        .font(.system(size: 7, weight: .bold))
-                        .foregroundColor(Theme.dim)
+                Button {
+                    showSettings = true
+                } label: {
+                    HStack(spacing: 4) {
+                        Text(dial.name.uppercased())
+                            .font(.system(size: 8, weight: .semibold).monospaced())
+                            .foregroundColor(Theme.dim)
+                            .lineLimit(1)
+                        if app.dialIsLinked(at: slot) {
+                            Image(systemName: "link")
+                                .font(.system(size: 7, weight: .bold))
+                                .foregroundColor(Theme.dim)
+                        }
+                        Image(systemName: "gear.circle")
+                            .font(.system(size: 8, weight: .semibold))
+                            .foregroundColor(Theme.accent.opacity(0.6))
+                    }
                 }
+                .buttonStyle(.plain)
+                
+                Spacer(minLength: 0)
             }
         }
         .sheet(isPresented: $showSettings) {
@@ -321,6 +333,12 @@ struct SteppedDialView: View {
 
 struct DialSettingsSheet: View {
     @AppStorage("MotionMIDIPro.dualSurface") private var dualSurface = false
+
+    @State private var showSaveAsNew = false
+    @State private var newDialName = ""
+    /// Held until confirmed. Overwriting changes every preset linked to that
+    /// dial, so it asks first and says how many.
+    @State private var pendingOverwrite: DialPreset? = nil
     @EnvironmentObject var app: AppState
     @Environment(\.dismiss) private var dismiss
     let slot: Int
@@ -333,6 +351,38 @@ struct DialSettingsSheet: View {
                 stepsSection
             }
             .navigationTitle("Stepped Dial")
+            .alert("Save as New Dial", isPresented: $showSaveAsNew) {
+                TextField("Dial Name", text: $newDialName)
+                Button("Cancel", role: .cancel) { }
+                Button("Save") {
+                    app.saveDialToLibrary(at: slot, named: newDialName)
+                }
+            } message: {
+                Text("Adds a copy to the shared library and links this slot to it.")
+            }
+            .confirmationDialog(
+                pendingOverwrite.map { "Overwrite \($0.name)?" } ?? "Overwrite?",
+                isPresented: Binding(
+                    get: { pendingOverwrite != nil },
+                    set: { if !$0 { pendingOverwrite = nil } }
+                ),
+                titleVisibility: .visible
+            ) {
+                if let entry = pendingOverwrite {
+                    Button("Overwrite", role: .destructive) {
+                        app.overwriteLibraryDial(entry.id, from: slot)
+                        pendingOverwrite = nil
+                    }
+                }
+                Button("Cancel", role: .cancel) { pendingOverwrite = nil }
+            } message: {
+                if let entry = pendingOverwrite {
+                    let count = app.presetsUsingDial(entry.id)
+                    Text(count > 1
+                         ? "\(count) presets link to this dial and will all change. The library dial keeps its name."
+                         : "The library dial keeps its name; its steps are replaced with this one's.")
+                }
+            }
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
@@ -360,9 +410,20 @@ struct DialSettingsSheet: View {
                 }
             }
 
-            if !app.dialIsLinked(at: slot) {
-                Button("Save to Shared Library") {
-                    app.saveDialToLibrary(at: slot)
+            Button("Save as New Dial…") {
+                newDialName = app.dial(at: slot).name
+                showSaveAsNew = true
+            }
+
+            // Only offered when there is something to overwrite. With an
+            // empty library the menu would be a dead end.
+            if !app.dialLibrary.isEmpty {
+                Menu("Save to Existing Dial…") {
+                    ForEach(app.dialLibrary) { entry in
+                        Button(entry.name) {
+                            pendingOverwrite = entry
+                        }
+                    }
                 }
             }
 
@@ -374,43 +435,61 @@ struct DialSettingsSheet: View {
             }
         }
 
-        // Only offered when a second surface is actually running. A toggle
-        // for a surface that isn't on screen has nothing to link to and no
-        // way to show what it did.
+        // Only offered when a second surface is actually running. A pairing
+        // menu for a surface that isn't on screen has nothing to list.
         if dualSurface, isPadIdiom, app.peer != nil {
             Section {
-                Toggle("Sync With Other Surface", isOn: Binding(
-                    get: {
-                        app.preset.dialSlots.indices.contains(slot)
-                            ? app.preset.dialSlots[slot].syncsAcrossSurfaces
-                            : false
-                    },
-                    set: { newValue in
-                        guard app.preset.dialSlots.indices.contains(slot) else { return }
-                        app.preset.dialSlots[slot].syncsAcrossSurfaces = newValue
-                    }
-                ))
-                .tint(Theme.accent)
+                let choices = app.peerDialChoices()
 
-                if app.preset.dialSlots.indices.contains(slot),
-                   app.preset.dialSlots[slot].syncsAcrossSurfaces {
-                    HStack {
-                        Text("Paired With")
-                        Spacer()
-                        // Says plainly whether the link found anything. A
-                        // toggle that is on but matches nothing looks like
-                        // it is working right up until the show.
-                        if let partner = app.peerSyncPartnerName(forSlot: slot) {
-                            Text(partner).foregroundColor(.secondary)
-                        } else {
-                            Text("No match").foregroundColor(Theme.danger)
+                if choices.isEmpty {
+                    Text("The other surface has no dials.")
+                        .foregroundColor(.secondary)
+                } else {
+                    // Selection type pinned explicitly. Inferring it from a
+                    // ternary that ends in a bare `nil` is how the selection
+                    // and the tags end up as different types, which SwiftUI
+                    // reports by simply never committing a choice.
+                    Picker("Paired Dial", selection: Binding<UUID?>(
+                        get: {
+                            guard app.preset.dialSlots.indices.contains(slot)
+                            else { return nil }
+                            return app.preset.dialSlots[slot].pairedSlotID
+                        },
+                        set: { (newValue: UUID?) in
+                            app.pairDial(at: slot, withPeerSlotID: newValue)
                         }
+                    )) {
+                        Text("None").tag(Optional<UUID>.none)
+                        ForEach(choices) { choice in
+                            // Listed by the name it has over there, which is
+                            // how you recognise it — it has no reason to
+                            // match this dial's name.
+                            //
+                            // Tag type must be EXACTLY the selection type.
+                            // A plain .tag(choice.id) would be UUID against a
+                            // UUID? selection, and SwiftUI silently refuses
+                            // to commit a tag whose type does not match —
+                            // the menu opens, lists everything, selects
+                            // nothing.
+                            Text(choice.name).tag(Optional<UUID>.some(choice.id))
+                        }
+                    }
+                }
+
+                // A pairing can outlive its partner: the dial was deleted, or
+                // the other surface switched to a preset that never had it.
+                // Saying so beats a menu that looks set and does nothing.
+                if app.pairedPartnerIsMissing(forSlot: slot) {
+                    HStack {
+                        Text("Partner")
+                        Spacer()
+                        Text("Missing").foregroundColor(Theme.danger)
                     }
                 }
             } header: {
                 Text("Surfaces")
             } footer: {
-                Text("Turn this dial and the dial with the SAME NAME on the other surface moves to the same step number. Each dial keeps its own steps — step 3 here and step 3 there can do completely different things. The other dial needs this turned on too, and its name has to match.")
+                Text("Turn this dial and the paired dial on the other surface moves to the same step number. Names don't need to match — pick whichever dial you want. Each dial keeps its own steps, so step 3 here and step 3 there can do completely different things. Pairing is set on both dials at once.")
             }
         }
     }
