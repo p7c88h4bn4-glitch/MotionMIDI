@@ -14,6 +14,7 @@ import SwiftUI
 /// Every step change fires that step's action with a haptic detent, and the
 /// position persists with the dial.
 struct SteppedDialView: View {
+    @Environment(\.theme) private var theme
     @EnvironmentObject var app: AppState
 
     /// Which dial+fader slot this instance shows. iPhone always passes 0.
@@ -78,16 +79,16 @@ struct SteppedDialView: View {
                     HStack(spacing: 4) {
                         Text(dial.name.uppercased())
                             .font(.system(size: 8, weight: .semibold).monospaced())
-                            .foregroundColor(Theme.dim)
+                            .foregroundColor(theme.dim)
                             .lineLimit(1)
                         if app.dialIsLinked(at: slot) {
                             Image(systemName: "link")
                                 .font(.system(size: 7, weight: .bold))
-                                .foregroundColor(Theme.dim)
+                                .foregroundColor(theme.dim)
                         }
                         Image(systemName: "gear.circle")
                             .font(.system(size: 8, weight: .semibold))
-                            .foregroundColor(Theme.accent.opacity(0.6))
+                            .foregroundColor(theme.accent.opacity(0.6))
                     }
                 }
                 .buttonStyle(.plain)
@@ -103,6 +104,15 @@ struct SteppedDialView: View {
 
     // MARK: - Knob
 
+    private var faceEdge: Color {
+        theme.restingEdge(theme.accent, quiet: theme.line(0.1))
+    }
+
+    /// Standard never glowed the pointer; Neon lights it.
+    private var pointerGlow: Color {
+        theme.traits.outlined ? theme.accent.opacity(0.8) : Color.clear
+    }
+
     private var knob: some View {
         GeometryReader { geo in
             let center = CGPoint(x: geo.size.width / 2, y: geo.size.height / 2)
@@ -114,7 +124,7 @@ struct SteppedDialView: View {
                 ForEach(Array(dial.steps.enumerated()), id: \.element.id) { index, _ in
                     let active = index == currentIndex
                     Capsule()
-                        .fill(active ? Theme.accent : Color.white.opacity(0.18))
+                        .fill(active ? theme.accent : theme.line(0.18))
                         .frame(width: active ? 3 : 2, height: active ? 10 : 6)
                         .offset(y: -tickRadius)
                         .rotationEffect(.degrees(Self.stepAngle(index, count: dial.steps.count)))
@@ -123,16 +133,19 @@ struct SteppedDialView: View {
 
                 // Knob face.
                 Circle()
-                    .fill(Theme.panel2)
+                    .fill(theme.restingFill(theme.accent))
+                    .themeFinish(theme, Circle(), round: true)
                     .frame(width: faceSize, height: faceSize)
-                    .overlay(Circle().strokeBorder(Color.white.opacity(0.1), lineWidth: 1))
-                    .shadow(color: .black.opacity(0.4), radius: 5, y: 2)
+                    .overlay(Circle().strokeBorder(faceEdge, lineWidth: theme.stroke(1)))
+                    .themeDropShadow(theme, radius: 5, y: 2)
 
                 // Pointer notch, rotating to the active step.
                 if !dial.steps.isEmpty {
                     Capsule()
-                        .fill(Theme.accent)
-                        .frame(width: 3, height: 11)
+                        .fill(theme.accent)
+                        .frame(width: theme.traits.inkBorders ? 4 : 3, height: 11)
+                        .themeGlow(theme, pointerGlow, radius: 4,
+                                   when: theme.traits.outlined)
                         .offset(y: -faceSize / 2 + 8)
                         .rotationEffect(.degrees(Self.stepAngle(currentIndex,
                                                                 count: dial.steps.count)))
@@ -142,8 +155,8 @@ struct SteppedDialView: View {
 
                 // Abbreviated step name.
                 Text(faceLabel)
-                    .font(.system(size: 12, weight: .bold, design: .rounded))
-                    .foregroundColor(dial.steps.isEmpty ? Theme.dim : Theme.accent)
+                    .font(theme.font(12))
+                    .foregroundColor(dial.steps.isEmpty ? theme.dim : theme.accent)
                     .lineLimit(1)
                     .minimumScaleFactor(0.7)
                     .frame(maxWidth: faceSize - 12)
@@ -332,6 +345,7 @@ struct SteppedDialView: View {
 // MARK: - Settings sheet
 
 struct DialSettingsSheet: View {
+    @Environment(\.theme) private var theme
     @AppStorage("MotionMIDIPro.dualSurface") private var dualSurface = false
 
     @State private var showSaveAsNew = false
@@ -435,61 +449,72 @@ struct DialSettingsSheet: View {
             }
         }
 
-        // Only offered when a second surface is actually running. A pairing
-        // menu for a surface that isn't on screen has nothing to list.
+        // Only offered when a second surface is actually running.
         if dualSurface, isPadIdiom, app.peer != nil {
             Section {
-                let choices = app.peerDialChoices()
+                if app.ownsPairings {
+                    let choices = app.peerDialChoices()
 
-                if choices.isEmpty {
-                    Text("The other surface has no dials.")
-                        .foregroundColor(.secondary)
-                } else {
-                    // Selection type pinned explicitly. Inferring it from a
-                    // ternary that ends in a bare `nil` is how the selection
-                    // and the tags end up as different types, which SwiftUI
-                    // reports by simply never committing a choice.
-                    Picker("Paired Dial", selection: Binding<UUID?>(
-                        get: {
-                            guard app.preset.dialSlots.indices.contains(slot)
-                            else { return nil }
-                            return app.preset.dialSlots[slot].pairedSlotID
-                        },
-                        set: { (newValue: UUID?) in
-                            app.pairDial(at: slot, withPeerSlotID: newValue)
-                        }
-                    )) {
-                        Text("None").tag(Optional<UUID>.none)
-                        ForEach(choices) { choice in
-                            // Listed by the name it has over there, which is
-                            // how you recognise it — it has no reason to
-                            // match this dial's name.
-                            //
-                            // Tag type must be EXACTLY the selection type.
-                            // A plain .tag(choice.id) would be UUID against a
-                            // UUID? selection, and SwiftUI silently refuses
-                            // to commit a tag whose type does not match —
-                            // the menu opens, lists everything, selects
-                            // nothing.
-                            Text(choice.name).tag(Optional<UUID>.some(choice.id))
+                    if choices.isEmpty {
+                        Text("The right surface has no dials.")
+                            .foregroundColor(.secondary)
+                    } else {
+                        // Selection type pinned explicitly. Inferring it from
+                        // a ternary that ends in a bare `nil` is how the
+                        // selection and the tags end up as different types,
+                        // which SwiftUI reports by simply never committing a
+                        // choice.
+                        Picker("Paired Dial", selection: Binding<UUID?>(
+                            get: {
+                                guard app.preset.dialSlots.indices.contains(slot)
+                                else { return nil }
+                                return app.preset.dialSlots[slot].pairedSlotID
+                            },
+                            set: { (newValue: UUID?) in
+                                app.pairDial(at: slot, withPeerSlotID: newValue)
+                            }
+                        )) {
+                            Text("None").tag(Optional<UUID>.none)
+                            ForEach(choices) { choice in
+                                // Listed by the name it has over there, which
+                                // is how you recognise it — it has no reason
+                                // to match this dial's name.
+                                Text(choice.name).tag(Optional<UUID>.some(choice.id))
+                            }
                         }
                     }
-                }
 
-                // A pairing can outlive its partner: the dial was deleted, or
-                // the other surface switched to a preset that never had it.
-                // Saying so beats a menu that looks set and does nothing.
-                if app.pairedPartnerIsMissing(forSlot: slot) {
+                    // A pairing can outlive its partner: the dial was
+                    // deleted, or the right surface switched to a preset that
+                    // never had it.
+                    if app.pairedPartnerIsMissing(forSlot: slot) {
+                        HStack {
+                            Text("Partner")
+                            Spacer()
+                            Text("Missing").foregroundColor(theme.danger)
+                        }
+                    }
+                } else {
+                    // Read-only on the right surface. Pairings are set from
+                    // the left, so offering a second control here would be
+                    // two places to change one fact — and the question of
+                    // which one won.
                     HStack {
-                        Text("Partner")
+                        Text("Paired With")
                         Spacer()
-                        Text("Missing").foregroundColor(Theme.danger)
+                        if let partner = app.pairedDialName(forSlot: slot) {
+                            Text(partner).foregroundColor(.secondary)
+                        } else {
+                            Text("Not paired").foregroundColor(.secondary)
+                        }
                     }
                 }
             } header: {
                 Text("Surfaces")
             } footer: {
-                Text("Turn this dial and the paired dial on the other surface moves to the same step number. Names don't need to match — pick whichever dial you want. Each dial keeps its own steps, so step 3 here and step 3 there can do completely different things. Pairing is set on both dials at once.")
+                Text(app.ownsPairings
+                     ? "Turn this dial and the paired dial on the right surface moves to the same step number. Names don't need to match. Each dial keeps its own steps, so step 3 here and step 3 there can do completely different things."
+                     : "Pairing is set from the left surface. Once paired, turning either dial moves the other to the same step number.")
             }
         }
     }
@@ -521,7 +546,7 @@ struct DialSettingsSheet: View {
                             .frame(minWidth: 52, alignment: .leading)
                         Text(step.summary)
                             .font(.caption.monospaced())
-                            .foregroundColor(step.hasActions ? .secondary : Theme.dim)
+                            .foregroundColor(step.hasActions ? .secondary : theme.dim)
                             .lineLimit(1)
                     }
                 }
@@ -543,7 +568,7 @@ struct DialSettingsSheet: View {
                 }
             } label: {
                 Label("Add Step", systemImage: "plus.circle.fill")
-                    .foregroundColor(Theme.accent)
+                    .foregroundColor(theme.accent)
             }
         } header: {
             Text("Steps · \(app.dial(at: slot).steps.count)")
@@ -562,6 +587,7 @@ struct DialSettingsSheet: View {
 // MARK: - Library picker
 
 struct DialLibraryPicker: View {
+    @Environment(\.theme) private var theme
     @EnvironmentObject var app: AppState
     @Environment(\.dismiss) private var dismiss
     let slot: Int
@@ -579,7 +605,7 @@ struct DialLibraryPicker: View {
                         Spacer()
                         if !app.dialIsLinked(at: slot) {
                             Image(systemName: "checkmark")
-                                .foregroundColor(Theme.accent)
+                                .foregroundColor(theme.accent)
                         }
                     }
                 }
@@ -609,7 +635,7 @@ struct DialLibraryPicker: View {
                             if app.preset.dialSlots.indices.contains(slot),
                                app.preset.dialSlots[slot].linkedDialPresetID == preset.id {
                                 Image(systemName: "checkmark")
-                                    .foregroundColor(Theme.accent)
+                                    .foregroundColor(theme.accent)
                             }
                         }
                     }
@@ -633,6 +659,7 @@ struct DialLibraryPicker: View {
 /// The step is looked up by ID on every render, so no binding can capture a
 /// stale index across deletes or reorders.
 struct DialStepEditor: View {
+    @Environment(\.theme) private var theme
     @EnvironmentObject var app: AppState
     let slot: Int
     let stepID: UUID
@@ -701,12 +728,12 @@ struct DialStepEditor: View {
                     Text(group.title)
                     if count > 0 {
                         Text("· \(count) on")
-                            .foregroundColor(Theme.accent)
+                            .foregroundColor(theme.accent)
                     }
                 }
                 .font(.headline)
             }
-            .tint(Theme.accent)
+            .tint(theme.accent)
         }
     }
 
@@ -731,7 +758,7 @@ struct DialStepEditor: View {
             HStack(spacing: 10) {
                 Image(systemName: existing == nil ? "circle" : "checkmark.circle.fill")
                     .font(.title3)
-                    .foregroundColor(existing == nil ? Theme.dim : Theme.accent)
+                    .foregroundColor(existing == nil ? theme.dim : theme.accent)
 
                 Text(kind.label)
                     .foregroundColor(.primary)
@@ -967,6 +994,7 @@ struct DialStepEditor: View {
 /// Feedback from the host and dial-step changes reposition it silently.
 /// Steps without a Send CC action render it dimmed and inert.
 struct DialFaderView: View {
+    @Environment(\.theme) private var theme
     @EnvironmentObject var app: AppState
 
     /// Which dial+fader slot this fader follows. Must match the
@@ -1061,7 +1089,7 @@ struct DialFaderView: View {
 
             Text(enabled ? "\(value ?? 0)" : "—")
                 .font(.system(size: 8, weight: .semibold).monospaced())
-                .foregroundColor(Theme.dim)
+                .foregroundColor(theme.dim)
                 .frame(width: touchWidth)
         }
     }
@@ -1075,27 +1103,53 @@ struct DialFaderView: View {
 
     private var track: some View {
         ZStack(alignment: .bottom) {
-            Capsule()
-                .fill(Theme.panel2)
-                .overlay(Capsule().strokeBorder(Color.white.opacity(0.1), lineWidth: 1))
+            trackShape
+                .fill(theme.panel2)
+                .overlay(trackShape.strokeBorder(trackEdge, lineWidth: theme.stroke(1)))
 
             // Filled portion, bottom up to the current value.
             if let value {
-                Capsule()
-                    .fill(Theme.accent.opacity(0.45))
+                trackShape
+                    .fill(theme.accent.opacity(0.45))
                     .frame(height: max(fillHeight(for: value), 5))
             }
         }
         .frame(width: 5, height: trackHeight)
     }
 
+    private var trackShape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: theme.radius(2.5))
+    }
+
+    private var trackEdge: Color {
+        theme.restingEdge(theme.accent, quiet: theme.line(0.1))
+    }
+
+    private var thumbFill: Color {
+        enabled ? theme.litFill(theme.accent) : theme.panel2
+    }
+
+    private var thumbEdge: Color {
+        if theme.traits.inkBorders { return theme.text }
+        if theme.traits.outlined && enabled { return theme.accent }
+        if theme.traits.finish.hidesRestingEdge { return Color.clear }
+        return theme.line(enabled ? 0.25 : 0.1)
+    }
+
+    private var thumbGlow: Color {
+        enabled ? theme.accent.opacity(0.4) : Color.clear
+    }
+
     private var thumb: some View {
         Circle()
-            .fill(enabled ? Theme.accent : Theme.panel2)
+            .fill(thumbFill)
+            .themeFinish(theme, Circle(), round: true)
             .frame(width: 20, height: 20)
-            .overlay(Circle().strokeBorder(Color.white.opacity(enabled ? 0.25 : 0.1),
-                                           lineWidth: 1))
-            .shadow(color: enabled ? Theme.accent.opacity(0.4) : .clear, radius: 5)
+            .overlay(Circle().strokeBorder(thumbEdge, lineWidth: theme.stroke(1)))
+            // Glow in the flat styles, a drop shadow in the shaded ones —
+            // the thumb moves with the finger, so never both.
+            .themeGlow(theme, thumbGlow, radius: 5, when: !theme.traits.shaded)
+            .themeDepth(theme, radius: 2.5, y: 1.5, single: true)
             .offset(y: thumbOffset)
             .animation(.easeOut(duration: 0.1), value: value)
     }

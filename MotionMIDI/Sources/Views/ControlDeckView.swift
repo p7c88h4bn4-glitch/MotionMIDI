@@ -2,6 +2,7 @@ import SwiftUI
 
 /// Middle third: transport pads, meters, stepped dial, connection status.
 struct ControlDeckView: View {
+    @Environment(\.theme) private var theme
     @EnvironmentObject var app: AppState
     @Binding var showEditor: Bool
 
@@ -25,7 +26,10 @@ struct ControlDeckView: View {
             if app.preset.showButtons {
                 LazyVGrid(columns: columns, spacing: 10) {
                     ForEach(visibleButtons) { button in
+                        // Each button draws in "accent"; handing it a theme
+                        // whose accent is its own colour is the whole trick.
                         PadButton(mapping: button)
+                            .environment(\.theme, theme.accented(.button(button.id)))
                     }
                 }
             }
@@ -94,6 +98,13 @@ struct ControlDeckView: View {
     /// the bottom off that label rather than push the layout.
     private let dialRowHeight: CGFloat = 126
 
+    /// Guarded because `ForEach` over indices can briefly hand out one that
+    /// no longer exists while a slot is being removed.
+    private func dialTheme(_ index: Int) -> ThemeColors {
+        guard app.preset.dialSlots.indices.contains(index) else { return theme }
+        return theme.accented(.dial(app.preset.dialSlots[index].id))
+    }
+
     private var dialSlotRow: some View {
         // A GeometryReader, specifically, because it REPORTS THE SIZE IT WAS
         // PROPOSED rather than the size of its contents. That is the whole
@@ -113,6 +124,8 @@ struct ControlDeckView: View {
                         SteppedDialView(slot: index)
                         DialFaderView(slot: index)
                     }
+                    // Dial and fader are one control, so they share a colour.
+                    .environment(\.theme, dialTheme(index))
                     .padding(.trailing, 16)
                 }
 
@@ -121,7 +134,7 @@ struct ControlDeckView: View {
                 } label: {
                     Image(systemName: "plus.circle.fill")
                         .font(.title2)
-                        .foregroundColor(Theme.accent)
+                        .foregroundColor(theme.accent)
                         .frame(width: 44, height: 44)
                 }
             }
@@ -241,7 +254,7 @@ struct ControlDeckView: View {
         if showEditor {
             button
                 .buttonStyle(.bordered)
-                .tint(Theme.accent)
+                .tint(theme.accent)
         } else {
             button
                 .buttonStyle(.plain)
@@ -278,15 +291,15 @@ private struct DialRowContentWidthKey: PreferenceKey {
 /// sixteen times a second, redrawing every pad, dial and fader to animate
 /// four capsules.
 struct MotionMetersRow: View {
+    @Environment(\.theme) private var theme
     @ObservedObject var motion: MotionEngine
-
-    private static let sources: [MotionSource] = [.pitch, .roll, .yaw, .magnitude]
 
     var body: some View {
         HStack(spacing: 8) {
-            ForEach(Self.sources, id: \.self) { source in
+            ForEach(ColorComponent.meterSources, id: \.self) { source in
                 MeterBar(label: source.shortLabel,
                          value: motion.meterValues[source] ?? 0.5)
+                    .environment(\.theme, theme.accented(.meter(source)))
             }
         }
     }
@@ -295,6 +308,7 @@ struct MotionMetersRow: View {
 // MARK: - Pad button
 
 struct PadButton: View {
+    @Environment(\.theme) private var theme
     let mapping: ButtonMapping
     @EnvironmentObject var app: AppState
 
@@ -316,20 +330,50 @@ struct PadButton: View {
     /// the steady state comes from the host a moment later.
     private var lit: Bool { pressed || latched }
 
+    // Style decisions, each pulled out and typed so the body stays a plain
+    // chain the type checker can solve quickly.
+
+    private var labelColor: Color {
+        lit ? theme.litForeground(theme.accent) : theme.accent
+    }
+
+    private var fillColor: Color {
+        lit ? theme.litFill(theme.accent) : theme.restingFill(theme.accent)
+    }
+
+    private var edgeColor: Color {
+        if theme.traits.inkBorders { return theme.text }
+        if theme.traits.finish.hidesRestingEdge && !latched { return Color.clear }
+        let strength: Double = latched ? 0.9 : (theme.traits.outlined ? 0.55 : 0.35)
+        return theme.accent.opacity(strength)
+    }
+
+    private var edgeWidth: CGFloat { theme.stroke(latched ? 2 : 1) }
+
+    /// Only Neon glows, and only while lit — a row of resting buttons all
+    /// glowing would stop the lit one standing out.
+    private var glowColor: Color {
+        (lit && theme.traits.outlined) ? theme.accent.opacity(0.6) : Color.clear
+    }
+
     var body: some View {
+        let shape = RoundedRectangle(cornerRadius: theme.radius(14))
+
         Text(mapping.name)
-            .font(.system(.headline, design: .rounded).weight(.bold))
-            .foregroundColor(lit ? Theme.bg : Theme.accent)
+            .font(theme.font(.headline))
+            .foregroundColor(labelColor)
             .frame(maxWidth: .infinity, minHeight: 56)
             .background(
-                RoundedRectangle(cornerRadius: 14)
-                    .fill(lit ? Theme.accent : Theme.panel2)
+                shape.fill(fillColor)
+                    .themeFinish(theme, shape, lit: lit)
+                    // Pressed, the shadow tightens: the key has moved
+                    // toward the surface. Radius is plain data, so the
+                    // press never rebuilds the view holding the gesture.
+                    .themeDepth(theme, radius: pressed ? 1.5 : 4,
+                                y: pressed ? 1 : 3)
             )
-            .overlay(
-                RoundedRectangle(cornerRadius: 14)
-                    .strokeBorder(Theme.accent.opacity(latched ? 0.9 : 0.35),
-                                  lineWidth: latched ? 2 : 1)
-            )
+            .overlay(shape.strokeBorder(edgeColor, lineWidth: edgeWidth))
+            .themeGlow(theme, glowColor, radius: 8, when: theme.traits.outlined)
             // Only the momentary press scales. A latched button holding at
             // 0.96 would read as permanently half-pressed.
             .scaleEffect(pressed ? 0.96 : 1)
@@ -402,25 +446,26 @@ struct PadButton: View {
 /// Colour carries connection, brightness carries traffic, so a glance
 /// answers both "is anything listening" and "is it hearing me".
 struct MIDIStatusDot: View {
+    @Environment(\.theme) private var theme
     @ObservedObject var midi: MIDIEngine
 
     private var connected: Bool { !midi.destinationNames.isEmpty }
 
     private var fill: Color {
-        if midi.activity { return Theme.good }
-        return connected ? Theme.accent : Color.white.opacity(0.12)
+        if midi.activity { return theme.good }
+        return connected ? theme.accent : theme.line(0.12)
     }
 
     private var glow: Color {
-        if midi.activity { return Theme.good.opacity(0.85) }
-        return connected ? Theme.accent.opacity(0.5) : .clear
+        if midi.activity { return theme.good.opacity(0.85) }
+        return connected ? theme.accent.opacity(0.5) : .clear
     }
 
     var body: some View {
         Circle()
             .fill(fill)
             .frame(width: 10, height: 10)
-            .shadow(color: glow, radius: midi.activity ? 6 : 4)
+            .themeGlow(theme, glow, radius: midi.activity ? 6 : 4)
             .animation(.easeOut(duration: 0.1), value: midi.activity)
             .animation(.easeOut(duration: 0.25), value: connected)
             .accessibilityLabel(connected ? "MIDI connected" : "No MIDI destination")
@@ -430,23 +475,29 @@ struct MIDIStatusDot: View {
 // MARK: - Small widgets
 
 struct MeterBar: View {
+    @Environment(\.theme) private var theme
     let label: String
     let value: Double // 0...1
 
+    /// No glow here in any style: meters move sixteen times a second, all
+    /// four at once, and a blur on each would be the costliest thing on the
+    /// deck for the least benefit.
     var body: some View {
+        let shape = RoundedRectangle(cornerRadius: theme.radius(3))
+
         VStack(spacing: 3) {
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
-                    Capsule().fill(Color.white.opacity(0.08))
-                    Capsule()
-                        .fill(Theme.accent.opacity(0.85))
+                    shape.fill(theme.line(0.08))
+                    shape
+                        .fill(theme.accent.opacity(0.85))
                         .frame(width: max(4, geo.size.width * value))
                 }
             }
             .frame(height: 6)
             Text(label)
                 .font(.system(size: 8, weight: .semibold).monospaced())
-                .foregroundColor(Theme.dim)
+                .foregroundColor(theme.dim)
         }
         // Meters arrive at 16 Hz; easing each step turns a stepped readout
         // into continuous movement without adding perceptible lag.

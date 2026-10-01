@@ -76,6 +76,7 @@ enum XYSurfaceMode: String, Codable, CaseIterable, Identifiable {
 /// when it is not, so the layout is final before the artwork lands and
 /// dropping the three images in later needs no code change.
 struct PadModeButton: View {
+    @Environment(\.theme) private var theme
     let mode: XYSurfaceMode
     let selected: Bool
     let action: () -> Void
@@ -96,13 +97,13 @@ struct PadModeButton: View {
                 } else {
                     Image(systemName: mode.symbol)
                         .font(.system(size: 22, weight: .semibold))
-                        .foregroundColor(Theme.accent)
+                        .foregroundColor(theme.accent)
                 }
             }
             .frame(width: side, height: side)
             .opacity(selected ? 1 : 0.38)
             .scaleEffect(selected ? 1 : 0.88)
-            .shadow(color: selected ? Theme.accent.opacity(0.45) : .clear, radius: 5)
+            .themeGlow(theme, selected ? theme.accent.opacity(0.45) : Color.clear, radius: 5)
             .animation(.easeOut(duration: 0.15), value: selected)
             // Keeps the finger target at 44pt without making the artwork
             // bigger or spacing the row out.
@@ -122,6 +123,7 @@ struct PadModeButton: View {
 /// to a 44pt tap target — the gap is built in, and adding more on top just
 /// spends width the preset name wants.
 struct PadModeSelector: View {
+    @Environment(\.theme) private var theme
     @Binding var selection: XYSurfaceMode
     var spacing: CGFloat = 0
 
@@ -159,9 +161,42 @@ struct PadModeSelector: View {
 /// lift B, and A comes back. That's the note-priority behavior of a classic
 /// mono synth, and it works the same way at 2 and 3 voices once full.
 struct XYPadView: View {
+    @Environment(\.theme) private var theme
     @EnvironmentObject var app: AppState
 
     // ── CC-mode change tracking ─────────────────────────────────────────
+    /// The touch gate currently holding 127, if any.
+    ///
+    /// Stores the whole target the "on" went to — not just a flag — so the
+    /// "off" reaches the same CC and channel even if the setting is edited,
+    /// switched off, or the pad changes mode while a finger is still down.
+    /// Anything else leaves the host parameter stuck on.
+    @State private var touchGate: PadTouchCC? = nil
+
+    /// A reference type held in @State so it lives as long as the pad and is
+    /// created once, not on every redraw.
+    @State private var smoother = PadCCSmoother()
+
+    /// Smooth is on for the mode the pad is in now. Notes and Drawbars never
+    /// smooth.
+    private var smoothOn: Bool {
+        guard cfg.mode == .cc else { return false }
+        switch cfg.ccMode {
+        case .standard: return cfg.xySmooth
+        case .morph:    return cfg.morphSmooth
+        default:        return false
+        }
+    }
+
+    /// Every XY and 4-Corner position CC goes out through here.
+    private func sendPadCC(_ cc: Int, value: Int, channel: Int) {
+        if smoothOn {
+            smoother.set(cc: cc, channel: channel, value: value)
+        } else {
+            app.midi.controlChange(cc, value: value, channel: channel)
+        }
+    }
+
     @State private var lastX = -1
     @State private var lastY = -1
 
@@ -264,6 +299,10 @@ struct XYPadView: View {
         // sheet's selector, and a dial step's Set Pad Mode. Only the first
         // used to release anything, so the other two could strand notes.
         .onChange(of: cfg.mode) { oldMode, newMode in
+            smoother.reset()
+            // The gate belongs to the mode that opened it. A finger still down
+            // re-opens the NEW mode's gate on its next movement.
+            closeTouchGate()
             if oldMode == .notes && newMode != .notes {
                 handOffVoicesLeavingNotes()
             }
@@ -282,6 +321,8 @@ struct XYPadView: View {
             }
         }
         .onChange(of: cfg.ccMode) { _, _ in
+            smoother.reset()
+            closeTouchGate()
             cancelDrawbarRamps(commit: true)
             // Clear dedupe state both ways, so the first move after a mode
             // switch always transmits rather than being suppressed as a
@@ -295,17 +336,29 @@ struct XYPadView: View {
             syncDrawbarLevelsFromPreset()
         }
         .onChange(of: app.activePresetID) { _, _ in
+            smoother.reset()
+            closeTouchGate()
             cancelDrawbarRamps(commit: false)
             drawbarFingerBars.removeAll()
             drawbarPreviousPoints.removeAll()
             syncDrawbarLevelsFromPreset()
         }
         .onAppear {
+            smoother.attach(app.midi)
             sendPortamentoState(on: cfg.glide)
             syncDrawbarLevelsFromPreset()
         }
+        // Switching Smooth on or off mid-gesture: settle whatever is pending
+        // and start clean, rather than interpolating from a stale value.
+        .onChange(of: smoothOn) { _, _ in
+            smoother.reset()
+        }
         .onDisappear {
+            smoother.reset()
             cancelDrawbarRamps(commit: true)
+            // The second surface being switched off takes this pad with it;
+            // a gate left open would hold its host parameter on for good.
+            closeTouchGate()
         }
     }
 
@@ -328,10 +381,10 @@ struct XYPadView: View {
                     .font(.system(size: 12, weight: .bold, design: .rounded))
                     .monospacedDigit()
             }
-            .foregroundColor(Theme.bg)
+            .foregroundColor(theme.bg)
             .padding(.horizontal, 9)
             .frame(height: 30)
-            .background(Capsule().fill(Theme.accent))
+            .background(Capsule().fill(theme.accent))
         }
         .buttonStyle(.plain)
         .accessibilityLabel("\(app.latchedNotes.count) held notes. Tap to release.")
@@ -383,11 +436,11 @@ struct XYPadView: View {
                 Image(systemName: "chevron.up.chevron.down")
                     .font(.system(size: 7, weight: .bold))
             }
-            .foregroundColor(Theme.dim)
+            .foregroundColor(theme.dim)
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
-            .background(Capsule().fill(Theme.panel2))
-            .overlay(Capsule().strokeBorder(Color.white.opacity(0.08), lineWidth: 1))
+            .background(Capsule().fill(theme.panel2))
+            .overlay(Capsule().strokeBorder(theme.line(0.08), lineWidth: 1))
         }
         .buttonStyle(.plain)
         // A long preset name must not push the gear off the row, so the chip
@@ -397,16 +450,39 @@ struct XYPadView: View {
 
     // MARK: - Pad surface
 
+    /// The pad's own colour, as a theme. Everything drawn ON the pad — puck,
+    /// border, note bands, scale chip — reads its accent from here; morph
+    /// corners and drawbars then narrow it again to their own colours, and
+    /// fall back to this one when they have none.
+    private var padTheme: ThemeColors { theme.accented(.pad) }
+
+    /// The pad's own corner radius in the current style.
+    private var padCorner: CGFloat { theme.radius(20) }
+
+    private var padBorderColor: Color {
+        touching
+            ? padTheme.activeEdge(padTheme.accent)
+            : padTheme.restingEdge(padTheme.accent, quiet: theme.line(0.08))
+    }
+
+    private var padBorderWidth: CGFloat {
+        theme.stroke(touching ? 2 : 1)
+    }
+
     private var padSurface: some View {
         GeometryReader { geo in
             let size = geo.size
             ZStack {
-                RoundedRectangle(cornerRadius: 20)
-                    .fill(Theme.panel)
+                RoundedRectangle(cornerRadius: padCorner)
+                    .fill(theme.panel)
+                    // Shaded styles sink the pad into the deck: drawn as a
+                    // pressed-in surface, faintly, so it reads as a well the
+                    // puck moves in rather than another button.
+                    .themeFinish(theme, RoundedRectangle(cornerRadius: padCorner),
+                                 lit: true, strength: 0.5)
                     .overlay(
-                        RoundedRectangle(cornerRadius: 20)
-                            .strokeBorder(touching ? Theme.accent : Color.white.opacity(0.08),
-                                          lineWidth: touching ? 2 : 1)
+                        RoundedRectangle(cornerRadius: padCorner)
+                            .strokeBorder(padBorderColor, lineWidth: padBorderWidth)
                     )
 
                 // Decoration layer. Clipped to the pad's own rounded shape —
@@ -426,7 +502,7 @@ struct XYPadView: View {
                         crosshairGrid(size: size)
                     }
                 }
-                .clipShape(RoundedRectangle(cornerRadius: 20))
+                .clipShape(RoundedRectangle(cornerRadius: padCorner))
 
                 // Suspended fingers get a dimmed, hollow puck so you can see
                 // where a held-but-silent finger will come back at.
@@ -444,7 +520,10 @@ struct XYPadView: View {
             .overlay(
                 MultitouchSurface(
                     onTouchesChanged: { points in handleTouches(points) },
-                    onAllTouchesEnded: { handleAllTouchesEnded() }
+                    onAllTouchesEnded: { handleAllTouchesEnded() },
+                    coalesce: smoothOn,
+                    onBurstBegan: { smoother.beginBurst() },
+                    onBurstEnded: { smoother.endBurst() }
                 )
             )
             // The scale chip sits ABOVE the touch layer, because anything
@@ -480,11 +559,11 @@ struct XYPadView: View {
                 Image(systemName: "chevron.down")
                     .font(.system(size: 8, weight: .bold))
             }
-            .foregroundColor(Theme.accent)
+            .foregroundColor(padTheme.accent)
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
-            .background(Capsule().fill(Theme.bg.opacity(0.88)))
-            .overlay(Capsule().strokeBorder(Theme.accent.opacity(0.4), lineWidth: 1))
+            .background(Capsule().fill(theme.bg.opacity(0.88)))
+            .overlay(Capsule().strokeBorder(padTheme.accent.opacity(0.4), lineWidth: 1))
         }
         .buttonStyle(.plain)
         // Faded almost out while a finger is on the pad. It is a setup
@@ -506,13 +585,13 @@ struct XYPadView: View {
     private var scalePanel: some View {
         VStack(spacing: 0) {
             scalePanelTopRow
-            Divider().overlay(Theme.accent.opacity(0.25))
+            Divider().overlay(padTheme.accent.opacity(0.25))
             scalePanelRangeRow
-            Divider().overlay(Theme.accent.opacity(0.25))
+            Divider().overlay(padTheme.accent.opacity(0.25))
             scalePanelScaleList
         }
         .frame(width: 300)
-        .background(Theme.panel)
+        .background(theme.panel)
     }
 
     /// `↓  [root wheel]  [octave]  ↑`
@@ -541,7 +620,7 @@ struct XYPadView: View {
 
             Text("\(rootOctaveNumber)")
                 .font(.system(size: 30, weight: .bold, design: .rounded))
-                .foregroundColor(Theme.accent)
+                .foregroundColor(padTheme.accent)
                 .monospacedDigit()
                 .frame(minWidth: 34)
 
@@ -565,11 +644,11 @@ struct XYPadView: View {
                 .frame(width: 38, height: 38)
                 .background(
                     RoundedRectangle(cornerRadius: 9)
-                        .fill(Theme.panel2)
+                        .fill(theme.panel2)
                 )
         }
         .buttonStyle(.plain)
-        .foregroundColor(possible ? Theme.accent : Theme.dim.opacity(0.4))
+        .foregroundColor(possible ? padTheme.accent : theme.dim.opacity(0.4))
         .disabled(!possible)
         .accessibilityLabel(delta > 0 ? "Octave up" : "Octave down")
     }
@@ -579,11 +658,11 @@ struct XYPadView: View {
             HStack {
                 Text("Range")
                     .font(.system(size: 12, weight: .semibold, design: .rounded))
-                    .foregroundColor(Theme.dim)
+                    .foregroundColor(theme.dim)
                 Spacer()
                 Text(rangeDescription)
                     .font(.system(size: 12, weight: .bold, design: .rounded))
-                    .foregroundColor(Theme.accent)
+                    .foregroundColor(padTheme.accent)
                     .monospacedDigit()
             }
 
@@ -605,7 +684,7 @@ struct XYPadView: View {
                 in: 1...60,
                 step: 1
             )
-            .tint(Theme.accent)
+            .tint(padTheme.accent)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -623,18 +702,18 @@ struct XYPadView: View {
                             Text(scale.label)
                                 .font(.system(size: 14, weight: scale == cfg.scale ? .bold : .regular,
                                               design: .rounded))
-                                .foregroundColor(scale == cfg.scale ? Theme.accent : .white.opacity(0.82))
+                                .foregroundColor(scale == cfg.scale ? padTheme.accent : theme.text.opacity(0.82))
                             Spacer(minLength: 0)
                             if scale == cfg.scale {
                                 Image(systemName: "checkmark")
                                     .font(.system(size: 12, weight: .bold))
-                                    .foregroundColor(Theme.accent)
+                                    .foregroundColor(padTheme.accent)
                             }
                         }
                         .padding(.horizontal, 14)
                         .padding(.vertical, 9)
                         .contentShape(Rectangle())
-                        .background(scale == cfg.scale ? Theme.accent.opacity(0.12) : .clear)
+                        .background(scale == cfg.scale ? padTheme.accent.opacity(0.12) : .clear)
                     }
                     .buttonStyle(.plain)
                 }
@@ -720,9 +799,9 @@ struct XYPadView: View {
         // Binding-based overload instead of the actual line at fault.
         let bandFills: [Color] = (0..<count).map { i in
             if scaleNotes[i] == cfg.rootNote {
-                return Theme.accent.opacity(0.16)   // brighter: the root note's band
+                return padTheme.accent.opacity(0.16)   // brighter: the root note's band
             }
-            return i % 2 == 0 ? Theme.accent.opacity(0.08) : Color.clear
+            return i % 2 == 0 ? padTheme.accent.opacity(0.08) : Color.clear
         }
 
         return AnyView(
@@ -762,7 +841,7 @@ struct XYPadView: View {
             ZStack {
                 ForEach(Array(alongs.enumerated()), id: \.offset) { _, along in
                     perpendicularLine(at: along, size: size)
-                        .stroke(Theme.accent.opacity(0.22),
+                        .stroke(padTheme.accent.opacity(0.22),
                                 style: StrokeStyle(lineWidth: 1.5,
                                                    lineCap: .round,
                                                    dash: [3, 6]))
@@ -841,6 +920,8 @@ struct XYPadView: View {
         let isLeft = (index == 0 || index == 2)
         let isTop  = (index == 0 || index == 1)
 
+        let cornerColor = padTheme.color(for: .morphCorner(index))
+
         let inset: CGFloat = 26
         let x = isLeft ? inset : size.width - inset
         let y = isTop ? inset : size.height - inset
@@ -848,24 +929,24 @@ struct XYPadView: View {
         return VStack(spacing: 2) {
             ZStack {
                 Circle()
-                    .stroke(Color.white.opacity(0.10), lineWidth: 3)
+                    .stroke(theme.line(0.10), lineWidth: 3)
                 Circle()
                     .trim(from: 0, to: max(fraction, 0.001))
-                    .stroke(Theme.accent.opacity(0.35 + 0.65 * fraction),
+                    .stroke(cornerColor.opacity(0.35 + 0.65 * fraction),
                             style: StrokeStyle(lineWidth: 3, lineCap: .round))
                     .rotationEffect(.degrees(-90))
-                    .shadow(color: Theme.accent.opacity(fraction * 0.8),
-                            radius: 5 * fraction)
+                    .themeGlow(theme, cornerColor.opacity(fraction * 0.8),
+                               radius: 5 * fraction)
 
                 Text(label.isEmpty ? " " : String(label.prefix(2)).uppercased())
-                    .font(.system(size: 9, weight: .bold, design: .rounded))
-                    .foregroundColor(Theme.accent.opacity(0.4 + 0.6 * fraction))
+                    .font(theme.font(9, weight: .bold))
+                    .foregroundColor(cornerColor.opacity(0.4 + 0.6 * fraction))
             }
             .frame(width: 30, height: 30)
 
             Text("\(level)")
                 .font(.system(size: 8, weight: .semibold).monospaced())
-                .foregroundColor(Theme.dim)
+                .foregroundColor(theme.dim)
         }
         .position(x: x, y: y)
         .animation(.easeOut(duration: 0.08), value: level)
@@ -878,7 +959,7 @@ struct XYPadView: View {
             p.move(to: CGPoint(x: 0, y: size.height / 2))
             p.addLine(to: CGPoint(x: size.width, y: size.height / 2))
         }
-        .stroke(Color.white.opacity(0.07), lineWidth: 1)
+        .stroke(theme.line(0.07), lineWidth: 1)
     }
 
     // MARK: - Drawbar surface
@@ -904,6 +985,7 @@ struct XYPadView: View {
         let level = drawbarLevels.indices.contains(index) ? drawbarLevels[index] : 0
         let fraction = CGFloat(level) / 127.0
         let inset: CGFloat = 24
+        let barColor = padTheme.color(for: .drawbar(index))
 
         if cfg.drawbarDirection.isVertical {
             let laneWidth = size.width / CGFloat(max(count, 1))
@@ -922,40 +1004,30 @@ struct XYPadView: View {
             // solid. Kept narrower than the handle, which is what makes the
             // handle look like something you can grab.
             let shaftWidth = max(8, handleWidth * 0.6)
-            let shaftCorner = min(shaftWidth * 0.3, 6)
+            let shaftCorner = theme.radius(min(shaftWidth * 0.3, 6))
 
             Rectangle()
-                .fill(Color.white.opacity(0.045))
+                .fill(theme.line(0.045))
                 .frame(width: 1, height: size.height)
                 .position(x: laneWidth * CGFloat(index + 1), y: size.height / 2)
 
             RoundedRectangle(cornerRadius: shaftCorner)
-                .fill(Color.white.opacity(0.08))
+                .fill(theme.line(0.08))
                 .frame(width: shaftWidth, height: travel)
                 .position(x: x, y: (top + bottom) / 2)
 
             RoundedRectangle(cornerRadius: shaftCorner)
-                .fill(Theme.accent.opacity(0.55))
+                .fill(barColor.opacity(0.55))
                 .frame(width: shaftWidth, height: fillHeight)
                 .position(x: x, y: (zeroY + y) / 2)
 
-            RoundedRectangle(cornerRadius: 5)
-                .fill(Theme.accent)
-                .frame(width: handleWidth, height: 18)
-                .shadow(color: Theme.accent.opacity(0.45), radius: 5)
-                .overlay(
-                    // The number shown is what the host RECEIVES, so it
-                    // matches the CC map and the host's own display even
-                    // when the invert is on.
-                    Text("\(cfg.drawbarOutput(level))")
-                        .font(.system(size: 7, weight: .bold, design: .monospaced))
-                        .foregroundColor(Theme.bg.opacity(0.9))
-                )
+            drawbarHandle(level: level, color: barColor,
+                          width: handleWidth, height: 18, rotated: false)
                 .position(x: x, y: y)
 
             Text("\(index + 1)")
-                .font(.system(size: 8, weight: .semibold, design: .rounded))
-                .foregroundColor(Theme.dim)
+                .font(theme.font(8, weight: .semibold))
+                .foregroundColor(theme.dim)
                 .position(x: x,
                           y: cfg.drawbarDirection == .up ? size.height - 9 : 9)
         } else {
@@ -971,41 +1043,67 @@ struct XYPadView: View {
             let fillWidth = max(abs(zeroX - x), 1)
             let handleHeight = max(16, min(42, laneHeight * 0.66))
             let shaftHeight = max(8, handleHeight * 0.6)
-            let shaftCorner = min(shaftHeight * 0.3, 6)
+            let shaftCorner = theme.radius(min(shaftHeight * 0.3, 6))
 
             Rectangle()
-                .fill(Color.white.opacity(0.045))
+                .fill(theme.line(0.045))
                 .frame(width: size.width, height: 1)
                 .position(x: size.width / 2, y: laneHeight * CGFloat(index + 1))
 
             RoundedRectangle(cornerRadius: shaftCorner)
-                .fill(Color.white.opacity(0.08))
+                .fill(theme.line(0.08))
                 .frame(width: travel, height: shaftHeight)
                 .position(x: (left + right) / 2, y: y)
 
             RoundedRectangle(cornerRadius: shaftCorner)
-                .fill(Theme.accent.opacity(0.55))
+                .fill(barColor.opacity(0.55))
                 .frame(width: fillWidth, height: shaftHeight)
                 .position(x: (zeroX + x) / 2, y: y)
 
-            RoundedRectangle(cornerRadius: 5)
-                .fill(Theme.accent)
-                .frame(width: 18, height: handleHeight)
-                .shadow(color: Theme.accent.opacity(0.45), radius: 5)
-                .overlay(
-                    Text("\(cfg.drawbarOutput(level))")
-                        .font(.system(size: 7, weight: .bold, design: .monospaced))
-                        .foregroundColor(Theme.bg.opacity(0.9))
-                        .rotationEffect(.degrees(-90))
-                )
+            drawbarHandle(level: level, color: barColor,
+                          width: 18, height: handleHeight, rotated: true)
                 .position(x: x, y: y)
 
             Text("\(index + 1)")
-                .font(.system(size: 8, weight: .semibold, design: .rounded))
-                .foregroundColor(Theme.dim)
+                .font(theme.font(8, weight: .semibold))
+                .foregroundColor(theme.dim)
                 .position(x: cfg.drawbarDirection == .right ? 9 : size.width - 9,
                           y: y)
         }
+    }
+
+    /// The grab handle on a drawbar, in the current style.
+    ///
+    /// The number shown is what the host RECEIVES, so it matches the CC map
+    /// and the host's own display even when the invert is on.
+    private func drawbarHandle(level: Int, color: Color,
+                               width: CGFloat, height: CGFloat,
+                               rotated: Bool) -> some View {
+        let shape = RoundedRectangle(cornerRadius: theme.radius(5))
+        let numberColor: Color = theme.traits.outlined
+            ? color
+            : theme.bg.opacity(0.9)
+        let edge: Color = theme.traits.inkBorders ? theme.text : color
+        let edgeWidth: CGFloat = (theme.traits.inkBorders || theme.traits.outlined)
+            ? theme.stroke(1)
+            : 0
+
+        // One shadow at most: the glow in the flat styles, a drop shadow in
+        // the shaded ones.
+        return shape
+            .fill(theme.litFill(color))
+            .themeFinish(theme, shape)
+            .overlay(shape.strokeBorder(edge, lineWidth: edgeWidth))
+            .frame(width: width, height: height)
+            .themeGlow(theme, color.opacity(0.45), radius: 5,
+                       when: !theme.traits.shaded)
+            .themeDepth(theme, radius: 2, y: 1.5, single: true)
+            .overlay(
+                Text("\(cfg.drawbarOutput(level))")
+                    .font(.system(size: 7, weight: .bold, design: .monospaced))
+                    .foregroundColor(numberColor)
+                    .rotationEffect(.degrees(rotated ? -90 : 0))
+            )
     }
 
     private func diagonalGuide(size: CGSize) -> some View {
@@ -1019,21 +1117,37 @@ struct XYPadView: View {
                 p.addLine(to: CGPoint(x: size.width, y: size.height))
             }
         }
-        .stroke(Theme.accent.opacity(0.35),
+        .stroke(padTheme.accent.opacity(0.35),
                 style: StrokeStyle(lineWidth: 2, dash: [6, 6]))
     }
 
+    /// One sounding voice.
+    ///
+    /// This is the view that redraws on every touch move, once per finger,
+    /// so it is where the styles' glow setting matters most: Flat, Graphic
+    /// and Candy draw it with no shadow at all, and the shaded styles swap
+    /// the glow for a single drop shadow — never both.
     private func puck(for voice: Voice, size: CGSize) -> some View {
-        ZStack {
+        let color: Color = padTheme.accent
+        let edge: Color = padTheme.activeEdge(color)
+        let edgeWidth: CGFloat = (theme.traits.inkBorders || theme.traits.outlined)
+            ? theme.stroke(2)
+            : 0
+
+        return ZStack {
             Circle()
-                .fill(Theme.accent)
+                .fill(padTheme.litFill(color))
+                .themeFinish(theme, Circle(), round: true)
+                .overlay(Circle().strokeBorder(edge, lineWidth: edgeWidth))
                 .frame(width: 44, height: 44)
-                .shadow(color: Theme.accent.opacity(0.7), radius: 14)
+                .themeGlow(theme, color.opacity(0.7), radius: 14,
+                           when: !theme.traits.shaded)
+                .themeDepth(theme, radius: 5, y: 3, single: true)
 
             if cfg.mode == .notes {
                 Text(noteName(voice.note))
                     .font(.caption2.monospaced().weight(.bold))
-                    .foregroundColor(Theme.bg)
+                    .foregroundColor(padTheme.litForeground(color))
             }
         }
         .position(x: voice.x * size.width,
@@ -1044,12 +1158,12 @@ struct XYPadView: View {
     private func suspendedPuck(for voice: Voice, size: CGSize) -> some View {
         ZStack {
             Circle()
-                .strokeBorder(Theme.accent.opacity(0.35), lineWidth: 2)
+                .strokeBorder(padTheme.accent.opacity(0.35), lineWidth: 2)
                 .frame(width: 40, height: 40)
 
             Text(noteName(voice.note))
                 .font(.caption2.monospaced())
-                .foregroundColor(Theme.accent.opacity(0.5))
+                .foregroundColor(padTheme.accent.opacity(0.5))
         }
         .position(x: voice.x * size.width,
                   y: (1 - voice.y) * size.height)
@@ -1175,6 +1289,38 @@ struct XYPadView: View {
         voices = [Voice(id: point.id, x: point.x, y: point.y, note: -1)]
         suspended.removeAll()
         emitCC(x: point.x, y: point.y)
+        // After the position, so whatever the gate switches on starts from
+        // where the finger actually landed rather than the last position.
+        openTouchGate()
+    }
+
+    // MARK: - Touch gate
+
+    /// The gate for the mode the pad is in now. Drawbars and Notes have none.
+    private var currentTouchTarget: PadTouchCC? {
+        guard cfg.mode == .cc else { return nil }
+        switch cfg.ccMode {
+        case .standard: return cfg.xyTouch
+        case .morph:    return cfg.morphTouch
+        default:        return nil
+        }
+    }
+
+    /// Send the on value, once per touch. Additional fingers do not resend
+    /// it — one gesture is one gate, however many fingers it uses.
+    private func openTouchGate() {
+        guard touchGate == nil,
+              let target = currentTouchTarget, target.enabled else { return }
+        app.midi.controlChange(target.cc, value: 127, channel: target.channel)
+        touchGate = target
+    }
+
+    /// Send the off value to wherever the on went. Safe to call anywhere:
+    /// it does nothing when no gate is open.
+    private func closeTouchGate() {
+        guard let open = touchGate else { return }
+        app.midi.controlChange(open.cc, value: 0, channel: open.channel)
+        touchGate = nil
     }
 
     // MARK: - Drawbar touch handling
@@ -1415,6 +1561,10 @@ struct XYPadView: View {
         } else {
             handOffVoicesLeavingNotes()
 
+            // The last finger position lands before the spring jumps away
+            // from it, and before the touch gate closes.
+            smoother.flush()
+
             // Each mode springs by its own rule. Note mode is absent from
             // both branches: the notes already ended on release, so there is
             // nothing left to move.
@@ -1431,6 +1581,10 @@ struct XYPadView: View {
                 break
             }
         }
+
+        // Last, after any spring: something the gate switches off should see
+        // the pad settle to its release position first, not jump afterwards.
+        closeTouchGate()
     }
 
     private func releaseAllVoices() {
@@ -1527,11 +1681,11 @@ struct XYPadView: View {
         let yv = Int((y * 127).rounded())
         if xv != lastX {
             lastX = xv
-            app.midi.controlChange(cfg.xCC, value: xv, channel: cfg.standardChannel)
+            sendPadCC(cfg.xCC, value: xv, channel: cfg.standardChannel)
         }
         if yv != lastY {
             lastY = yv
-            app.midi.controlChange(cfg.yCC, value: yv, channel: cfg.standardChannel)
+            sendPadCC(cfg.yCC, value: yv, channel: cfg.standardChannel)
         }
     }
 
@@ -1557,9 +1711,7 @@ struct XYPadView: View {
             guard lastMorph[index] != value else { continue }
             lastMorph[index] = value
             changed = true
-            app.midi.controlChange(corner.cc,
-                                   value: value,
-                                   channel: corner.channel)
+            sendPadCC(corner.cc, value: value, channel: corner.channel)
         }
 
         // Only touch @State when something moved — otherwise a stationary
@@ -1639,13 +1791,18 @@ struct TouchPoint: Equatable {
 struct MultitouchSurface: UIViewRepresentable {
     var onTouchesChanged: ([TouchPoint]) -> Void
     var onAllTouchesEnded: () -> Void
+    /// Deliver the in-between finger positions iOS records between screen
+    /// updates, bracketed by the burst callbacks. Off leaves reporting
+    /// exactly as it was.
+    var coalesce: Bool = false
+    var onBurstBegan: (() -> Void)? = nil
+    var onBurstEnded: (() -> Void)? = nil
 
     func makeUIView(context: Context) -> TouchTrackingView {
         let view = TouchTrackingView()
         view.backgroundColor = .clear
         view.isMultipleTouchEnabled = true
-        view.onTouchesChanged = onTouchesChanged
-        view.onAllTouchesEnded = onAllTouchesEnded
+        updateUIView(view, context: context)
         return view
     }
 
@@ -1653,12 +1810,18 @@ struct MultitouchSurface: UIViewRepresentable {
         // Closures capture current SwiftUI state, so refresh them each pass.
         uiView.onTouchesChanged = onTouchesChanged
         uiView.onAllTouchesEnded = onAllTouchesEnded
+        uiView.coalesce = coalesce
+        uiView.onBurstBegan = onBurstBegan
+        uiView.onBurstEnded = onBurstEnded
     }
 }
 
 final class TouchTrackingView: UIView {
     var onTouchesChanged: (([TouchPoint]) -> Void)?
     var onAllTouchesEnded: (() -> Void)?
+    var coalesce = false
+    var onBurstBegan: (() -> Void)?
+    var onBurstEnded: (() -> Void)?
 
     /// UITouch objects are recycled by UIKit, so we assign our own stable
     /// integer id for the lifetime of each finger's contact.
@@ -1674,7 +1837,33 @@ final class TouchTrackingView: UIView {
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
-        report()
+        guard coalesce, let event else {
+            report()
+            return
+        }
+
+        // iOS samples fingers faster than it redraws and hands the extra
+        // positions over in one go. Reporting each of them, oldest first,
+        // gives the real path the finger took instead of only where it ended
+        // up this frame. Fingers with fewer samples repeat their last one.
+        let samples: [(id: Int, locations: [CGPoint])] = touchIDs.map { touch, id in
+            let path = event.coalescedTouches(for: touch) ?? [touch]
+            let locations = path.isEmpty
+                ? [touch.location(in: self)]
+                : path.map { $0.location(in: self) }
+            return (id, locations)
+        }
+        let count = samples.map(\.locations.count).max() ?? 1
+
+        onBurstBegan?()
+        for index in 0..<count {
+            let points = samples.map { sample in
+                normalized(id: sample.id,
+                           location: sample.locations[min(index, sample.locations.count - 1)])
+            }
+            report(points)
+        }
+        onBurstEnded?()
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -1697,18 +1886,214 @@ final class TouchTrackingView: UIView {
 
     /// Send the current full set of fingers, normalized to 0...1.
     private func report() {
+        report(touchIDs.map { touch, id in
+            normalized(id: id, location: touch.location(in: self))
+        })
+    }
+
+    private func report(_ points: [TouchPoint]) {
         guard bounds.width > 0, bounds.height > 0 else { return }
+        onTouchesChanged?(points.sorted { $0.id < $1.id })   // oldest finger first
+    }
 
-        let points = touchIDs.map { touch, id -> TouchPoint in
-            let location = touch.location(in: self)
-            let x = min(max(location.x / bounds.width, 0), 1)
-            // Flip Y so 0 is the bottom of the pad.
-            let y = min(max(1 - location.y / bounds.height, 0), 1)
-            return TouchPoint(id: id, x: Double(x), y: Double(y))
+    private func normalized(id: Int, location: CGPoint) -> TouchPoint {
+        let w = max(bounds.width, 1), h = max(bounds.height, 1)
+        let x = min(max(location.x / w, 0), 1)
+        // Flip Y so 0 is the bottom of the pad.
+        let y = min(max(1 - location.y / h, 0), 1)
+        return TouchPoint(id: id, x: Double(x), y: Double(y))
+    }
+}
+
+// MARK: - CC smoothing
+
+/// Spreads each change in a pad CC across the time until the next finger
+/// report, so a fast move arrives as a run of steps instead of one jump.
+///
+/// Never trails the finger by more than one report — around 8 ms on a 120 Hz
+/// iPad, 16 ms on 60 Hz. Every new report replaces whatever is still pending
+/// and starts from the value actually sent last, so delay cannot build up the
+/// way it does with a glide.
+///
+/// Values arriving outside a burst — a finger landing, the release spring —
+/// go out at once. Those are jumps by nature, and spreading them would only
+/// delay them.
+final class PadCCSmoother {
+    struct Key: Hashable {
+        let cc: Int
+        let channel: Int
+    }
+
+    private struct Step {
+        let due: CFTimeInterval
+        let value: Int
+    }
+
+    /// Closest two steps of one CC may be. About 500 per second at most,
+    /// which keeps a fast swipe from flooding a Bluetooth MIDI link.
+    private static let minSpacing: CFTimeInterval = 0.002
+
+    private let queue = DispatchQueue(label: "com.mrbrad.motionmidi.smoother",
+                                      qos: .userInteractive)
+
+    // Everything below is touched only on `queue`.
+    private weak var midi: MIDIEngine?
+    private var sent: [Key: Int] = [:]
+    private var waypoints: [Key: [Int]] = [:]
+    private var pending: [Key: [Step]] = [:]
+    private var inBurst = false
+    private var lastCommit: CFTimeInterval = 0
+    private var timer: DispatchSourceTimer?
+
+    // Main-thread API. Each call is synchronous, so anything the view sends
+    // straight afterwards — a touch gate, say — lands behind it on the wire.
+
+    func attach(_ midi: MIDIEngine) {
+        queue.sync { self.midi = midi }
+    }
+
+    func beginBurst() {
+        queue.sync {
+            inBurst = true
+            waypoints.removeAll()
         }
-        .sorted { $0.id < $1.id }   // stable order: oldest finger first
+    }
 
-        onTouchesChanged?(points)
+    func endBurst() {
+        queue.sync {
+            inBurst = false
+            commit()
+        }
+    }
+
+    /// Inside a burst this is a waypoint; outside one it is sent now.
+    func set(cc: Int, channel: Int, value: Int) {
+        let key = Key(cc: cc, channel: channel)
+        queue.sync {
+            if inBurst {
+                waypoints[key, default: []].append(value)
+            } else {
+                pending[key] = nil
+                send(key, value)
+            }
+        }
+    }
+
+    /// Land everything pending on its final value now.
+    func flush() {
+        queue.sync { flushLocked() }
+    }
+
+    /// Flush, then forget what was last sent. Used when the pad changes mode
+    /// or preset, where the next values have no relation to the last ones.
+    func reset() {
+        queue.sync {
+            flushLocked()
+            sent.removeAll()
+        }
+    }
+
+    // MARK: Queue-only
+
+    private func commit() {
+        let now = CACurrentMediaTime()
+        var interval = now - lastCommit
+        lastCommit = now
+        // A long gap means the finger paused; the next move is judged against
+        // a normal frame rather than the whole pause.
+        if interval <= 0 || interval > 0.05 { interval = 1.0 / 120.0 }
+        let span = min(max(interval, 0.004), 0.020)
+
+        for (key, points) in waypoints where !points.isEmpty {
+            let start = sent[key] ?? points[0]
+            let path = [start] + points
+            let distance = zip(path, path.dropFirst()).reduce(0) { $0 + abs($1.1 - $1.0) }
+            guard distance > 0 else { continue }
+
+            let count = max(1, min(distance, Int(span / Self.minSpacing)))
+            var steps: [Step] = []
+            var previous = start
+            for index in 1...count {
+                let value = index == count
+                    ? points[points.count - 1]
+                    : Self.value(along: path, at: Double(index) / Double(count), total: distance)
+                guard value != previous else { continue }
+                // The first step goes out immediately; the last lands one
+                // spacing before the next report is due.
+                steps.append(Step(due: now + span * Double(index - 1) / Double(count),
+                                  value: value))
+                previous = value
+            }
+            pending[key] = steps.isEmpty ? nil : steps
+        }
+        waypoints.removeAll()
+
+        if !pending.isEmpty { startTimer() }
+    }
+
+    /// Position `fraction` of the way along a path of integer waypoints,
+    /// measured by distance travelled rather than by segment count.
+    private static func value(along path: [Int], at fraction: Double, total: Int) -> Int {
+        var remaining = fraction * Double(total)
+        for (a, b) in zip(path, path.dropFirst()) {
+            let length = Double(abs(b - a))
+            if remaining <= length, length > 0 {
+                return Int((Double(a) + Double(b - a) * remaining / length).rounded())
+            }
+            remaining -= length
+        }
+        return path[path.count - 1]
+    }
+
+    private func startTimer() {
+        guard timer == nil else { return }
+        let source = DispatchSource.makeTimerSource(flags: .strict, queue: queue)
+        source.schedule(deadline: .now(), repeating: .milliseconds(1),
+                        leeway: .microseconds(250))
+        source.setEventHandler { [weak self] in self?.tick() }
+        source.resume()
+        timer = source
+    }
+
+    private func tick() {
+        let now = CACurrentMediaTime()
+        for key in Array(pending.keys) {
+            guard var steps = pending[key] else { continue }
+            // If the timer ran late, send only the newest step that is due.
+            // Catching up with every missed one would be a burst — the exact
+            // thing this exists to avoid.
+            var latest: Int?
+            while let first = steps.first, first.due <= now {
+                latest = first.value
+                steps.removeFirst()
+            }
+            if let latest { send(key, latest) }
+            pending[key] = steps.isEmpty ? nil : steps
+        }
+        if pending.isEmpty { stopTimer() }
+    }
+
+    private func flushLocked() {
+        for (key, steps) in pending {
+            if let last = steps.last { send(key, last.value) }
+        }
+        pending.removeAll()
+        for (key, points) in waypoints {
+            if let last = points.last { send(key, last) }
+        }
+        waypoints.removeAll()
+        stopTimer()
+    }
+
+    private func stopTimer() {
+        timer?.cancel()
+        timer = nil
+    }
+
+    private func send(_ key: Key, _ value: Int) {
+        guard sent[key] != value else { return }
+        sent[key] = value
+        midi?.controlChange(key.cc, value: value, channel: key.channel)
     }
 }
 
@@ -1721,6 +2106,7 @@ final class TouchTrackingView: UIView {
 /// the sheet opens showing which of the four surfaces it is configuring and
 /// can switch between them without closing.
 struct XYPadConfigSheet: View {
+    @Environment(\.theme) private var theme
     @EnvironmentObject var app: AppState
     @Environment(\.dismiss) private var dismiss
 
@@ -1743,7 +2129,7 @@ struct XYPadConfigSheet: View {
         if let override {
             Label(message(override), systemImage: "dial.medium.fill")
                 .font(.caption)
-                .foregroundColor(Theme.accent)
+                .foregroundColor(theme.accent)
         }
     }
 
@@ -1785,13 +2171,29 @@ struct XYPadConfigSheet: View {
                                     selection: bind(\.standardChannel),
                                     range: 0...15) { String($0 + 1) }
 
-                        Picker("On Release", selection: bind(\.springTarget)) {
+                        // The master. Routed through setMasterSpringTarget
+                        // so an edit here takes over from a dial step that
+                        // was holding a different target, instead of silently
+                        // editing a value the pad was not using.
+                        Picker("On Release", selection: Binding(
+                            get: { app.preset.xyPad.springTarget },
+                            set: { app.setMasterSpringTarget($0) }
+                        )) {
                             ForEach(SpringTarget.allCases) { target in
                                 Label(target.label, systemImage: target.symbol)
                                     .tag(target)
                             }
                         }
+
+                        overrideNote(for: app.padOverrides.springTarget) {
+                            "A dial step is holding this at \($0.label)."
+                        }
+
+                        Toggle("Smooth", isOn: bind(\.xySmooth))
+                            .tint(theme.accent)
                     }
+
+                    touchSection(\.xyTouch)
 
                 case .drawbars:
                     Section("Output") {
@@ -1828,12 +2230,24 @@ struct XYPadConfigSheet: View {
 
                 case .morph:
                     Section("Output") {
-                        Picker("On Release", selection: bind(\.morphSpringTarget)) {
+                        Picker("On Release", selection: Binding(
+                            get: { app.preset.xyPad.morphSpringTarget },
+                            set: { app.setMasterMorphSpring($0) }
+                        )) {
                             ForEach(MorphSpringTarget.allCases) { target in
                                 Text(morphTargetLabel(target)).tag(target)
                             }
                         }
+
+                        overrideNote(for: app.padOverrides.morphSpringTarget) {
+                            "A dial step is holding this at \(morphTargetLabel($0))."
+                        }
+
+                        Toggle("Smooth", isOn: bind(\.morphSmooth))
+                            .tint(theme.accent)
                     }
+
+                    touchSection(\.morphTouch)
                 }
 
                 // Scale lives on the pad surface now — a tap on the chip in
@@ -1874,21 +2288,21 @@ struct XYPadConfigSheet: View {
                         Spacer(minLength: 0)
                     }
                     .frame(height: 44)
-                    .listRowBackground(Theme.panel2)
+                    .listRowBackground(theme.panel2)
 
                     HStack(spacing: 10) {
                         Slider(value: $padModeIndent, in: 0...140, step: 2)
-                            .tint(Theme.accent)
+                            .tint(theme.accent)
 
                         Text("\(Int(padModeIndent))")
                             .font(.callout.monospaced())
-                            .foregroundColor(Theme.dim)
+                            .foregroundColor(theme.dim)
                             .frame(minWidth: 30, alignment: .trailing)
                     }
 
                     if padModeIndent > 0 {
                         Button("Remove Indent") { padModeIndent = 0 }
-                            .tint(Theme.accent)
+                            .tint(theme.accent)
                     }
                 } header: {
                     Text("Mode Button Indent")
@@ -1972,7 +2386,7 @@ struct XYPadConfigSheet: View {
 
         Section("Glide") {
             Toggle("Glide (legato portamento)", isOn: bind(\.glide))
-                .tint(Theme.accent)
+                .tint(theme.accent)
 
             if cfg.glide {
                 VStack(alignment: .leading, spacing: 4) {
@@ -1984,7 +2398,7 @@ struct XYPadConfigSheet: View {
                             .foregroundColor(.secondary)
                     }
                     Slider(value: bind(\.glideTime), in: 0...1)
-                        .tint(Theme.accent)
+                        .tint(theme.accent)
                 }
 
             }
@@ -1992,7 +2406,7 @@ struct XYPadConfigSheet: View {
 
         Section("Velocity") {
             Toggle("Perpendicular → Velocity", isOn: bind(\.perpToVelocity))
-                .tint(Theme.accent)
+                .tint(theme.accent)
             if !cfg.perpToVelocity {
                 IntWheelRow(title: "Fixed Velocity", selection: bind(\.fixedVelocity), range: 1...127)
             }
@@ -2015,7 +2429,7 @@ struct XYPadConfigSheet: View {
             .pickerStyle(.segmented)
 
             Toggle("Invert Values", isOn: bind(\.drawbarInvert))
-                .tint(Theme.accent)
+                .tint(theme.accent)
         } header: {
             Text("Layout")
         }
@@ -2097,11 +2511,11 @@ struct XYPadConfigSheet: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: 12)
-                .fill(Theme.panel2.opacity(0.6))
+                .fill(theme.panel2.opacity(0.6))
         )
         .overlay(
             RoundedRectangle(cornerRadius: 12)
-                .strokeBorder(Color.white.opacity(0.1), lineWidth: 1)
+                .strokeBorder(theme.line(0.1), lineWidth: 1)
         )
     }
 
@@ -2116,7 +2530,7 @@ struct XYPadConfigSheet: View {
                         .foregroundColor(.secondary)
                 }
                 Slider(value: bind(\.morphCurve), in: -100...100, step: 1)
-                    .tint(Theme.accent)
+                    .tint(theme.accent)
             }
 
             VStack(alignment: .leading, spacing: 4) {
@@ -2128,11 +2542,11 @@ struct XYPadConfigSheet: View {
                         .foregroundColor(.secondary)
                 }
                 Slider(value: bind(\.morphCenterStrength), in: 0...1)
-                    .tint(Theme.accent)
+                    .tint(theme.accent)
             }
 
             Toggle("Equal Power", isOn: bind(\.morphEqualPower))
-                .tint(Theme.accent)
+                .tint(theme.accent)
         } header: {
             Text("Morph Shape")
         }
@@ -2245,6 +2659,52 @@ struct XYPadConfigSheet: View {
         )
     }
 
+    /// Touch/release gate editor, shared by Standard XY and 4-Corner.
+    @ViewBuilder
+    private func touchSection(_ keyPath: WritableKeyPath<XYPadConfig, PadTouchCC>) -> some View {
+        let touch = app.preset.xyPad[keyPath: keyPath]
+
+        Section {
+            Toggle("Touch CC", isOn: Binding(
+                get: { touch.enabled },
+                set: { isOn in
+                    var edited = app.preset.xyPad[keyPath: keyPath]
+                    // Turning it on must not land on a number something else
+                    // already sends. A disabled gate is not in the CC map, so
+                    // this check sees only the other owners.
+                    if isOn {
+                        let clash = app.ccAssignments.contains {
+                            !$0.isNote && $0.cc == edited.cc && $0.channel == edited.channel
+                        }
+                        if clash, let free = app.firstFreeCC() { edited.cc = free }
+                    }
+                    edited.enabled = isOn
+                    app.preset.xyPad[keyPath: keyPath] = edited
+                }
+            ))
+            .tint(theme.accent)
+
+            if touch.enabled {
+                IntWheelRow(title: "CC",
+                            selection: Binding(
+                                get: { app.preset.xyPad[keyPath: keyPath].cc },
+                                set: { app.preset.xyPad[keyPath: keyPath].cc = min(max($0, 0), 127) }
+                            ),
+                            range: 0...127)
+                IntWheelRow(title: "Channel",
+                            selection: Binding(
+                                get: { app.preset.xyPad[keyPath: keyPath].channel },
+                                set: { app.preset.xyPad[keyPath: keyPath].channel = min(max($0, 0), 15) }
+                            ),
+                            range: 0...15) { String($0 + 1) }
+            }
+        } header: {
+            Text("Touch")
+        } footer: {
+            Text("Sends 127 when a finger lands on the pad and 0 when the last one lifts.")
+        }
+    }
+
     private func noteName(_ n: Int) -> String {
         let names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
         let clamped = min(max(n, 0), 127)
@@ -2259,6 +2719,7 @@ struct XYPadConfigSheet: View {
 /// accent fill/border rather than relying on text — a performer should
 /// recognize the direction at a glance, not decode an abbreviation.
 struct DiagonalArrowIcon: View {
+    @Environment(\.theme) private var theme
     let diagonal: XYDiagonal
     let selected: Bool
 
@@ -2289,13 +2750,13 @@ struct DiagonalArrowIcon: View {
             let h = geo.size.height
             let p0 = CGPoint(x: start.x * w, y: start.y * h)
             let p1 = CGPoint(x: end.x * w, y: end.y * h)
-            let color = selected ? Theme.accent : Theme.dim
+            let color = selected ? theme.accent : theme.dim
 
             ZStack {
                 RoundedRectangle(cornerRadius: 9)
-                    .fill(selected ? Theme.accent.opacity(0.18) : Theme.panel2)
+                    .fill(selected ? theme.accent.opacity(0.18) : theme.panel2)
                 RoundedRectangle(cornerRadius: 9)
-                    .strokeBorder(selected ? Theme.accent : Color.white.opacity(0.12),
+                    .strokeBorder(selected ? theme.accent : theme.line(0.12),
                                   lineWidth: selected ? 2 : 1)
 
                 Path { path in

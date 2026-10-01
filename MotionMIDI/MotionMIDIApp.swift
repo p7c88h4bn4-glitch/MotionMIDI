@@ -16,8 +16,9 @@ struct MotionMIDIApp: App {
 
     var body: some Scene {
         WindowGroup {
+            // Colour scheme is set per surface in ContentView, from the
+            // palette — a light palette needs a light scheme under it.
             RootView(engines: shared)
-                .preferredColorScheme(.dark)
                 .onAppear {
                     UIApplication.shared.isIdleTimerDisabled = true
                 }
@@ -92,6 +93,10 @@ struct RootView: View {
 
     @AppStorage("MotionMIDIPro.dualSurface") private var dualSurface = false
 
+    /// Only for the strip behind and between the surfaces; each surface
+    /// paints its own background from its own palette.
+    @ObservedObject private var palettes = PaletteLibrary.shared
+
     /// Two full surfaces need width for two pads. On a phone that would
     /// leave each one too narrow to play, so the toggle simply doesn't
     /// apply there.
@@ -117,7 +122,7 @@ struct RootView: View {
                     .environmentObject(engines.surfaceA)
             }
         }
-        .background(Theme.bg.ignoresSafeArea())
+        .background(ThemeColors(palette: palettes.global).bg.ignoresSafeArea())
         // Turning the second surface off takes its pad — and its HOLD chip —
         // off screen. Anything it had latched would ring on with no control
         // left to stop it.

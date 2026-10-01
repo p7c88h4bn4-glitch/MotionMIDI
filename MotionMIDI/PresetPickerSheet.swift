@@ -7,6 +7,7 @@ import UniformTypeIdentifiers
 /// at the top. Tapping a row switches immediately and closes — during a se t
 /// that should be one tap, not a tap plus a confirm.
 struct PresetPickerSheet: View {
+    @Environment(\.theme) private var theme
     @EnvironmentObject var app: AppState
     @Environment(\.dismiss) private var dismiss
 
@@ -50,7 +51,7 @@ struct PresetPickerSheet: View {
                         Label("Import Preset…", systemImage: "square.and.arrow.down")
                     }
                 }
-                .tint(Theme.accent)
+                .tint(theme.accent)
             }
             .navigationTitle("Presets")
             .navigationBarTitleDisplayMode(.inline)
@@ -181,7 +182,7 @@ struct PresetPickerSheet: View {
                 if isActive {
                     Image(systemName: "checkmark")
                         .font(.body.weight(.semibold))
-                        .foregroundColor(Theme.accent)
+                        .foregroundColor(theme.accent)
                 }
             }
             .contentShape(Rectangle())
@@ -193,7 +194,7 @@ struct PresetPickerSheet: View {
             } label: {
                 Label("Rename", systemImage: "pencil")
             }
-            .tint(Theme.accent)
+            .tint(theme.accent)
 
             Button {
                 exportName = preset.exportFilename
@@ -201,7 +202,7 @@ struct PresetPickerSheet: View {
             } label: {
                 Label("Export", systemImage: "square.and.arrow.up")
             }
-            .tint(Theme.dim)
+            .tint(theme.dim)
         }
     }
 

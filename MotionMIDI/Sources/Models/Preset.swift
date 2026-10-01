@@ -109,6 +109,12 @@ struct Preset: Identifiable, Codable, Equatable {
     /// shows the true state rather than a reset one.
     var showButtons: Bool = true
 
+    // ── Colours ─────────────────────────────────────────────────────────
+    /// This preset's palette choice and per-widget colours. Empty for every
+    /// preset saved before colours existed, which resolves to the global
+    /// palette with every widget on its accent — exactly the old look.
+    var colors = PresetColors()
+
     // MARK: - Factory default
     //
     // COMPUTED, not a stored constant — every access must mint fresh UUIDs.
@@ -191,6 +197,7 @@ extension Preset {
         case id, name, motionMappings, xyPad, buttons, calibration
         case lastUsed, dialSlots
         case showMotionMeters, showDialPanel, showButtons
+        case colors
     }
 
     /// Pre-iPad-multi-dial presets stored a single dial under these keys.
@@ -219,6 +226,7 @@ extension Preset {
         showMotionMeters = try c.decodeIfPresent(Bool.self, forKey: .showMotionMeters) ?? true
         showDialPanel    = try c.decodeIfPresent(Bool.self, forKey: .showDialPanel)    ?? true
         showButtons      = try c.decodeIfPresent(Bool.self, forKey: .showButtons)      ?? true
+        colors           = try c.decodeIfPresent(PresetColors.self, forKey: .colors)   ?? PresetColors()
 
         if let slots = try c.decodeIfPresent([DialSlot].self, forKey: .dialSlots), !slots.isEmpty {
             dialSlots = slots
@@ -230,6 +238,79 @@ extension Preset {
             let legacyDial = try legacy.decodeIfPresent(DialPreset.self, forKey: .dial) ?? .factory
             let legacyLink = try legacy.decodeIfPresent(UUID.self, forKey: .linkedDialPresetID) ?? nil
             dialSlots = [DialSlot(localDial: legacyDial, linkedDialPresetID: legacyLink)]
+        }
+    }
+}
+
+// MARK: - Colours
+
+/// A preset's colour choices.
+///
+/// Foundation-only on purpose — the palette itself and everything that turns
+/// these numbers into `Color` live in Theme.swift. A preset stores WHICH
+/// palette and WHICH colour of it, never a colour value, so switching
+/// palettes restyles every widget at once.
+struct PresetColors: Codable, Equatable {
+    /// Nil means "follow the surface, then the global palette".
+    var paletteID: UUID? = nil
+
+    /// `ColorComponent.key` → index into the palette's component colours.
+    /// A missing key means the widget follows the accent (or, for a base
+    /// role, the palette's own colour for that role).
+    var assignments: [String: Int] = [:]
+
+    /// Nil means "follow the surface, then the global style".
+    var style: SurfaceStyle? = nil
+
+    init(paletteID: UUID? = nil, assignments: [String: Int] = [:],
+         style: SurfaceStyle? = nil) {
+        self.paletteID = paletteID
+        self.assignments = assignments
+        self.style = style
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case paletteID, assignments, style
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        paletteID = try c.decodeIfPresent(UUID.self, forKey: .paletteID)
+        assignments = try c.decodeIfPresent([String: Int].self, forKey: .assignments) ?? [:]
+        // Read as a plain string so a style this build doesn't know — one
+        // added later — degrades to "follow" instead of failing the preset.
+        let rawStyle: String? = try? c.decodeIfPresent(String.self, forKey: .style)
+        style = rawStyle.flatMap(SurfaceStyle.init(rawValue:))
+    }
+}
+
+extension Preset {
+    /// Which widget a CC map row colours, if any.
+    ///
+    /// The two XY axes and both touch gates are one widget — the pad — so
+    /// they share its colour. A motion mapping colours the meter for its
+    /// source, and only when that source HAS a meter on the deck. The
+    /// spec-fixed portamento rows have nothing on screen to colour.
+    func colorComponent(for slot: CCSlot) -> ColorComponent? {
+        switch slot {
+        case .motion(let id):
+            guard let source = motionMappings.first(where: { $0.id == id })?.source,
+                  ColorComponent.meterSources.contains(source)
+            else { return nil }
+            return .meter(source)
+        case .xyX, .xyY, .xyTouch, .morphTouch:
+            return .pad
+        case .morphCorner(let i):
+            return .morphCorner(i)
+        case .drawbar(let i):
+            return .drawbar(i)
+        case .button(let id):
+            return .button(id)
+        case .dialSend(let slotIndex, _, _), .dialFader(let slotIndex, _, _):
+            guard dialSlots.indices.contains(slotIndex) else { return nil }
+            return .dial(dialSlots[slotIndex].id)
+        case .portamentoTime, .portamentoSwitch:
+            return nil
         }
     }
 }

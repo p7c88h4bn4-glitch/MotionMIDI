@@ -9,6 +9,7 @@ import SwiftUI
 /// see the holes. Sorting by owner buries the holes; sorting by number
 /// scatters each feature across the list.
 struct CCMapView: View {
+    @Environment(\.theme) private var theme
     @EnvironmentObject private var ownSurface: AppState
 
     var body: some View {
@@ -21,6 +22,7 @@ struct CCMapView: View {
 }
 
 private struct CCMapBody: View {
+    @Environment(\.theme) private var theme
     @ObservedObject var app: AppState
     @ObservedObject var peer: AppState
     @Environment(\.dismiss) private var dismiss
@@ -48,6 +50,11 @@ private struct CCMapBody: View {
     /// Which row has its picker open. One at a time — two open wheels in a
     /// list would fight for the same drag.
     @State private var editing: CCSlot? = nil
+
+    /// Which button row has its listen editor open. Shares the one-at-a-time
+    /// rule with `editing`: opening either closes the other, since two sets
+    /// of wheels open in one list fight over the same drag.
+    @State private var listening: CCSlot? = nil
 
     /// Row that just sent a learn sweep, for a brief confirmation tick.
     /// Nothing comes BACK from a learn — the host either bound it or didn't
@@ -112,7 +119,7 @@ private struct CCMapBody: View {
                     }
                 }
             }
-            .background(Theme.bg)
+            .background(theme.bg)
             .navigationTitle("CC Map")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -127,13 +134,13 @@ private struct CCMapBody: View {
 
     private var summaryStrip: some View {
         HStack(spacing: 14) {
-            summaryItem("\(rows.count)", "assigned", Theme.accent)
-            summaryItem("\(128 - Set(rows.map(\.cc)).count)", "free", Theme.dim)
+            summaryItem("\(rows.count)", "assigned", theme.accent)
+            summaryItem("\(128 - Set(rows.map(\.cc)).count)", "free", theme.dim)
 
             if conflicts.isEmpty {
-                summaryItem("0", "conflicts", Theme.good)
+                summaryItem("0", "conflicts", theme.good)
             } else {
-                summaryItem("\(conflicts.count)", "conflicts", Theme.danger)
+                summaryItem("\(conflicts.count)", "conflicts", theme.danger)
             }
 
             Spacer()
@@ -143,7 +150,7 @@ private struct CCMapBody: View {
             // advance rather than discovering mid-set.
             Label("tap to send", systemImage: "dot.radiowaves.right")
                 .font(.system(size: 10))
-                .foregroundColor(Theme.dim)
+                .foregroundColor(theme.dim)
         }
         .padding(.horizontal, 16)
         .padding(.bottom, 8)
@@ -158,7 +165,7 @@ private struct CCMapBody: View {
                 .monospacedDigit()
             Text(label)
                 .font(.system(size: 11))
-                .foregroundColor(Theme.dim)
+                .foregroundColor(theme.dim)
         }
     }
 
@@ -166,6 +173,10 @@ private struct CCMapBody: View {
 
     private var ownerList: some View {
         List {
+            // Colour lives in the map rather than a screen of its own, so
+            // every widget is named, numbered and coloured in one place.
+            CCMapColorsSection(app: target, showsSurfaceRow: hasPeer)
+
             ForEach(orderedGroups, id: \.id) { group in
                 let groupRows = rows.filter { $0.group == group }
                 if !groupRows.isEmpty {
@@ -181,18 +192,18 @@ private struct CCMapBody: View {
                                 // was, since both wrote the same DialStep.label.
                                 ForEach(stepGroups(in: groupRows), id: \.key) { step in
                                     dialStepRow(step.rows)
-                                        .listRowBackground(Theme.panel2)
+                                        .listRowBackground(theme.panel2)
                                 }
                             } else {
                                 ForEach(groupRows) { row in
                                     assignmentRow(row)
-                                        .listRowBackground(Theme.panel2)
+                                        .listRowBackground(theme.panel2)
                                 }
                             }
 
                             if group == .buttons {
                                 addButtonRow
-                                    .listRowBackground(Theme.panel2)
+                                    .listRowBackground(theme.panel2)
                             }
                         }
                     } header: {
@@ -236,7 +247,7 @@ private struct CCMapBody: View {
                     Image(systemName: "chevron.right")
                         .font(.system(size: 10, weight: .bold))
                         .rotationEffect(.degrees(collapsed ? 0 : 90))
-                        .foregroundColor(Theme.dim)
+                        .foregroundColor(theme.dim)
 
                     Label(group.title, systemImage: group.symbol)
 
@@ -252,17 +263,43 @@ private struct CCMapBody: View {
                     .foregroundColor(.white)
                     .padding(.horizontal, 5)
                     .padding(.vertical, 1)
-                    .background(Capsule().fill(Theme.danger))
+                    .background(Capsule().fill(theme.danger))
             }
 
             if collapsed {
                 Text("\(rowCount)")
                     .font(.system(size: 11, weight: .semibold))
-                    .foregroundColor(Theme.dim)
+                    .foregroundColor(theme.dim)
                     .monospacedDigit()
             }
 
+            if let component = headerColor(for: group, rows: groupRows) {
+                ColorChoiceMenu(app: target, component: component)
+            }
+
             channelStepper(for: groupRows)
+        }
+    }
+
+    /// Sections that are ONE widget get their colour in the header: the XY
+    /// pad (both axes and the touch gate are the same pad) and each dial
+    /// (every step belongs to the same knob). A dropdown on every row there
+    /// would be several controls editing one colour.
+    private func headerColor(for group: CCGroup, rows groupRows: [CCAssignment]) -> ColorComponent? {
+        switch group {
+        case .xyPad: return .pad
+        case .dial:  return groupRows.first?.color
+        default:     return nil
+        }
+    }
+
+    /// Sections whose rows are separate widgets get a dropdown per row. The
+    /// morph Touch row is the pad itself, so it gets none here.
+    private func rowColor(for row: CCAssignment) -> ColorComponent? {
+        guard let component = row.color, component != .pad else { return nil }
+        switch row.group {
+        case .motion, .morph, .drawbars, .buttons: return component
+        default: return nil
         }
     }
 
@@ -292,7 +329,7 @@ private struct CCMapBody: View {
 
             Text("CH")
                 .font(.system(size: 8, weight: .bold))
-                .foregroundColor(Theme.dim)
+                .foregroundColor(theme.dim)
 
             Button {
                 shiftChannels(editable, by: 1)
@@ -308,15 +345,15 @@ private struct CCMapBody: View {
     private func stepperGlyph(_ name: String) -> some View {
         Image(systemName: name)
             .font(.system(size: 9, weight: .bold))
-            .foregroundColor(Theme.accent)
+            .foregroundColor(theme.accent)
             .frame(width: 22, height: 20)
             .background(
                 RoundedRectangle(cornerRadius: 5)
-                    .fill(Theme.accent.opacity(0.12))
+                    .fill(theme.accent.opacity(0.12))
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 5)
-                    .strokeBorder(Theme.accent.opacity(0.35), lineWidth: 1)
+                    .strokeBorder(theme.accent.opacity(0.35), lineWidth: 1)
             )
             .contentShape(Rectangle())
     }
@@ -348,7 +385,7 @@ private struct CCMapBody: View {
         } label: {
             Label("Add Button", systemImage: "plus.circle.fill")
                 .font(.system(size: 14, weight: .medium))
-                .foregroundColor(Theme.accent)
+                .foregroundColor(theme.accent)
         }
         .buttonStyle(.plain)
     }
@@ -422,7 +459,7 @@ private struct CCMapBody: View {
                         set: { target.setName(lead.slot, to: $0) }
                     ))
                     .font(.system(size: 14, weight: .medium))
-                    .foregroundColor(lead.isActive ? .white.opacity(0.9) : Theme.dim)
+                    .foregroundColor(lead.isActive ? theme.text.opacity(0.9) : theme.dim)
                     .textInputAutocapitalization(.words)
                     .autocorrectionDisabled()
 
@@ -437,7 +474,7 @@ private struct CCMapBody: View {
                             Label("\(row.roleSuffix ?? "CC"): \(conflictText(for: row))",
                                   systemImage: "exclamationmark.triangle.fill")
                                 .font(.system(size: 10, weight: .semibold))
-                                .foregroundColor(Theme.danger)
+                                .foregroundColor(theme.danger)
                         }
                     }
                 }
@@ -448,6 +485,7 @@ private struct CCMapBody: View {
                     ForEach(rows) { row in
                         Button {
                             editing = (editing == row.slot) ? nil : row.slot
+                            if editing != nil { listening = nil }
                         } label: {
                             valueChip(row,
                                       conflicted: conflicts.contains(row.ref),
@@ -486,16 +524,19 @@ private struct CCMapBody: View {
                             set: { target.setName(row.slot, to: $0) }
                         ))
                         .font(.system(size: 14, weight: .medium))
-                        .foregroundColor(row.isActive ? .white.opacity(0.9) : Theme.dim)
+                        .foregroundColor(row.isActive ? theme.text.opacity(0.9) : theme.dim)
                         .textInputAutocapitalization(.words)
                         .autocorrectionDisabled()
                     } else {
                         Text(row.displayName)
                             .font(.system(size: 14, weight: .medium))
-                            .foregroundColor(Theme.dim)
+                            .foregroundColor(theme.dim)
                     }
 
                     HStack(spacing: 6) {
+                        if let component = rowColor(for: row) {
+                            ColorChoiceMenu(app: target, component: component)
+                        }
                         if let info = row.button {
                             // Choosable on the row itself, not behind the
                             // number editor. Message type and behavior are
@@ -511,14 +552,23 @@ private struct CCMapBody: View {
                             // otherwise the number looks free.
                             Text("inactive · still reserved")
                                 .font(.system(size: 10))
-                                .foregroundColor(Theme.dim)
+                                .foregroundColor(theme.dim)
                         }
                         if isConflicted {
                             Label(conflictText(for: row),
                                   systemImage: "exclamationmark.triangle.fill")
                                 .font(.system(size: 10, weight: .semibold))
-                                .foregroundColor(Theme.danger)
+                                .foregroundColor(theme.danger)
                         }
+                    }
+
+                    // Its own line rather than a fourth pill: it has to say
+                    // WHAT it listens on to be useful, which is more than a
+                    // pill holds, and the pill row is already full on a phone.
+                    // Only for host-lit buttons — an Own State button never
+                    // reads incoming MIDI.
+                    if let info = row.button, info.light == .host {
+                        listenLine(for: row, info: info)
                     }
                 }
 
@@ -530,6 +580,7 @@ private struct CCMapBody: View {
                             // Tapping the open row closes it, so the wheels
                             // can be dismissed without hunting for a Done.
                             editing = isOpen ? nil : row.slot
+                            if editing != nil { listening = nil }
                         } label: {
                             valueChip(row, conflicted: isConflicted, open: isOpen)
                         }
@@ -541,7 +592,7 @@ private struct CCMapBody: View {
                                 .font(.system(size: 13, weight: .bold, design: .rounded))
                                 .monospacedDigit()
                         }
-                        .foregroundColor(Theme.dim)
+                        .foregroundColor(theme.dim)
                     }
 
                     // Locked rows get one too. The number can't be changed,
@@ -554,8 +605,135 @@ private struct CCMapBody: View {
             if isOpen {
                 wheelPair(for: row)
             }
+
+            if listening == row.slot, let info = row.button, info.light == .host {
+                listenEditor(for: row, info: info)
+            }
         }
         .padding(.vertical, 2)
+    }
+
+    // MARK: - Listen target (host-lit buttons)
+
+    private func targetText(_ t: ButtonListen) -> String {
+        "\(t.message == .cc ? "CC" : "NOTE") \(t.number) · CH \(t.channel + 1)"
+    }
+
+    /// Tappable status line: what this button listens on, and whether that is
+    /// its own send number or a separate one.
+    private func listenLine(for row: CCAssignment, info: ButtonRowInfo) -> some View {
+        let open = listening == row.slot
+
+        return Button {
+            listening = open ? nil : row.slot
+            if listening != nil { editing = nil }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "ear")
+                    .font(.system(size: 9, weight: .semibold))
+                Text(info.listen == nil
+                     ? "listens on own · \(targetText(info.feedbackTarget))"
+                     : "listens on \(targetText(info.feedbackTarget))")
+                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                Image(systemName: open ? "chevron.up" : "chevron.down")
+                    .font(.system(size: 7, weight: .bold))
+            }
+            // Accent when custom, dim when default: a separate target is the
+            // thing worth noticing at a glance down a column of buttons.
+            .foregroundColor(info.listen == nil ? theme.dim : theme.accent)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func listenEditor(for row: CCAssignment, info: ButtonRowInfo) -> some View {
+        VStack(spacing: 8) {
+            Picker("Listen On", selection: Binding<Bool>(
+                get: { info.listen != nil },
+                set: { custom in
+                    // Seeded from where it listens now, so choosing Custom
+                    // changes nothing until a value is actually edited.
+                    target.setButtonListen(row.slot, to: custom ? info.feedbackTarget : nil)
+                }
+            )) {
+                Text("Own Number").tag(false)
+                Text("Custom").tag(true)
+            }
+            .pickerStyle(.segmented)
+
+            if let listen = info.listen {
+                Picker("Message", selection: Binding<ButtonMessage>(
+                    get: { listen.message },
+                    set: { newValue in
+                        var edited = listen
+                        edited.message = newValue
+                        target.setButtonListen(row.slot, to: edited)
+                    }
+                )) {
+                    ForEach(ButtonMessage.allCases) { m in
+                        Text(m.label).tag(m)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                // Same compact, right-aligned wheels as the number editor, so
+                // the two read as one family and neither is a wide spin
+                // target across the row.
+                HStack(spacing: 10) {
+                    Spacer(minLength: 0)
+
+                    VStack(spacing: 2) {
+                        Text(listen.message == .cc ? "CC" : "NOTE")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundColor(theme.dim)
+                        Picker("Number", selection: Binding<Int>(
+                            get: { listen.number },
+                            set: { newValue in
+                                var edited = listen
+                                edited.number = newValue
+                                target.setButtonListen(row.slot, to: edited)
+                            }
+                        )) {
+                            ForEach(0...127, id: \.self) { n in
+                                Text(listen.message == .note ? MIDIWheelText.note(n) : "\(n)")
+                                    .font(.system(size: 15, weight: .semibold, design: .rounded))
+                                    .monospacedDigit()
+                                    .tag(n)
+                            }
+                        }
+                        .pickerStyle(.wheel)
+                        .frame(width: listen.message == .note ? 104 : 60, height: 96)
+                        .clipped()
+                    }
+
+                    VStack(spacing: 2) {
+                        Text("CH")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundColor(theme.dim)
+                        Picker("Channel", selection: Binding<Int>(
+                            get: { listen.channel },
+                            set: { newValue in
+                                var edited = listen
+                                edited.channel = newValue
+                                target.setButtonListen(row.slot, to: edited)
+                            }
+                        )) {
+                            ForEach(0...15, id: \.self) { c in
+                                Text("\(c + 1)")
+                                    .font(.system(size: 15, weight: .semibold, design: .rounded))
+                                    .monospacedDigit()
+                                    .tag(c)
+                            }
+                        }
+                        .pickerStyle(.wheel)
+                        .frame(width: 48, height: 96)
+                        .clipped()
+                    }
+                }
+            }
+        }
+        .padding(.top, 2)
     }
 
     /// Fires a learn sweep for one assignment.
@@ -584,16 +762,16 @@ private struct CCMapBody: View {
         } label: {
             Image(systemName: sent ? "checkmark" : "dot.radiowaves.right")
                 .font(.system(size: 12, weight: .bold))
-                .foregroundColor(sent ? Theme.good : Theme.accent)
+                .foregroundColor(sent ? theme.good : theme.accent)
                 .frame(width: 30, height: 30)
                 .background(
                     RoundedRectangle(cornerRadius: 8)
-                        .fill(Theme.bg.opacity(0.5))
+                        .fill(theme.bg.opacity(0.5))
                 )
                 .overlay(
                     RoundedRectangle(cornerRadius: 8)
-                        .strokeBorder(sent ? Theme.good.opacity(0.6)
-                                           : Color.white.opacity(0.08),
+                        .strokeBorder(sent ? theme.good.opacity(0.6)
+                                           : theme.line(0.08),
                                       lineWidth: 1)
                 )
         }
@@ -612,7 +790,7 @@ private struct CCMapBody: View {
             if let role = row.roleSuffix {
                 Text(role.uppercased())
                     .font(.system(size: 8, weight: .bold))
-                    .foregroundColor(Theme.dim)
+                    .foregroundColor(theme.dim)
                     .fixedSize()
 
                 Divider().frame(height: 20)
@@ -624,7 +802,7 @@ private struct CCMapBody: View {
                 // thing entirely.
                 Text(row.isNote ? "NOTE" : "CC")
                     .font(.system(size: 8, weight: .semibold))
-                    .foregroundColor(Theme.dim)
+                    .foregroundColor(theme.dim)
                 Text("\(row.cc)")
                     .font(.system(size: 15, weight: .bold, design: .rounded))
                     .monospacedDigit()
@@ -635,24 +813,24 @@ private struct CCMapBody: View {
 
             VStack(spacing: 0) {
                 Text("CH").font(.system(size: 8, weight: .semibold))
-                    .foregroundColor(Theme.dim)
+                    .foregroundColor(theme.dim)
                 Text("\(row.channel + 1)")
                     .font(.system(size: 15, weight: .bold, design: .rounded))
                     .monospacedDigit()
             }
             .frame(minWidth: 22)
         }
-        .foregroundColor(conflicted ? Theme.danger : Theme.accent)
+        .foregroundColor(conflicted ? theme.danger : theme.accent)
         .padding(.horizontal, 10)
         .padding(.vertical, 4)
         .background(
             RoundedRectangle(cornerRadius: 9)
-                .fill(open ? Theme.accent.opacity(0.16) : Theme.bg.opacity(0.5))
+                .fill(open ? theme.accent.opacity(0.16) : theme.bg.opacity(0.5))
         )
         .overlay(
             RoundedRectangle(cornerRadius: 9)
-                .strokeBorder(open ? Theme.accent.opacity(0.7)
-                                   : Color.white.opacity(0.08),
+                .strokeBorder(open ? theme.accent.opacity(0.7)
+                                   : theme.line(0.08),
                               lineWidth: 1)
         )
     }
@@ -730,16 +908,16 @@ private struct CCMapBody: View {
             Image(systemName: "chevron.down")
                 .font(.system(size: 6, weight: .bold))
         }
-        .foregroundColor(Theme.accent)
+        .foregroundColor(theme.accent)
         .padding(.horizontal, 6)
         .padding(.vertical, 3)
         .background(
             RoundedRectangle(cornerRadius: 5)
-                .fill(Theme.accent.opacity(0.12))
+                .fill(theme.accent.opacity(0.12))
         )
         .overlay(
             RoundedRectangle(cornerRadius: 5)
-                .strokeBorder(Theme.accent.opacity(0.35), lineWidth: 1)
+                .strokeBorder(theme.accent.opacity(0.35), lineWidth: 1)
         )
     }
 
@@ -758,7 +936,7 @@ private struct CCMapBody: View {
             VStack(spacing: 2) {
                 Text(row.isNote ? "NOTE" : "CC")
                     .font(.system(size: 9, weight: .semibold))
-                    .foregroundColor(Theme.dim)
+                    .foregroundColor(theme.dim)
 
                 Picker(row.isNote ? "Note" : "CC", selection: Binding(
                     get: { row.cc },
@@ -783,7 +961,7 @@ private struct CCMapBody: View {
             VStack(spacing: 2) {
                 Text("CH")
                     .font(.system(size: 9, weight: .semibold))
-                    .foregroundColor(Theme.dim)
+                    .foregroundColor(theme.dim)
 
                 Picker("Channel", selection: Binding(
                     get: { row.channel },
@@ -861,10 +1039,10 @@ private struct CCMapBody: View {
             ForEach(numberSections, id: \.start) { section in
                 if section.isFree {
                     freeRunRow(section)
-                        .listRowBackground(Theme.panel)
+                        .listRowBackground(theme.panel)
                 } else {
                     numberRow(section)
-                        .listRowBackground(Theme.panel2)
+                        .listRowBackground(theme.panel2)
                 }
             }
         }
@@ -914,7 +1092,7 @@ private struct CCMapBody: View {
         return HStack(alignment: .top, spacing: 12) {
             Text("\(section.start)")
                 .font(.system(size: 15, weight: .bold, design: .rounded))
-                .foregroundColor(clash ? Theme.danger : Theme.accent)
+                .foregroundColor(clash ? theme.danger : theme.accent)
                 .monospacedDigit()
                 .frame(width: 34, alignment: .trailing)
 
@@ -923,22 +1101,22 @@ private struct CCMapBody: View {
                     HStack(spacing: 6) {
                         Image(systemName: owner.group.symbol)
                             .font(.system(size: 9))
-                            .foregroundColor(Theme.dim)
+                            .foregroundColor(theme.dim)
                             .frame(width: 12)
                         Text(owner.displayName)
                             .font(.system(size: 13))
-                            .foregroundColor(owner.isActive ? .white.opacity(0.9)
-                                                            : Theme.dim)
+                            .foregroundColor(owner.isActive ? theme.text.opacity(0.9)
+                                                            : theme.dim)
                         // The channel is what makes a shared number safe, so
                         // it belongs on every row here, not just clashing ones.
                         Text("ch \(owner.channel + 1)")
                             .font(.system(size: 10, weight: .semibold))
-                            .foregroundColor(Theme.dim)
+                            .foregroundColor(theme.dim)
                             .monospacedDigit()
                         if !owner.isEditable {
                             Image(systemName: "lock.fill")
                                 .font(.system(size: 8))
-                                .foregroundColor(Theme.dim)
+                                .foregroundColor(theme.dim)
                         }
                     }
                 }
@@ -949,7 +1127,7 @@ private struct CCMapBody: View {
             if clash {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .font(.system(size: 12))
-                    .foregroundColor(Theme.danger)
+                    .foregroundColor(theme.danger)
             }
         }
         .padding(.vertical, 3)
@@ -964,16 +1142,676 @@ private struct CCMapBody: View {
         return HStack(spacing: 12) {
             Text(label)
                 .font(.system(size: 12, weight: .medium, design: .rounded))
-                .foregroundColor(Theme.dim)
+                .foregroundColor(theme.dim)
                 .monospacedDigit()
                 .frame(width: 60, alignment: .trailing)
 
             Text(count == 1 ? "free" : "\(count) free")
                 .font(.system(size: 12))
-                .foregroundColor(Theme.dim)
+                .foregroundColor(theme.dim)
 
             Spacer(minLength: 0)
         }
         .padding(.vertical, 1)
+    }
+}
+
+// MARK: - Colour dropdown
+
+/// The colour choice for one widget or base role.
+///
+/// Reads the TARGET surface's palette, not the one the map is drawn in, so
+/// with the map switched to the other surface the swatches offered are the
+/// ones that surface will actually show.
+struct ColorChoiceMenu: View {
+    @ObservedObject private var app: AppState
+    @ObservedObject private var palettes = PaletteLibrary.shared
+    @AppStorage("MotionMIDIPro.dualSurface") private var dualSurface = false
+    @Environment(\.theme) private var theme
+
+    let component: ColorComponent
+
+    init(app: AppState, component: ColorComponent) {
+        _app = ObservedObject(wrappedValue: app)
+        self.component = component
+    }
+
+    private var targetTheme: ThemeColors {
+        palettes.theme(for: app.preset, surface: app.surface,
+                       dual: dualSurface && isPadIdiom)
+    }
+
+    private var defaultLabel: String {
+        switch component {
+        case .background, .panel, .raised, .text, .grid, .accent:
+            return "Palette Default"
+        case .morphCorner, .drawbar:
+            return "Same as Pad"
+        default:
+            return "Same as Accent"
+        }
+    }
+
+    var body: some View {
+        let palette = targetTheme.palette
+
+        Menu {
+            Picker("Color", selection: Binding<Int>(
+                get: { app.colorChoice(component) ?? -1 },
+                set: { app.setColor(component, to: $0 < 0 ? nil : $0) }
+            )) {
+                Label {
+                    Text(defaultLabel)
+                } icon: {
+                    Image(uiImage: SwatchImage.make(targetTheme.fallbackRGBA(for: component)))
+                }
+                .tag(-1)
+
+                ForEach(palette.swatches.indices, id: \.self) { index in
+                    Label {
+                        Text("Color \(index + 1)")
+                    } icon: {
+                        Image(uiImage: SwatchImage.make(palette.swatches[index]))
+                    }
+                    .tag(index)
+                }
+            }
+        } label: {
+            HStack(spacing: 3) {
+                Circle()
+                    .fill(targetTheme.resolvedRGBA(for: component).color)
+                    .frame(width: 11, height: 11)
+                    .overlay(Circle().strokeBorder(theme.text.opacity(0.3), lineWidth: 1))
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 6, weight: .bold))
+                    .foregroundColor(theme.dim)
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(
+                RoundedRectangle(cornerRadius: 5)
+                    .fill(theme.bg.opacity(0.5))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 5)
+                    .strokeBorder(theme.line(0.08), lineWidth: 1)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Color")
+    }
+}
+
+// MARK: - Colors section
+
+/// The top section of the map: which palette, the base colours, the dice.
+///
+/// Folded away by default. Colour is set up once and then left alone, and
+/// open by default it would push every MIDI row down the list on every visit.
+struct CCMapColorsSection: View {
+    @ObservedObject private var app: AppState
+    @ObservedObject private var palettes = PaletteLibrary.shared
+    @AppStorage("MotionMIDIPro.dualSurface") private var dualSurface = false
+    @AppStorage("MotionMIDIPro.ccMapColorsOpen") private var isOpen = false
+    @Environment(\.theme) private var theme
+
+    @State private var showManager = false
+
+    /// True only while a second surface is running — the surface palette
+    /// row means nothing otherwise, so it isn't offered.
+    let showsSurfaceRow: Bool
+
+    init(app: AppState, showsSurfaceRow: Bool) {
+        _app = ObservedObject(wrappedValue: app)
+        self.showsSurfaceRow = showsSurfaceRow
+    }
+
+    private var dual: Bool { dualSurface && isPadIdiom }
+
+    private var resolved: ColorPalette {
+        palettes.resolvedPalette(for: app.preset, surface: app.surface, dual: dual)
+    }
+
+    private var resolvedStyle: SurfaceStyle {
+        palettes.resolvedStyle(for: app.preset, surface: app.surface, dual: dual)
+    }
+
+    private var surfaceSide: String { app.surface == 0 ? "Left" : "Right" }
+
+    var body: some View {
+        Section {
+            if isOpen {
+                swatchStrip
+                    .listRowBackground(theme.panel2)
+
+                // One row per layer, palette and style side by side. A
+                // layer that follows the one below shows what it inherits,
+                // dimmed, so the row always says what you're looking at.
+                layerRow(title: "This Preset",
+                         palette: app.preset.colors.paletteID,
+                         inheritedPalette: palettes.inheritedPalette(surface: app.surface, dual: dual),
+                         setPalette: { app.setPresetPalette($0) },
+                         style: app.preset.colors.style,
+                         inheritedStyle: palettes.inheritedStyle(surface: app.surface, dual: dual),
+                         setStyle: { app.setPresetStyle($0) },
+                         followLabel: showsSurfaceRow ? "Follow Surface" : "Follow Global")
+                    .listRowBackground(theme.panel2)
+
+                if showsSurfaceRow {
+                    layerRow(title: "\(surfaceSide) Surface",
+                             palette: palettes.surfacePaletteID(for: app.surface),
+                             inheritedPalette: palettes.global,
+                             setPalette: { palettes.setSurfacePalette($0, for: app.surface) },
+                             style: palettes.surfaceStyle(for: app.surface),
+                             inheritedStyle: palettes.globalStyle,
+                             setStyle: { palettes.setSurfaceStyle($0, for: app.surface) },
+                             followLabel: "Follow Global")
+                        .listRowBackground(theme.panel2)
+                }
+
+                layerRow(title: "Global",
+                         palette: palettes.globalID,
+                         inheritedPalette: palettes.global,
+                         setPalette: { palettes.globalID = $0 ?? ColorPalette.classic.id },
+                         style: palettes.globalStyle,
+                         inheritedStyle: palettes.globalStyle,
+                         setStyle: { palettes.globalStyle = $0 ?? .standard },
+                         followLabel: nil)
+                    .listRowBackground(theme.panel2)
+
+                ForEach(ColorComponent.roles, id: \.self) { role in
+                    HStack {
+                        Text(role.roleLabel)
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundColor(theme.text.opacity(0.9))
+                        Spacer()
+                        ColorChoiceMenu(app: app, component: role)
+                    }
+                    .listRowBackground(theme.panel2)
+                }
+
+                Button {
+                    showManager = true
+                } label: {
+                    Label("Manage Palettes", systemImage: "swatchpalette")
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundColor(theme.accent)
+                }
+                .buttonStyle(.plain)
+                .listRowBackground(theme.panel2)
+                .sheet(isPresented: $showManager) {
+                    PaletteManagerView()
+                }
+            }
+        } header: {
+            header
+        }
+    }
+
+    // MARK: Header
+
+    private var header: some View {
+        HStack(spacing: 6) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.18)) { isOpen.toggle() }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10, weight: .bold))
+                        .rotationEffect(.degrees(isOpen ? 90 : 0))
+                        .foregroundColor(theme.dim)
+
+                    Label("Colors", systemImage: "paintpalette")
+
+                    // Folded, the section still says which palette and
+                    // style are live.
+                    if !isOpen {
+                        Text("\(resolved.name) · \(resolvedStyle.label)")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundColor(theme.dim)
+                            .lineLimit(1)
+                    }
+
+                    Spacer(minLength: 4)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            diceMenu
+        }
+    }
+
+    /// In the header, so it works with the section folded. Most people want
+    /// variety, not a colour-by-colour session — one tap should get them it.
+    private var diceMenu: some View {
+        Menu {
+            Button {
+                app.surpriseColors()
+            } label: {
+                Label("Surprise Me", systemImage: "dice")
+            }
+            Button {
+                app.randomPalette()
+            } label: {
+                Label("Random Palette", systemImage: "paintpalette")
+            }
+            Button {
+                app.scatterColors()
+            } label: {
+                Label("Scatter Colors", systemImage: "sparkles")
+            }
+            Divider()
+            Button(role: .destructive) {
+                app.resetColors()
+            } label: {
+                Label("Reset Colors", systemImage: "arrow.counterclockwise")
+            }
+        } label: {
+            Image(systemName: "dice.fill")
+                .font(.system(size: 11, weight: .bold))
+                .foregroundColor(theme.accent)
+                .frame(width: 30, height: 22)
+                .background(
+                    RoundedRectangle(cornerRadius: 5)
+                        .fill(theme.accent.opacity(0.12))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 5)
+                        .strokeBorder(theme.accent.opacity(0.35), lineWidth: 1)
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Randomize colors")
+    }
+
+    // MARK: Rows
+
+    /// The live palette's colours, numbered the way the dropdowns number
+    /// them, so "Color 5" can be found without opening a menu.
+    private var swatchStrip: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(resolved.name)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(theme.dim)
+
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 26), spacing: 6)], spacing: 6) {
+                ForEach(resolved.swatches.indices, id: \.self) { index in
+                    let swatch: RGBA = resolved.swatches[index]
+                    let numberColor: Color = swatch.luminance > 0.6
+                        ? Color.black.opacity(0.7)
+                        : Color.white.opacity(0.9)
+                    ZStack {
+                        Circle()
+                            .fill(swatch.color)
+                        Text("\(index + 1)")
+                            .font(.system(size: 9, weight: .bold, design: .rounded))
+                            .foregroundColor(numberColor)
+                    }
+                    .frame(width: 26, height: 26)
+                }
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    /// One layer — preset, surface or global — with its palette menu and
+    /// its style menu. `followLabel` nil means the layer can't follow
+    /// anything (Global), so no follow option is offered.
+    private func layerRow(title: String,
+                          palette: UUID?,
+                          inheritedPalette: ColorPalette,
+                          setPalette: @escaping (UUID?) -> Void,
+                          style: SurfaceStyle?,
+                          inheritedStyle: SurfaceStyle,
+                          setStyle: @escaping (SurfaceStyle?) -> Void,
+                          followLabel: String?) -> some View {
+        HStack(spacing: 10) {
+            Text(title)
+                .font(.system(size: 14, weight: .medium))
+                .foregroundColor(theme.text.opacity(0.9))
+                .lineLimit(1)
+                .layoutPriority(1)
+            Spacer(minLength: 4)
+            paletteMenu(title: title, current: palette, inherited: inheritedPalette,
+                        followLabel: followLabel, set: setPalette)
+            styleMenu(title: title, current: style, inherited: inheritedStyle,
+                      followLabel: followLabel, set: setStyle)
+        }
+    }
+
+    private func paletteMenu(title: String,
+                             current: UUID?,
+                             inherited: ColorPalette,
+                             followLabel: String?,
+                             set: @escaping (UUID?) -> Void) -> some View {
+        let chosen: ColorPalette? = palettes.palette(current)
+        let shownName: String = chosen?.name ?? inherited.name
+        let following: Bool = chosen == nil && followLabel != nil
+
+        return Menu {
+            Picker(title, selection: Binding<UUID?>(
+                get: { chosen == nil ? nil : current },
+                set: { set($0) }
+            )) {
+                if let followLabel {
+                    Text(followLabel).tag(UUID?.none)
+                }
+                ForEach(palettes.all) { palette in
+                    Label {
+                        Text(palette.name)
+                    } icon: {
+                        Image(uiImage: SwatchImage.strip(palette.swatches))
+                    }
+                    .tag(Optional(palette.id))
+                }
+            }
+        } label: {
+            menuLabel(shownName, following: following)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func styleMenu(title: String,
+                           current: SurfaceStyle?,
+                           inherited: SurfaceStyle,
+                           followLabel: String?,
+                           set: @escaping (SurfaceStyle?) -> Void) -> some View {
+        let shown: SurfaceStyle = current ?? inherited
+        let following: Bool = current == nil && followLabel != nil
+
+        return Menu {
+            Picker(title, selection: Binding<SurfaceStyle?>(
+                get: { current },
+                set: { set($0) }
+            )) {
+                if let followLabel {
+                    Text(followLabel).tag(SurfaceStyle?.none)
+                }
+                Section("Flat") {
+                    ForEach(SurfaceStyle.flatStyles) { style in
+                        Label(style.label, systemImage: style.symbol)
+                            .tag(Optional(style))
+                    }
+                }
+                Section("Shaded") {
+                    ForEach(SurfaceStyle.shadedStyles) { style in
+                        Label(style.label, systemImage: style.symbol)
+                            .tag(Optional(style))
+                    }
+                }
+            }
+        } label: {
+            menuLabel(shown.label, following: following)
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// Accent when this layer made the choice; dimmed when it is showing
+    /// what it inherits from the layer below.
+    private func menuLabel(_ text: String, following: Bool) -> some View {
+        HStack(spacing: 3) {
+            Text(text)
+                .font(.system(size: 13, weight: following ? .medium : .semibold))
+                .lineLimit(1)
+            Image(systemName: "chevron.up.chevron.down")
+                .font(.system(size: 8, weight: .bold))
+        }
+        .foregroundColor(following ? theme.dim : theme.accent)
+    }
+}
+
+// MARK: - Palette manager
+
+/// Every palette: pick the global one, open one to edit, make new ones.
+struct PaletteManagerView: View {
+    @ObservedObject private var palettes = PaletteLibrary.shared
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.theme) private var theme
+
+    @State private var path: [UUID] = []
+
+    var body: some View {
+        NavigationStack(path: $path) {
+            List {
+                Section {
+                    ForEach(palettes.custom) { palette in
+                        row(palette)
+                    }
+                    .onDelete { offsets in
+                        let ids = offsets.map { palettes.custom[$0].id }
+                        for id in ids { palettes.delete(id) }
+                    }
+
+                    Button {
+                        path.append(palettes.createRandom())
+                    } label: {
+                        Label("New Random Palette", systemImage: "dice")
+                            .foregroundColor(theme.accent)
+                    }
+                } header: {
+                    Text("Yours")
+                } footer: {
+                    Text("Open any built-in palette and tap Duplicate to make a copy you can change.")
+                }
+
+                Section("Built-In") {
+                    ForEach(ColorPalette.builtIns) { palette in
+                        row(palette)
+                    }
+                }
+            }
+            .navigationTitle("Palettes")
+            .navigationBarTitleDisplayMode(.inline)
+            .navigationDestination(for: UUID.self) { id in
+                PaletteEditorView(paletteID: id) { newID in
+                    path.append(newID)
+                }
+            }
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+    }
+
+    private func row(_ palette: ColorPalette) -> some View {
+        NavigationLink(value: palette.id) {
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(palette.name)
+                    if palette.id == palettes.globalID {
+                        Text("Global")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundColor(theme.accent)
+                    }
+                }
+                Spacer(minLength: 8)
+                PalettePreview(palette: palette)
+            }
+        }
+    }
+}
+
+/// Background plate with the component colours on it, so a palette reads
+/// the way it will look rather than as loose dots.
+struct PalettePreview: View {
+    let palette: ColorPalette
+
+    var body: some View {
+        HStack(spacing: 3) {
+            ForEach(Array(palette.swatches.prefix(8).enumerated()), id: \.offset) { _, swatch in
+                Circle()
+                    .fill(swatch.color)
+                    .frame(width: 12, height: 12)
+            }
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 5)
+        .background(
+            RoundedRectangle(cornerRadius: 7)
+                .fill(palette.panel.color)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 7)
+                .strokeBorder(palette.grid.color, lineWidth: 1)
+        )
+    }
+}
+
+// MARK: - Palette editor
+
+struct PaletteEditorView: View {
+    @ObservedObject private var palettes = PaletteLibrary.shared
+    @Environment(\.theme) private var theme
+
+    let paletteID: UUID
+    /// Opens another palette — used after Duplicate, so the copy is where
+    /// you land.
+    let open: (UUID) -> Void
+
+    init(paletteID: UUID, open: @escaping (UUID) -> Void) {
+        self.paletteID = paletteID
+        self.open = open
+    }
+
+    private var editable: Bool { !palettes.isBuiltIn(paletteID) }
+
+    var body: some View {
+        Group {
+            if let palette = palettes.palette(paletteID) {
+                form(palette)
+            } else {
+                // Deleted from under the editor.
+                Text("This palette no longer exists.")
+                    .foregroundColor(theme.dim)
+            }
+        }
+        .navigationTitle(palettes.palette(paletteID)?.name ?? "Palette")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private func form(_ palette: ColorPalette) -> some View {
+        Form {
+            Section {
+                if editable {
+                    TextField("Name", text: Binding(
+                        get: { palette.name },
+                        set: { newName in palettes.update(paletteID) { $0.name = newName } }
+                    ))
+                } else {
+                    LabeledContent("Name", value: palette.name)
+                }
+
+                if palette.id == palettes.globalID {
+                    Label("Global Palette", systemImage: "checkmark.circle.fill")
+                        .foregroundColor(theme.accent)
+                } else {
+                    Button {
+                        palettes.globalID = palette.id
+                    } label: {
+                        Label("Use as Global Palette", systemImage: "globe")
+                    }
+                }
+
+                Button {
+                    if let copy = palettes.duplicate(paletteID) { open(copy) }
+                } label: {
+                    Label("Duplicate", systemImage: "plus.square.on.square")
+                }
+            } footer: {
+                if !editable {
+                    Text("Built-in palettes can't be changed. Duplicate this one to make a copy you can edit.")
+                }
+            }
+
+            Section {
+                ForEach(ColorComponent.roles, id: \.self) { role in
+                    colorRow(role.roleLabel,
+                             value: palette.base(role),
+                             supportsOpacity: role == .grid) { newValue in
+                        palettes.update(paletteID) { $0.setBase(role, to: newValue) }
+                    }
+                }
+            } header: {
+                Text("Base")
+            } footer: {
+                Text("Grid Lines keeps its transparency, so lines stay faint over the panels.")
+            }
+
+            Section {
+                ForEach(palette.swatches.indices, id: \.self) { index in
+                    colorRow("Color \(index + 1)",
+                             value: palette.swatches[index],
+                             supportsOpacity: false) { newValue in
+                        palettes.update(paletteID) { edited in
+                            guard edited.swatches.indices.contains(index) else { return }
+                            edited.swatches[index] = newValue
+                        }
+                    }
+                    // Built-ins can't lose colours, and every palette keeps
+                    // at least one for widgets to fall back on.
+                    .deleteDisabled(!editable || palette.swatches.count <= 1)
+                }
+                .onDelete { offsets in
+                    palettes.update(paletteID) { edited in
+                        guard edited.swatches.count > offsets.count else { return }
+                        edited.swatches.remove(atOffsets: offsets)
+                    }
+                }
+
+                if editable {
+                    Button {
+                        palettes.update(paletteID) { edited in
+                            edited.swatches.append(RGBA(hue: Double.random(in: 0..<1),
+                                                        saturation: 0.7,
+                                                        brightness: 0.95))
+                        }
+                    } label: {
+                        Label("Add Color", systemImage: "plus.circle")
+                    }
+                    .disabled(palette.swatches.count >= ColorPalette.maxSwatches)
+
+                    Button {
+                        palettes.update(paletteID) { edited in
+                            let fresh = ColorPalette.random()
+                            edited.swatches = fresh.swatches
+                            edited.accent = fresh.accent
+                        }
+                    } label: {
+                        Label("Generate New Colors", systemImage: "dice")
+                    }
+                }
+            } header: {
+                Text("Component Colors")
+            } footer: {
+                Text("Widgets choose from these by number in the CC Map. Deleting a colour renumbers the ones after it.")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func colorRow(_ title: String,
+                          value: RGBA,
+                          supportsOpacity: Bool,
+                          set: @escaping (RGBA) -> Void) -> some View {
+        if editable {
+            ColorPicker(title,
+                        selection: Binding(get: { value.color },
+                                           set: { set(RGBA($0)) }),
+                        supportsOpacity: supportsOpacity)
+        } else {
+            HStack {
+                Text(title)
+                Spacer()
+                Circle()
+                    .fill(value.color)
+                    .frame(width: 24, height: 24)
+                    .overlay(Circle().strokeBorder(theme.text.opacity(0.3), lineWidth: 1))
+            }
+        }
     }
 }

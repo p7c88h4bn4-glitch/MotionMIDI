@@ -2,6 +2,7 @@ import SwiftUI
 
 /// Bottom third: collapsible editor. Fully hidden during performance.
 struct EditorView: View {
+    @Environment(\.theme) private var theme
     @EnvironmentObject var app: AppState
     /// Opens on Settings. It is the page with the CC map, the destinations
     /// and the layout switches — the things reached mid-setup — where
@@ -39,7 +40,7 @@ struct EditorView: View {
         }
         .padding(10)
         .background(
-            RoundedRectangle(cornerRadius: 20).fill(Theme.panel)
+            RoundedRectangle(cornerRadius: 20).fill(theme.panel)
         )
     }
 }
@@ -47,6 +48,7 @@ struct EditorView: View {
 // MARK: - Mappings list
 
 struct MappingListView: View {
+    @Environment(\.theme) private var theme
     @EnvironmentObject var app: AppState
 
     var body: some View {
@@ -67,23 +69,23 @@ struct MappingListView: View {
                                 set: { app.preset.motionMappings[offset].enabled = $0 }
                             ))
                             .labelsHidden()
-                            .tint(Theme.accent)
+                            .tint(theme.accent)
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(mapping.name)
                                     .font(.subheadline.bold())
                                 Text("\(mapping.source.shortLabel) → CC\(mapping.cc) · CH \(mapping.channel + 1)")
                                     .font(.caption.monospaced())
-                                    .foregroundColor(Theme.dim)
+                                    .foregroundColor(theme.dim)
                             }
                         }
                     }
-                    .listRowBackground(Theme.panel2)
+                    .listRowBackground(theme.panel2)
                 }
 
                 Section {
                     Toggle("Show Meters on Deck", isOn: $app.preset.showMotionMeters)
-                        .tint(Theme.accent)
-                        .listRowBackground(Theme.panel2)
+                        .tint(theme.accent)
+                        .listRowBackground(theme.panel2)
                 }
             }
             .scrollContentBackground(.hidden)
@@ -102,6 +104,7 @@ struct MappingListView: View {
 /// so a delete or reorder can never leave a binding pointing at a stale
 /// offset.
 struct ButtonListView: View {
+    @Environment(\.theme) private var theme
     @EnvironmentObject var app: AppState
 
     /// Edit mode is driven from here rather than by an `EditButton` in the
@@ -124,8 +127,8 @@ struct ButtonListView: View {
                 // can sit side by side in the library.
                 Section {
                     Toggle("Show Buttons on Deck", isOn: $app.preset.showButtons)
-                        .tint(Theme.accent)
-                        .listRowBackground(Theme.panel2)
+                        .tint(theme.accent)
+                        .listRowBackground(theme.panel2)
                 }
 
                 Section {
@@ -138,11 +141,11 @@ struct ButtonListView: View {
                                     .font(.subheadline.bold())
                                 Text(button.summary)
                                     .font(.caption.monospaced())
-                                    .foregroundColor(Theme.dim)
+                                    .foregroundColor(theme.dim)
 
                             }
                         }
-                        .listRowBackground(Theme.panel2)
+                        .listRowBackground(theme.panel2)
                     }
                     .onMove { from, to in
                         app.preset.buttons.move(fromOffsets: from, toOffset: to)
@@ -167,7 +170,7 @@ struct ButtonListView: View {
                             } label: {
                                 Text(editMode.isEditing ? "Done" : "Reorder")
                                     .font(.caption.bold())
-                                    .foregroundColor(Theme.accent)
+                                    .foregroundColor(theme.accent)
                             }
                             .buttonStyle(.plain)
                         }
@@ -179,7 +182,7 @@ struct ButtonListView: View {
                         app.addButton()
                     } label: {
                         Label("Add Button", systemImage: "plus.circle.fill")
-                            .foregroundColor(Theme.accent)
+                            .foregroundColor(theme.accent)
                     }
                 } footer: {
                     Text("Swipe a button left to delete it.")
@@ -195,6 +198,7 @@ struct ButtonListView: View {
 // MARK: - Mapping detail editor
 
 struct MappingEditorView: View {
+    @Environment(\.theme) private var theme
     @Binding var mapping: MotionMapping
 
     var body: some View {
@@ -202,7 +206,7 @@ struct MappingEditorView: View {
             Section("Identity") {
                 TextField("Name", text: $mapping.name)
                 Toggle("Enabled", isOn: $mapping.enabled)
-                    .tint(Theme.accent)
+                    .tint(theme.accent)
             }
 
             Section("Source & Target") {
@@ -228,7 +232,7 @@ struct MappingEditorView: View {
                     }
                 }
                 Toggle("Invert", isOn: $mapping.processing.invert)
-                    .tint(Theme.accent)
+                    .tint(theme.accent)
             }
 
             Section("Output Range") {
@@ -239,7 +243,7 @@ struct MappingEditorView: View {
             }
         }
         .scrollContentBackground(.hidden)
-        .background(Theme.panel)
+        .background(theme.panel)
         .navigationTitle(mapping.name)
         .navigationBarTitleDisplayMode(.inline)
     }
@@ -251,6 +255,7 @@ struct MappingEditorView: View {
 /// `DialStepEditor` — so a delete or reorder elsewhere can never leave this
 /// editor pointed at a stale array position.
 struct ButtonEditorView: View {
+    @Environment(\.theme) private var theme
     @EnvironmentObject var app: AppState
     let buttonID: UUID
     @Environment(\.dismiss) private var dismiss
@@ -303,6 +308,44 @@ struct ButtonEditorView: View {
                     Text("MIDI")
                 }
 
+                // Only when the light actually comes from the host. A button
+                // lit from its own state never reads incoming MIDI, so a
+                // listen target here would be a setting with no effect.
+                if button.light == .host {
+                    Section {
+                        Toggle("Listen on a Different Message", isOn: listenEnabledBinding)
+                            .tint(theme.accent)
+
+                        if let listen = button.listen {
+                            Picker("Message", selection: listenMessageBinding) {
+                                ForEach(ButtonMessage.allCases) { m in
+                                    Text(m.label).tag(m)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+
+                            IntWheelRow(title: listen.message == .cc ? "CC" : "Note",
+                                        selection: listenNumberBinding,
+                                        range: 0...127,
+                                        wheelWidth: listen.message == .cc ? 140 : 170) { n in
+                                listen.message == .cc ? String(n) : MIDIWheelText.note(n)
+                            }
+
+                            IntWheelRow(title: "Channel",
+                                        selection: listenChannelBinding,
+                                        range: 0...15) { String($0 + 1) }
+                        } else {
+                            // Says where it listens now, so the default is
+                            // visible rather than implied.
+                            let target = button.feedbackTarget
+                            LabeledContent("Listening On",
+                                           value: "\(target.message == .cc ? "CC" : "Note") \(target.number) · CH \(target.channel + 1)")
+                        }
+                    } header: {
+                        Text("Host Feedback")
+                    }
+                }
+
                 Section("XY Pad Glide Toggle") {
                     let isAssigned = app.preset.xyPad.glideToggleButtonId == buttonID
                     Toggle("Toggle XY Pad Glide", isOn: Binding(
@@ -316,12 +359,12 @@ struct ButtonEditorView: View {
                             }
                         }
                     ))
-                    .tint(Theme.accent)
+                    .tint(theme.accent)
 
                     if isAssigned {
                         Text("This button will toggle glide (legato portamento) on the XY pad when pressed.")
                             .font(.caption)
-                            .foregroundColor(Theme.dim)
+                            .foregroundColor(theme.dim)
                     }
                 }
 
@@ -341,7 +384,7 @@ struct ButtonEditorView: View {
             }
         }
         .scrollContentBackground(.hidden)
-        .background(Theme.panel)
+        .background(theme.panel)
         .navigationTitle(button?.name ?? "Button")
         .navigationBarTitleDisplayMode(.inline)
         .confirmationDialog("Delete this button?", isPresented: $confirmDelete,
@@ -367,6 +410,55 @@ struct ButtonEditorView: View {
                 guard let i = self.app.preset.buttons
                     .firstIndex(where: { $0.id == self.buttonID }) else { return }
                 self.app.preset.buttons[i][keyPath: keyPath] = newValue
+            }
+        )
+    }
+
+    // ── Listen target ─────────────────────────────────────────────────
+    //
+    // Every edit clears the button's host-lit state. Whatever lit it came in
+    // on the OLD target; keeping it would show a status the new target has
+    // never reported.
+
+    private func editListen(_ change: (inout ButtonListen?) -> Void) {
+        guard let i = app.preset.buttons.firstIndex(where: { $0.id == buttonID }) else { return }
+        change(&app.preset.buttons[i].listen)
+        app.clearHostLit(buttonID)
+    }
+
+    private var listenEnabledBinding: Binding<Bool> {
+        Binding(
+            get: { self.button?.listen != nil },
+            set: { isOn in
+                guard let current = self.button else { return }
+                // Seeded with what the button already listens on, so turning
+                // this on changes nothing until a value is actually edited.
+                self.editListen { $0 = isOn ? current.feedbackTarget : nil }
+            }
+        )
+    }
+
+    private var listenMessageBinding: Binding<ButtonMessage> {
+        Binding(
+            get: { self.button?.listen?.message ?? .cc },
+            set: { newValue in self.editListen { $0?.message = newValue } }
+        )
+    }
+
+    private var listenNumberBinding: Binding<Int> {
+        Binding(
+            get: { self.button?.listen?.number ?? 0 },
+            set: { newValue in
+                self.editListen { $0?.number = min(max(newValue, 0), 127) }
+            }
+        )
+    }
+
+    private var listenChannelBinding: Binding<Int> {
+        Binding(
+            get: { self.button?.listen?.channel ?? 0 },
+            set: { newValue in
+                self.editListen { $0?.channel = min(max(newValue, 0), 15) }
             }
         )
     }
@@ -458,6 +550,7 @@ struct ButtonEditorView: View {
 }
 
 struct LabeledSlider: View {
+    @Environment(\.theme) private var theme
     let label: String
     @Binding var value: Double
     let range: ClosedRange<Double>
@@ -469,10 +562,10 @@ struct LabeledSlider: View {
                 Spacer()
                 Text(String(format: "%.2f", value))
                     .font(.caption.monospaced())
-                    .foregroundColor(Theme.dim)
+                    .foregroundColor(theme.dim)
             }
             Slider(value: $value, in: range)
-                .tint(Theme.accent)
+                .tint(theme.accent)
         }
     }
 }
@@ -480,6 +573,7 @@ struct LabeledSlider: View {
 // MARK: - Settings
 
 struct SettingsPageView: View {
+    @Environment(\.theme) private var theme
     @EnvironmentObject var app: AppState
     @State private var confirmReset = false
     @State private var expandedSection: String? = nil
@@ -517,17 +611,17 @@ struct SettingsPageView: View {
                         if ccConflictCount > 0 {
                             Text("\(ccConflictCount)")
                                 .font(.caption.bold())
-                                .foregroundColor(Theme.bg)
+                                .foregroundColor(theme.bg)
                                 .padding(.horizontal, 7)
                                 .padding(.vertical, 2)
-                                .background(Capsule().fill(Theme.danger))
+                                .background(Capsule().fill(theme.danger))
                         }
                         Image(systemName: "chevron.right")
                             .font(.caption.weight(.semibold))
-                            .foregroundColor(Theme.dim)
+                            .foregroundColor(theme.dim)
                     }
                 }
-                .tint(Theme.accent)
+                .tint(theme.accent)
             } header: {
                 Text("MIDI")
             }
@@ -555,7 +649,7 @@ struct SettingsPageView: View {
                     showBluetooth = true
                 } label: {
                     Label("Bluetooth MIDI", systemImage: "antenna.radiowaves.left.and.right")
-                        .foregroundColor(Theme.accent)
+                        .foregroundColor(theme.accent)
                 }
 
                 MIDIDestinationStatus(midi: app.midi)
@@ -565,13 +659,13 @@ struct SettingsPageView: View {
 
             Section {
                 Toggle("Show Dial / Fader Panel", isOn: $app.preset.showDialPanel)
-                    .tint(Theme.accent)
+                    .tint(theme.accent)
 
                 // iPad only. Two surfaces need width for two pads; on a phone
                 // each would be too narrow to play, so it isn't offered.
                 if isPadIdiom {
                     Toggle("Second Performer Surface", isOn: $dualSurface)
-                        .tint(Theme.accent)
+                        .tint(theme.accent)
                 }
             } header: {
                 Text("Layout")
@@ -616,6 +710,12 @@ struct SettingsPageView: View {
                          "Standard, Drawbars, and Notes each carry their own channel, so switching mode doesn't retarget whatever the last one was driving. Morph is the exception: each of the four corners has its own channel, which is finer than a mode channel could be. Everything defaults to channel 1.")
                 helpItem("On Release (Standard Mode)",
                          "Where the puck goes when your finger lifts. Hold Position sends nothing and leaves it where you left it. Center returns to the middle of both axes. Left Center and Right Center pin X to one end while centering Y — useful when X is a sweep you want parked open or closed. Bottom Left returns both axes to zero. Morph has its own separate list of targets; Notes has none, since the notes already ended on release.")
+                helpItem("On Release: Master and Dial Steps",
+                         "The On Release choice in pad settings is the master, for Standard XY and 4-Corner separately. A dial step with an XY On Release or Morph On Release action overrides it while that step is selected, and a note under the picker says so. Any step that says nothing about release leaves the master in charge. Changing the master takes effect straight away, taking over from the step that was holding it until that dial is turned again.")
+                helpItem("Smooth",
+                         "Standard XY and 4-Corner each have a Smooth switch in pad settings under Output. Without it, a fast swipe can jump several values between finger readings, which some synths let you hear as stepping. With it on, the pad reads the extra finger positions iOS records between screen updates and spreads each change across the few milliseconds before the next reading, so the host receives a run of steps instead of one jump. It never falls behind your finger by more than one reading — about 8 ms on a 120 Hz iPad — so it is not a glide or a lag. A finger landing and the release spring still jump straight to their value. Smooth cannot go finer than the 128 steps of a standard CC, and a synth that smooths its own controls may not need it.")
+                helpItem("Touch CC",
+                         "Standard XY and 4-Corner each have their own Touch CC, in pad settings under Touch. When on, it sends 127 as the first finger lands and 0 as the last one lifts — once per gesture, however many fingers. The 0 goes out after the pad has sprung to its release position, and always reaches the same CC and channel the 127 went to, even if you change the setting or switch modes mid-touch. Use it to engage an effect only while you are touching the pad. Both default to off; each appears in the CC Map while switched on.")
                 helpItem("On Release (Morph Mode)",
                          "Where the blend lands when your finger lifts, chosen separately from Standard mode. Hold Position leaves it where you left it. Center returns to an even four-corner blend. Corner A, B, C or D snap to full weight on that one corner — and when you have named a corner, the picker shows that name. Center Top, Center Bottom, Center Left and Center Right park on an edge.")
                 helpItem("Master Scale",
@@ -682,8 +782,10 @@ struct SettingsPageView: View {
                          "Show Buttons on Deck, at the top of the Buttons tab, removes the whole button grid from the performance screen and gives its height to the XY pad. Nothing about the buttons changes while they are hidden: assignments stay, a latched button stays latched, and one set to follow host feedback keeps tracking it. The setting belongs to the preset, so a pad-only preset and a button-heavy one can sit side by side.")
                 helpItem("Lit From: Own State or Host Feedback",
                          "Own State is the original behavior: the button lights from its own press, so a Toggle stays lit because it latched. Host Feedback lights it from incoming MIDI on the button's own number and channel instead. That matters for anything the host can also change on its own — a looper clip started from the host's own screen, stopped by a scene change, or run to the end. With Own State the button would go on claiming it is playing; with Host Feedback it follows what is actually happening. Set it in the button editor or from the button's row in the CC Map.")
+                helpItem("Listen on a Different Message",
+                         "By default a Host Feedback button watches the number and channel it sends on. Turn on Listen on a Different Message in the button editor to watch something else instead — a CC or note, any number, any channel. That lets the host report status on its own message: in Loopy Pro, for example, a widget can take CC 24 from the button and send its on/off state out on CC 90. Keeping status separate from control means the host never mistakes its own report for a press. Motion MIDI never sends anything in response to what it receives, so this cannot create a feedback loop on its side; just make sure the host's status message is sent only to Motion MIDI and cannot find its way back into the host's own input.")
                 helpItem("Host Feedback Requirements",
-                         "The host has to echo the state back over MIDI on the same number and channel the button sends. Any value at or above 64 counts as on, since hosts differ about which value they reply with. For note buttons, a Note On with velocity above zero is on, and both Note Off and Note On with velocity zero are off. If your host only reports state over OSC rather than MIDI, this will not light — Motion MIDI speaks MIDI only.")
+                         "The host has to report the state over MIDI on the number and channel the button listens on — its own, unless you set a different one. Any value at or above 64 counts as on, since hosts differ about which value they reply with. For note buttons, a Note On with velocity above zero is on, and both Note Off and Note On with velocity zero are off. If your host only reports state over OSC rather than MIDI, this will not light — Motion MIDI speaks MIDI only.")
             }
 
             helpSection("Presets & Files", icon: "square.and.arrow.up") {
@@ -729,7 +831,15 @@ struct SettingsPageView: View {
                 helpItem("CC Map",
                          "Settings → MIDI → CC Map lists everything this preset sends in one place: motion, pad, morph corners, drawbars, buttons, and every dial step. Numbers, channels, and names are editable there. View it by owner to see what each control sends, or by number to see what is free. A red badge on the way in counts conflicts — two controls on the same number and channel that can both be active at once.")
                 helpItem("Editing Buttons in the Map",
-                         "Button rows carry three menus the other rows do not: CC or Note, the press behavior (Momentary, Tap, Toggle), and whether the button lights from its own state or from host feedback. Add Button at the foot of the Buttons section creates one without leaving the map, on the first free CC. Note buttons appear in the map alongside CC buttons, showing NOTE and their note number.")
+                         "Button rows carry three menus the other rows do not: CC or Note, the press behavior (Momentary, Tap, Toggle), and whether the button lights from its own state or from host feedback. Add Button at the foot of the Buttons section creates one without leaving the map, on the first free CC. Note buttons appear in the map alongside CC buttons, showing NOTE and their note number. A button lit from Host Feedback also shows a line saying what it listens on; tap it to switch between its own number and a custom CC or note on any channel.")
+                helpItem("Colors",
+                         "Colors live at the top of the CC Map. A palette is a set of base colors — background, panels, raised surfaces, text, grid lines and accent — plus a row of numbered component colors. Every widget picks one of those numbers: the XY pad and each dial in their section headers, and each morph corner, drawbar, button and motion meter on its own row. A widget left on its default follows the accent, and morph corners and drawbars follow the pad. The dice in the Colors header does the work for you: Surprise Me picks a new palette and spreads its colors across everything, Random Palette swaps only the palette, Scatter Colors re-spreads the current one, and Reset puts every widget back on its default. Because widgets store a color's number rather than the color itself, changing the palette restyles the whole surface at once.")
+                helpItem("Global, Surface and Preset Palettes",
+                         "The Global palette applies everywhere. A preset can choose its own, which wins while that preset is loaded. With a second surface running, each surface can also have its own palette, sitting between the two: a preset that follows the surface gets the surface's palette, and a surface that follows global gets the global one. A row that is following shows what it inherits in grey; a row that made its own choice shows it in the accent color. Manage Palettes lists the built-ins and your own. Duplicate any palette to edit it, or start from a random one. Daylight, Candy and Paper are light palettes for bright rooms and outdoor stages.")
+                helpItem("Styles",
+                         "Beside each palette menu is a style menu. A palette decides what color things are; a style decides how they are drawn, and any palette works in any style. Standard is the original look with soft glows. Flat drops every glow and shadow for a clean, quiet surface. Neon draws controls as lit outlines that glow when on — best on a dark palette. Graphic uses square corners and heavy borders in the text color — try it with Paper or Mono. Candy uses pill shapes and color-washed controls — try it with Candy or Pastel. Styles follow the same layers as palettes: Global, then each surface, then the preset. Flat, Graphic and Candy are also the lightest to draw, which can help on older devices with several fingers on the pad.")
+                helpItem("Shaded Styles",
+                         "The style menu's second section holds the shaded looks. Clay is puffy and matte, with pressed buttons squashing flat — try it with Candy or Pastel. Glass makes controls see-through with a glossy top edge — best on a dark palette like Ocean or Neon. Metal turns knobs and the puck into brushed steel and colors buttons like anodized aluminum — try Mono or Classic. Soft presses every control out of the surface itself, and a pressed button sinks in — it looks best on Daylight or Mono. Plastic gives glossy hardware keys like a drum machine, with the color lighting up inside. Shaded styles draw with gradients rather than blur, and anything that follows your finger carries a single shadow, so they cost about the same to draw as Standard.")
                 helpItem("Collapsing Sections and Shifting Channels",
                          "Tap any section header to fold it away; a collapsed section still shows its row count and any conflicts inside it. The − CH + buttons on the right of each header move every channel in that section together by one, keeping the spread between rows that sit on different channels. They stop at the edges rather than piling rows onto the last channel.")
                 helpItem("Notes and CCs Do Not Collide",
@@ -782,7 +892,7 @@ struct SettingsPageView: View {
         VStack(alignment: .leading, spacing: 4) {
             Text(title)
                 .font(.caption.weight(.semibold))
-                .foregroundColor(Theme.accent)
+                .foregroundColor(theme.accent)
             Text(body)
                 .font(.caption)
                 .foregroundColor(.secondary)
@@ -803,6 +913,7 @@ struct SettingsPageView: View {
 /// useless: connecting a device while the page is open left it still saying
 /// zero, which reads as a failed connection.
 struct MIDIDestinationStatus: View {
+    @Environment(\.theme) private var theme
     @ObservedObject var midi: MIDIEngine
 
     var body: some View {
@@ -827,6 +938,7 @@ struct MIDIDestinationStatus: View {
 /// Motion engine run state, observing the engine directly for the same
 /// reason as above.
 struct MotionEngineStatus: View {
+    @Environment(\.theme) private var theme
     @ObservedObject var motion: MotionEngine
 
     var body: some View {

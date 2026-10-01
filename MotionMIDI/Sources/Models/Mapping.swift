@@ -52,6 +52,11 @@ enum MIDIDefaults {
     // ── XY pad, standard mode ───────────────────────────────────────────
     static let xyXCC = 12
     static let xyYCC = 13
+    /// Touch/release gates for the XY and 4-Corner pads. General Purpose
+    /// Controllers 1 and 2 in the MIDI spec, and unclaimed by anything else
+    /// in the factory layout.
+    static let xyTouchCC = 16
+    static let morphTouchCC = 17
 
     // ── XY pad, 4-corner morph ──────────────────────────────────────────
     /// A/B/C/D in TL/TR/BL/BR order. Exactly four, always — the pad indexes
@@ -113,7 +118,7 @@ enum MIDIDefaults {
     /// rather than only the feature it belongs to.
     static var reservedCCs: Set<Int> {
         var used: Set<Int> = [rollCC, shakeCC, pitchCC, yawCC,
-                              xyXCC, xyYCC,
+                              xyXCC, xyYCC, xyTouchCC, morphTouchCC,
                               portamentoTimeCC, portamentoSwitchCC,
                               dialSendCC, dialFaderCC]
         used.formUnion(morphCornerCCs)
@@ -312,6 +317,18 @@ extension XYPadConfig {
         let clamped = min(max(level, 0), 127)
         return drawbarInvert ? 127 - clamped : clamped
     }
+}
+
+/// A CC that reports whether a finger is on the pad: the on value when the
+/// first finger lands, the off value when the last one lifts.
+///
+/// Its own channel rather than borrowing the mode's: 4-Corner has no single
+/// channel to borrow — each corner carries its own — and keeping XY the same
+/// shape means one editor and one rule for both.
+struct PadTouchCC: Codable, Equatable {
+    var enabled: Bool = false
+    var cc: Int
+    var channel: Int = MIDIDefaults.channel
 }
 
 /// What happens to sounding notes that no longer have a finger driving them.
@@ -625,6 +642,17 @@ struct XYPadConfig: Codable, Equatable {
     /// Morph mode: where the blend lands on release.
     var morphSpringTarget: MorphSpringTarget = .center
 
+    /// Smooth CC output for Standard XY and 4-Corner. See `PadCCSmoother`.
+    /// Never adds more delay than one finger report, so it cannot trail
+    /// behind the finger the way a glide would.
+    var xySmooth: Bool = false
+    var morphSmooth: Bool = false
+
+    /// Touch/release gate for Standard XY.
+    var xyTouch = PadTouchCC(cc: MIDIDefaults.xyTouchCC)
+    /// Touch/release gate for 4-Corner Morph.
+    var morphTouch = PadTouchCC(cc: MIDIDefaults.morphTouchCC)
+
     // ── Note mode ────────────────────────────────────────────────────────
     var mode: XYPadMode = .cc
 
@@ -713,7 +741,8 @@ extension XYPadConfig {
     enum CodingKeys: String, CodingKey {
         case xCC, yCC, channel
         case standardChannel, drawbarChannel, notesChannel
-        case springTarget, morphSpringTarget
+        case springTarget, morphSpringTarget, xyTouch, morphTouch
+        case xySmooth, morphSmooth
         case mode, noteHold, diagonal, rootNote, rangeSemitones, scale
         case glide, glideTime, perpToVelocity, fixedVelocity
         case glideToggleButtonId, voiceCount
@@ -756,6 +785,17 @@ extension XYPadConfig {
         morphSpringTarget = try c.decodeIfPresent(MorphSpringTarget.self,
                                                  forKey: .morphSpringTarget)
             ?? (legacyMorphSnap ? .center : .hold)
+
+        // Off when absent, so existing presets send exactly as they did.
+        xySmooth = try c.decodeIfPresent(Bool.self, forKey: .xySmooth) ?? false
+        morphSmooth = try c.decodeIfPresent(Bool.self, forKey: .morphSmooth) ?? false
+
+        // Absent in presets from before the touch gates existed. Both default
+        // to off, so an upgrade never starts sending a CC nobody asked for.
+        xyTouch = try c.decodeIfPresent(PadTouchCC.self, forKey: .xyTouch)
+            ?? PadTouchCC(cc: MIDIDefaults.xyTouchCC)
+        morphTouch = try c.decodeIfPresent(PadTouchCC.self, forKey: .morphTouch)
+            ?? PadTouchCC(cc: MIDIDefaults.morphTouchCC)
 
         // Absent means a preset from before held notes could outlive their
         // finger, and back then every note stopped when its finger lifted.
@@ -994,6 +1034,20 @@ enum ButtonMessage: String, Codable, CaseIterable, Identifiable {
     var label: String { self == .cc ? "CC" : "Note" }
 }
 
+/// A message a button watches for its lit state, separate from what it sends.
+///
+/// Lets the host report status on a number of its own choosing. A looper
+/// widget can take CC 24 from the button and announce its state on CC 90,
+/// channel 16 — keeping status traffic apart from control traffic, so the
+/// host never mistakes one for the other and toggles itself.
+struct ButtonListen: Codable, Equatable {
+    var message: ButtonMessage
+    /// CC number or note number, per `message`.
+    var number: Int
+    /// 0-based.
+    var channel: Int
+}
+
 struct ButtonMapping: Identifiable, Codable, Equatable {
     var id = UUID()
     var name: String
@@ -1015,6 +1069,22 @@ struct ButtonMapping: Identifiable, Codable, Equatable {
     /// Where the lit state comes from. Defaults to `.local`, which is how
     /// every button behaved before feedback existed.
     var light: ButtonLight = .local
+
+    /// A different message to watch for host feedback. Nil means watch the
+    /// button's own number and channel — the original behaviour, and still
+    /// the right one when the host echoes state on the control it received.
+    var listen: ButtonListen? = nil
+
+    /// What host feedback is matched against: the custom target when there
+    /// is one, otherwise exactly what the button sends.
+    ///
+    /// One definition, read by the feedback matcher and the editor alike, so
+    /// what the screen says a button listens on is what it listens on.
+    var feedbackTarget: ButtonListen {
+        listen ?? ButtonListen(message: message,
+                               number: message == .cc ? cc : note,
+                               channel: channel)
+    }
 
     init(id: UUID = UUID(),
          name: String,
@@ -1040,19 +1110,26 @@ struct ButtonMapping: Identifiable, Codable, Equatable {
 
     /// One-line description for the editor list.
     var summary: String {
+        let base: String
         switch message {
         case .cc:
-            return "CC\(cc) → \(onValue)/\(offValue) · CH \(channel + 1) · \(behavior.label)"
+            base = "CC\(cc) → \(onValue)/\(offValue) · CH \(channel + 1) · \(behavior.label)"
         case .note:
-            return "Note \(note) · CH \(channel + 1) · \(behavior.label)"
+            base = "Note \(note) · CH \(channel + 1) · \(behavior.label)"
         }
+        // A custom listen target is the one setting you cannot see from the
+        // deck, so it goes on the list row. Only when it applies — a button
+        // lit from its own state ignores it.
+        guard light == .host, let listen else { return base }
+        let kind = listen.message == .cc ? "CC" : "Note"
+        return base + " · lit by \(kind)\(listen.number) CH \(listen.channel + 1)"
     }
 }
 
 extension ButtonMapping {
     enum CodingKeys: String, CodingKey {
         case id, name, message, note, cc, onValue, offValue, channel, behavior
-        case light
+        case light, listen
     }
 
     /// The default in the memberwise init above is `.cc`, but the default
@@ -1081,6 +1158,9 @@ extension ButtonMapping {
         // Absent means a preset from before feedback existed, and back then
         // every button reported its own press state.
         light    = try c.decodeIfPresent(ButtonLight.self, forKey: .light) ?? .local
+        // Absent means the button listens where it sends, as every button
+        // did before a separate target existed.
+        listen   = try c.decodeIfPresent(ButtonListen.self, forKey: .listen)
 
         note     = min(max(note, 0), 127)
         cc       = min(max(cc, 0), 127)

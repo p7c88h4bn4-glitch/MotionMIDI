@@ -21,6 +21,10 @@ enum CCSlot: Hashable {
     case motion(UUID)
     case xyX
     case xyY
+    /// Touch/release gates. Listed only while switched on — a gate that is
+    /// off sends nothing and must not make its number look taken.
+    case xyTouch
+    case morphTouch
     case morphCorner(Int)
     case drawbar(Int)
     case button(UUID)
@@ -114,6 +118,13 @@ struct ButtonRowInfo: Equatable {
     /// note 24 mean nothing to each other, so each keeps its own.
     var cc: Int
     var note: Int
+    /// A custom feedback target, or nil when the button listens where it
+    /// sends.
+    var listen: ButtonListen?
+    /// What the button actually listens on right now — the custom target or
+    /// its own send number. Carried so the map shows the same answer the
+    /// feedback matcher uses, rather than working it out a second time.
+    var feedbackTarget: ButtonListen
 }
 
 /// A row's identity across BOTH surfaces.
@@ -166,6 +177,10 @@ struct CCAssignment: Identifiable, Equatable {
     /// Which performer surface this row belongs to. 0 when only one is
     /// running.
     var surface: Int = 0
+
+    /// The widget this row colours, or nil for rows with nothing on screen.
+    /// Stamped with `surface` at the end of `ccAssignments`.
+    var color: ColorComponent? = nil
 
     /// Set only for button rows, which are the one owner whose message type
     /// and press behavior are editable from the map. Nil everywhere else —
@@ -261,6 +276,16 @@ extension Preset {
             isActive: xyPad.ccMode == .standard,
             defaultName: "Y Axis", isRenamable: true, exclusion: nil,
             button: nil, restValue: 64))
+        if xyPad.xyTouch.enabled {
+            rows.append(CCAssignment(
+                slot: .xyTouch, group: .xyPad,
+                name: "Touch", storedName: "", roleSuffix: nil,
+                cc: xyPad.xyTouch.cc, channel: xyPad.xyTouch.channel, isEditable: true,
+                isActive: xyPad.ccMode == .standard,
+                defaultName: "Touch", isRenamable: false, exclusion: nil,
+                // A learn sweep ends at 0 — no finger on the pad.
+                button: nil, restValue: 0))
+        }
 
         // ── Morph corners ───────────────────────────────────────────────
         for (i, corner) in xyPad.morphCorners.enumerated() {
@@ -280,6 +305,15 @@ extension Preset {
                 button: nil,
                 restValue: 0
             ))
+        }
+        if xyPad.morphTouch.enabled {
+            rows.append(CCAssignment(
+                slot: .morphTouch, group: .morph,
+                name: "Touch", storedName: "", roleSuffix: nil,
+                cc: xyPad.morphTouch.cc, channel: xyPad.morphTouch.channel, isEditable: true,
+                isActive: xyPad.ccMode == .morph,
+                defaultName: "Touch", isRenamable: false, exclusion: nil,
+                button: nil, restValue: 0))
         }
 
         // ── Drawbars ────────────────────────────────────────────────────
@@ -329,7 +363,9 @@ extension Preset {
                                       behavior: button.behavior,
                                       light: button.light,
                                       cc: button.cc,
-                                      note: button.note),
+                                      note: button.note,
+                                      listen: button.listen,
+                                      feedbackTarget: button.feedbackTarget),
                 restValue: button.offValue
             ))
         }
@@ -431,6 +467,7 @@ extension Preset {
         return rows.map { row in
             var copy = row
             copy.surface = surface
+            copy.color = colorComponent(for: row.slot)
             return copy
         }
     }

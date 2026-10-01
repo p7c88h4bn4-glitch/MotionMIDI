@@ -656,6 +656,10 @@ final class AppState: ObservableObject {
             preset.xyPad.xCC = cc
         case .xyY:
             preset.xyPad.yCC = cc
+        case .xyTouch:
+            preset.xyPad.xyTouch.cc = cc
+        case .morphTouch:
+            preset.xyPad.morphTouch.cc = cc
 
         case .morphCorner(let i):
             guard preset.xyPad.morphCorners.indices.contains(i) else { return }
@@ -734,6 +738,12 @@ final class AppState: ObservableObject {
             // gesture, so the map edits the mode's channel from either row.
             preset.xyPad.standardChannel = channel
 
+        // Each gate has its own channel, so these do not follow the mode's.
+        case .xyTouch:
+            preset.xyPad.xyTouch.channel = channel
+        case .morphTouch:
+            preset.xyPad.morphTouch.channel = channel
+
         case .morphCorner(let i):
             guard preset.xyPad.morphCorners.indices.contains(i) else { return }
             preset.xyPad.morphCorners[i].channel = channel
@@ -806,6 +816,8 @@ final class AppState: ObservableObject {
             preset.xyPad.xAxisName = trimmed
         case .xyY:
             preset.xyPad.yAxisName = trimmed
+        case .xyTouch, .morphTouch:
+            break   // fixed name; the map never offers a field for these
 
         case .morphCorner(let i):
             guard preset.xyPad.morphCorners.indices.contains(i) else { return }
@@ -912,6 +924,28 @@ final class AppState: ObservableObject {
         }
 
         preset.buttons[i].light = light
+    }
+
+    /// Set or clear a button's custom feedback target. Nil means listen where
+    /// it sends.
+    ///
+    /// Clears the button's host-lit state: whatever lit it arrived on the old
+    /// target, and the new one has reported nothing yet.
+    func setButtonListen(_ slot: CCSlot, to listen: ButtonListen?) {
+        guard case .button(let id) = slot,
+              let i = preset.buttons.firstIndex(where: { $0.id == id })
+        else { return }
+
+        var clamped = listen
+        if var target = clamped {
+            target.number = min(max(target.number, 0), 127)
+            target.channel = min(max(target.channel, 0), 15)
+            clamped = target
+        }
+        guard preset.buttons[i].listen != clamped else { return }
+
+        preset.buttons[i].listen = clamped
+        clearHostLit(id)
     }
 
     /// Change how a button's press behaves.
@@ -1038,6 +1072,97 @@ final class AppState: ObservableObject {
                         + Array(85...90) + Array(102...119)
         if let free = preferred.first(where: { !taken.contains($0) }) { return free }
         return (0...127).first { !taken.contains($0) }
+    }
+
+    // MARK: - Colours
+
+    /// Whether this surface is currently one of two. Surface palettes only
+    /// apply then — see `PaletteLibrary.resolvedPalette`.
+    private var dualSurfaceActive: Bool {
+        isPadIdiom && UserDefaults.standard.bool(forKey: "MotionMIDIPro.dualSurface")
+    }
+
+    /// The palette this surface is drawn with right now.
+    var resolvedPalette: ColorPalette {
+        PaletteLibrary.shared.resolvedPalette(for: preset, surface: surface,
+                                              dual: dualSurfaceActive)
+    }
+
+    /// The palette colour index a component uses, or nil for its default.
+    func colorChoice(_ component: ColorComponent) -> Int? {
+        preset.colors.assignments[component.key]
+    }
+
+    /// Nil puts the component back on its default.
+    func setColor(_ component: ColorComponent, to index: Int?) {
+        guard preset.colors.assignments[component.key] != index else { return }
+        preset.colors.assignments[component.key] = index
+    }
+
+    /// Nil makes the preset follow the surface / global palette again.
+    func setPresetPalette(_ id: UUID?) {
+        guard preset.colors.paletteID != id else { return }
+        preset.colors.paletteID = id
+    }
+
+    /// Nil makes the preset follow the surface / global style again.
+    func setPresetStyle(_ style: SurfaceStyle?) {
+        guard preset.colors.style != style else { return }
+        preset.colors.style = style
+    }
+
+    /// Put this preset on a palette it is not already showing.
+    func randomPalette() {
+        let current = resolvedPalette.id
+        let choices = PaletteLibrary.shared.all.filter { $0.id != current }
+        guard let pick = choices.randomElement() else { return }
+        setPresetPalette(pick.id)
+    }
+
+    /// Spread the palette across every widget, so nothing sits beside a
+    /// neighbour in the same colour.
+    ///
+    /// Each family — corners, drawbars, buttons, dials, meters — walks the
+    /// palette from its own random starting point in one shared shuffled
+    /// order. Consecutive widgets in a family therefore always differ (as
+    /// long as the palette has more than one colour), and two families
+    /// rarely line up. The base roles are left alone: scattering the
+    /// background and text is how you get red text on a red panel.
+    func scatterColors() {
+        let count = resolvedPalette.swatches.count
+        guard count > 0 else { return }
+        let order = Array(0..<count).shuffled()
+
+        var colors = preset.colors
+        let families: [[ColorComponent]] = [
+            [.pad],
+            (0..<4).map { ColorComponent.morphCorner($0) },
+            preset.xyPad.drawbars.indices.map { ColorComponent.drawbar($0) },
+            preset.buttons.map { ColorComponent.button($0.id) },
+            preset.dialSlots.map { ColorComponent.dial($0.id) },
+            ColorComponent.meterSources.map { ColorComponent.meter($0) }
+        ]
+        for family in families {
+            let start = Int.random(in: 0..<count)
+            for (offset, component) in family.enumerated() {
+                colors.assignments[component.key] = order[(start + offset) % count]
+            }
+        }
+        // One write, so the preset saves once rather than per widget.
+        preset.colors = colors
+    }
+
+    /// The dice: a new palette and a fresh spread across it.
+    func surpriseColors() {
+        randomPalette()
+        scatterColors()
+    }
+
+    /// Every widget and role back on its default. Keeps the palette choice —
+    /// resetting what things are coloured and resetting which palette is in
+    /// use are different requests.
+    func resetColors() {
+        preset.colors.assignments = [:]
     }
 
     // MARK: - Latching buttons
@@ -1183,6 +1308,9 @@ final class AppState: ObservableObject {
     /// A pad parameter a dial step can declare and a master edit can overrule.
     enum PadParam: Hashable {
         case scale, rootNote, range
+        /// The release targets. The value in pad settings is the master; a
+        /// dial step's XY / Morph On Release overrides it while selected.
+        case springTarget, morphSpring
     }
 
     /// Steps whose declaration the performer has overruled by editing the
@@ -1214,6 +1342,8 @@ final class AppState: ObservableObject {
                 case (.scale, .setScale):        return true
                 case (.rootNote, .setRootNote):  return true
                 case (.range, .setNoteRange):    return true
+                case (.springTarget, .setSpringTarget): return true
+                case (.morphSpring, .setMorphSpring):   return true
                 default:                         return false
                 }
             }
@@ -1246,6 +1376,28 @@ final class AppState: ObservableObject {
     }
 
     /// Master root note, same rule as `setMasterScale`.
+    /// Master release target for Standard XY.
+    ///
+    /// Same rule as the master scale. A step that declares XY On Release
+    /// overrides this while it is selected; a step that says nothing about
+    /// release leaves the master in charge. Editing the master takes effect
+    /// straight away, overruling the step that was holding a different target
+    /// until that dial moves — without that, the picker changed and the pad
+    /// went on springing wherever the step said, which looked like every
+    /// target but one was broken.
+    func setMasterSpringTarget(_ target: SpringTarget) {
+        preset.xyPad.springTarget = target
+        suppressCurrentAssertions(of: .springTarget)
+        refreshPadOverrides()
+    }
+
+    /// Master release target for 4-Corner Morph. Same rule.
+    func setMasterMorphSpring(_ target: MorphSpringTarget) {
+        preset.xyPad.morphSpringTarget = target
+        suppressCurrentAssertions(of: .morphSpring)
+        refreshPadOverrides()
+    }
+
     func setMasterRootNote(_ note: Int) {
         preset.xyPad.rootNote = min(max(note, 0), 120)
         suppressCurrentAssertions(of: .rootNote)
@@ -1312,11 +1464,17 @@ final class AppState: ObservableObject {
                 case .setYAxisCC(let cc, let ch):
                     next.yCC = cc
                     next.standardChannel = ch
-                case .setSpringTarget(let t):   next.springTarget = t
+                case .setSpringTarget(let t):
+                    if !isSuppressed(.springTarget, slot: slot, stepIndex: stepIndex) {
+                        next.springTarget = t
+                    }
                 case .setMorphCornerCC(let corner, let cc):
                     next.morphCornerCCs[corner] = cc
                 case .setMorphChannel(let ch):  next.morphChannel = ch
-                case .setMorphSpring(let t):    next.morphSpringTarget = t
+                case .setMorphSpring(let t):
+                    if !isSuppressed(.morphSpring, slot: slot, stepIndex: stepIndex) {
+                        next.morphSpringTarget = t
+                    }
                 default:                        break
                 }
             }
@@ -1451,11 +1609,13 @@ final class AppState: ObservableObject {
                                number: Int,
                                channel: Int,
                                on: Bool) {
-        for button in preset.buttons
-        where button.light == .host
-            && button.message == message
-            && button.channel == channel
-            && (message == .cc ? button.cc : button.note) == number {
+        // Matched on `feedbackTarget`: a custom listen target when the button
+        // has one, otherwise the number and channel it sends on.
+        for button in preset.buttons where button.light == .host {
+            let target = button.feedbackTarget
+            guard target.message == message,
+                  target.channel == channel,
+                  target.number == number else { continue }
 
             if on {
                 hostLitButtons.insert(button.id)
